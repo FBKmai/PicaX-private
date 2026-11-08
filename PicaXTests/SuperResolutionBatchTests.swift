@@ -32,6 +32,31 @@ final class SuperResolutionBatchTests: XCTestCase {
             ReaderBatchRenderStore.archiveFileName(bookTitle: "A/B: C"),
             "PicaX-A-B- C-2x.zip")
         XCTAssertEqual(ReaderBatchRenderStore.safeFileName("  "), "untitled")
+        XCTAssertEqual(
+            ReaderBatchRenderStore.libraryPageFileName(pageIndex: 0),
+            "P0001.png")
+        XCTAssertEqual(
+            ReaderBatchRenderStore.libraryPageFileName(pageIndex: 9_999),
+            "P10000.png")
+        let libraryReadme = ReaderBatchRenderStore.readmeText(
+            bookTitle: "Book",
+            scope: .wholeBook,
+            preset: .color,
+            requestedMode: .automatic,
+            chapterCount: 1,
+            createdAt: Date(timeIntervalSince1970: 0),
+            storesInLibrary: true)
+        XCTAssertTrue(libraryReadme.contains("PicaX 下载 → 超分分类"))
+        XCTAssertTrue(libraryReadme.contains("PicaX/Downloads"))
+        XCTAssertFalse(libraryReadme.contains("文件 App → 我的 iPhone"))
+        let fileReadme = ReaderBatchRenderStore.readmeText(
+            bookTitle: "Book",
+            scope: .wholeBook,
+            preset: .color,
+            requestedMode: .automatic,
+            chapterCount: 1,
+            createdAt: Date(timeIntervalSince1970: 0))
+        XCTAssertTrue(fileReadme.contains("文件 App → 我的 iPhone"))
         let longChineseTitle = String(repeating: "漫", count: 100)
         let truncated = ReaderBatchRenderStore.safeFileName(longChineseTitle)
         XCTAssertLessThanOrEqual(truncated.utf8.count, 80)
@@ -59,6 +84,13 @@ final class SuperResolutionBatchTests: XCTestCase {
         XCTAssertTrue(ReaderBatchRenderModel.isFatal(SuperResolutionError.insufficientStorage))
         XCTAssertFalse(ReaderBatchRenderModel.isFatal(SuperResolutionError.budgetExceeded))
         XCTAssertFalse(ReaderBatchRenderModel.isFatal(ReaderImageSourceError.invalidImage))
+        XCTAssertTrue(ReaderBatchRenderModel.isFatal(SuperResolutionLibraryError.storageUnavailable))
+        XCTAssertTrue(ReaderBatchRenderModel.isFatal(SuperResolutionLibraryError.pageWriteFailed))
+        XCTAssertTrue(ReaderBatchRenderModel.isFatal(SuperResolutionLibraryError.recordNotFound))
+        XCTAssertFalse(ReaderBatchRenderModel.isFatal(
+            SuperResolutionLibraryError.alreadyExists("标题")))
+        XCTAssertFalse(ReaderBatchRenderModel.isFatal(
+            SuperResolutionLibraryError.sourceBusy("标题")))
     }
 
     func testStoreWritesManifestAndBuildsArchiveWithoutDeletingOutputs() throws {

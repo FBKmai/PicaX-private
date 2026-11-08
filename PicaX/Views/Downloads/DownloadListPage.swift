@@ -15,9 +15,16 @@ struct DownloadListPage: View {
     @State private var searchRequest: DownloadedComicSearchRequest?
     @State private var selectedPlatform: ComicPlatform?
     @State private var completionFilter: DownloadCompletionFilter = .all
+    @State private var libraryFilter: DownloadLibraryFilter = .all
     @State private var sortOption: DownloadSortOption = .updatedAt
     @State private var sortDirection: DownloadSortDirection = .descending
     @State private var displayRecords: [DownloadRecord] = []
+    @State private var isSelectingDownloads = false
+    @State private var selectedDownloadIDs = Set<String>()
+    @State private var listAlert: DownloadListFeedback?
+#if os(iOS)
+    @State private var libraryBatch: LibrarySuperResolutionBatch?
+#endif
     @State private var exportingRecordID: String?
     @State private var archiveExportDocument = DownloadedComicExportDocument()
     @State private var archiveExportFileName = "漫画.zip"
@@ -25,7 +32,6 @@ struct DownloadListPage: View {
     @State private var pdfExportDocument = DownloadedComicExportDocument()
     @State private var pdfExportFileName = "漫画.pdf"
     @State private var showsPDFExporter = false
-    @State private var exportFeedback: DownloadArchiveExportFeedback?
 
     var body: some View {
         Group {
@@ -35,21 +41,42 @@ struct DownloadListPage: View {
         .navigationTitle("下载")
         .toolbar {
             ToolbarItemGroup(placement: .picaxTopBarTrailing) {
-                Button { showsLocalImporter = true } label: { Image(systemName: "square.and.arrow.down") }
-                    .accessibilityLabel("导入本地漫画")
-                Button {
-                    showsQueueSheet = true
-                } label: {
-                    Image(systemName: "tray.and.arrow.down")
-                }
-                .accessibilityLabel("下载队列")
+                if isSelectingDownloads {
+                    Button(areAllSelectableSelected ? "取消全选" : "全选") {
+                        toggleSelectAll()
+                    }
+                    .disabled(selectableDisplayRecords.isEmpty)
 
-                Button {
-                    showsFilterSheet = true
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
+                    Button("完成") {
+                        endSelection()
+                    }
+                } else {
+                    Button { showsLocalImporter = true } label: { Image(systemName: "square.and.arrow.down") }
+                        .accessibilityLabel("导入本地漫画")
+                    Button {
+                        showsQueueSheet = true
+                    } label: {
+                        Image(systemName: "tray.and.arrow.down")
+                    }
+                    .accessibilityLabel("下载队列")
+
+#if os(iOS)
+                    Button {
+                        beginSelection()
+                    } label: {
+                        Image(systemName: "checklist")
+                    }
+                    .accessibilityLabel("多选批量超分")
+                    .disabled(libraryFilter == .superResolution)
+#endif
+
+                    Button {
+                        showsFilterSheet = true
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                    }
+                    .accessibilityLabel("高级筛选")
                 }
-                .accessibilityLabel("高级筛选")
             }
         }
         .sheet(isPresented: $showsLocalImporter) { LocalComicImportSheet() }
@@ -87,7 +114,7 @@ struct DownloadListPage: View {
             pdfExportDocument = DownloadedComicExportDocument()
             handleExportResult(result)
         }
-        .alert(item: $exportFeedback) { feedback in
+        .alert(item: $listAlert) { feedback in
             Alert(
                 title: Text(feedback.title),
                 message: Text(feedback.message),
@@ -113,6 +140,13 @@ struct DownloadListPage: View {
         .picaxNavigationDestination(item: $searchRequest) { request in
             ComicSearchPage(initialQuery: request.tag.query, platform: request.tag.platform, service: service)
         }
+#if os(iOS)
+        .fullScreenCover(item: $libraryBatch) { batch in
+            LibrarySuperResolutionView(batch: batch) {
+                libraryBatch = nil
+            }
+        }
+#endif
         .task {
             refreshDisplayRecords()
         }
@@ -125,6 +159,10 @@ struct DownloadListPage: View {
         .onChange(of: completionFilter) { _ in
             refreshDisplayRecords()
         }
+        .onChange(of: libraryFilter) { _ in
+            selectedDownloadIDs.removeAll()
+            refreshDisplayRecords()
+        }
         .onChange(of: sortOption) { _ in
             refreshDisplayRecords()
         }
@@ -135,83 +173,230 @@ struct DownloadListPage: View {
 
     private func handleExportResult(_ result: Result<URL, Error>) {
         if case .failure(let error) = result {
-            exportFeedback = DownloadArchiveExportFeedback(title: "导出失败", message: error.localizedDescription)
+            listAlert = DownloadListFeedback(title: "导出失败", message: error.localizedDescription)
         }
     }
 
     private var downloadList: some View {
-        List {
-            if displayRecords.isEmpty {
-                ContentUnavailableView(
-                    emptyTitle,
-                    systemImage: "arrow.down.circle",
-                    description: Text(emptyDescription)
-                )
-                .listRowBackground(Color.clear)
-            } else {
-                Section("已下载") {
-                    if !readableDisplayRecords.isEmpty {
-                        Button {
-                            Task { @MainActor in
-                                readingListRequest = ReadingListRequest(
-                                    title: "已下载",
-                                    entries: readableDisplayRecords.map { record in
-                                        ReadingListEntry.downloaded(
-                                            record,
-                                            coverURL: downloadService.localCoverURL(for: record) ?? record.item.coverURL
-                                        )
-                                    }
-                                )
-                            }
-                        } label: {
-                            Label("阅读全部", systemImage: "play.circle")
-                        }
-                    }
-
-                    ForEach(displayRecords) { record in
-                        Button {
-                            selectedRecord = record
-                        } label: {
-                            DownloadRecordRow(
-                                record: record,
-                                coverURL: downloadService.localCoverURL(for: record) ?? record.item.coverURL
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        .contextMenu {
-                            Button("检查完整性与修复") { integrityRecord = record }
+        VStack(spacing: 0) {
+            libraryFilterBar
+            List {
+                if displayRecords.isEmpty {
+                    ContentUnavailableView(
+                        emptyTitle,
+                        systemImage: "arrow.down.circle",
+                        description: Text(emptyDescription)
+                    )
+                    .listRowBackground(Color.clear)
+                } else {
+                    Section("已下载") {
+                        if !isSelectingDownloads, !readableDisplayRecords.isEmpty {
                             Button {
-                                prepareArchiveExport(for: record)
+                                Task { @MainActor in
+                                    readingListRequest = ReadingListRequest(
+                                        title: "已下载",
+                                        entries: readableDisplayRecords.map { record in
+                                            ReadingListEntry.downloaded(
+                                                record,
+                                                coverURL: downloadService.localCoverURL(for: record) ?? record.item.coverURL
+                                            )
+                                        }
+                                    )
+                                }
                             } label: {
-                                Label("以 ZIP 导出", systemImage: "archivebox")
+                                Label("阅读全部", systemImage: "play.circle")
                             }
-                            .disabled(exportingRecordID != nil)
-
-                            Button {
-                                preparePDFExport(for: record)
-                            } label: {
-                                Label("以 PDF 导出", systemImage: "doc.richtext")
-                            }
-                            .disabled(exportingRecordID != nil)
                         }
-                        .swipeActions(edge: .trailing) {
-                            Button(role: .destructive) {
-                                downloadService.removeRecord(record)
-                            } label: {
-                                Label("删除", systemImage: "trash")
-                            }
+
+                        ForEach(displayRecords) { record in
+                            recordRow(record)
                         }
                     }
                 }
             }
+            .picaxInsetGroupedListStyle()
+            .background(AppColor.groupedBackground)
         }
-        .picaxInsetGroupedListStyle()
-        .background(AppColor.groupedBackground)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+#if os(iOS)
+            if isSelectingDownloads {
+                selectionBar
+            }
+#endif
+        }
     }
+
+    private var libraryFilterBar: some View {
+        Picker("下载分类", selection: $libraryFilter) {
+            ForEach(DownloadLibraryFilter.allCases) { option in
+                Text(option.title).tag(option)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(AppColor.groupedBackground)
+        .accessibilityLabel("下载分类")
+        .disabled(isSelectingDownloads)
+    }
+
+    @ViewBuilder
+    private func recordRow(_ record: DownloadRecord) -> some View {
+        if isSelectingDownloads {
+            selectionRow(record)
+        } else {
+            Button {
+                selectedRecord = record
+            } label: {
+                DownloadRecordRow(
+                    record: record,
+                    coverURL: downloadService.localCoverURL(for: record) ?? record.item.coverURL
+                )
+            }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button("检查完整性与修复") { integrityRecord = record }
+                Button {
+                    prepareArchiveExport(for: record)
+                } label: {
+                    Label("以 ZIP 导出", systemImage: "archivebox")
+                }
+                .disabled(exportingRecordID != nil)
+
+                Button {
+                    preparePDFExport(for: record)
+                } label: {
+                    Label("以 PDF 导出", systemImage: "doc.richtext")
+                }
+                .disabled(exportingRecordID != nil)
+            }
+            .swipeActions(edge: .trailing) {
+                Button(role: .destructive) {
+                    downloadService.removeRecord(record)
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func selectionRow(_ record: DownloadRecord) -> some View {
+        let canSelect = downloadService.canSuperResolution(record)
+        let isSelected = selectedDownloadIDs.contains(record.id)
+        return Button {
+            toggleSelection(record)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                DownloadRecordRow(
+                    record: record,
+                    coverURL: downloadService.localCoverURL(for: record) ?? record.item.coverURL
+                )
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(!canSelect)
+        .opacity(canSelect ? 1 : 0.45)
+    }
+
+#if os(iOS)
+    private var selectionBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 12) {
+                Text("已选 \(selectedDownloadIDs.count) 本")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Button {
+                    startLibraryBatch()
+                } label: {
+                    Label("批量超分", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(selectedDownloadIDs.isEmpty)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.regularMaterial)
+        }
+    }
+#endif
 
     private var readableDisplayRecords: [DownloadRecord] {
         displayRecords.filter { !$0.chapters.isEmpty }
     }
+
+    private var selectableDisplayRecords: [DownloadRecord] {
+        displayRecords.filter { downloadService.canSuperResolution($0) }
+    }
+
+    private var areAllSelectableSelected: Bool {
+        !selectableDisplayRecords.isEmpty
+            && selectableDisplayRecords.allSatisfy { selectedDownloadIDs.contains($0.id) }
+    }
+
+    private func beginSelection() {
+        guard !selectableDisplayRecords.isEmpty else {
+            listAlert = DownloadListFeedback(
+                title: "没有可超分的下载",
+                message: "只能选择有已下载章节、不在下载队列中，且尚无超分版本的普通漫画。"
+            )
+            return
+        }
+        selectedDownloadIDs.removeAll()
+        isSelectingDownloads = true
+    }
+
+    private func endSelection() {
+        isSelectingDownloads = false
+        selectedDownloadIDs.removeAll()
+    }
+
+    private func toggleSelection(_ record: DownloadRecord) {
+        guard downloadService.canSuperResolution(record) else { return }
+        if selectedDownloadIDs.contains(record.id) {
+            selectedDownloadIDs.remove(record.id)
+        } else {
+            selectedDownloadIDs.insert(record.id)
+        }
+    }
+
+    private func toggleSelectAll() {
+        if areAllSelectableSelected {
+            selectedDownloadIDs.removeAll()
+        } else {
+            selectedDownloadIDs = Set(selectableDisplayRecords.map(\.id))
+        }
+    }
+
+#if os(iOS)
+    private func startLibraryBatch() {
+        let selected = displayRecords.filter {
+            selectedDownloadIDs.contains($0.id) && downloadService.canSuperResolution($0)
+        }
+        guard !selected.isEmpty else {
+            listAlert = DownloadListFeedback(
+                title: "没有可超分的下载",
+                message: "所选漫画已有超分版本、仍在下载或没有已下载章节。"
+            )
+            return
+        }
+        do {
+            let requests = try selected.map {
+                try downloadService.makeSuperResolutionBatchRequest(for: $0)
+            }
+            libraryBatch = LibrarySuperResolutionBatch(requests: requests)
+            endSelection()
+        } catch {
+            listAlert = DownloadListFeedback(
+                title: "无法开始批量超分",
+                message: error.localizedDescription
+            )
+        }
+    }
+#endif
 
     private func prepareArchiveExport(for record: DownloadRecord) {
         guard exportingRecordID == nil else { return }
@@ -225,7 +410,7 @@ struct DownloadListPage: View {
                 archiveExportFileName = export.fileName
                 showsArchiveExporter = true
             } catch {
-                exportFeedback = DownloadArchiveExportFeedback(title: "导出失败", message: error.localizedDescription)
+                listAlert = DownloadListFeedback(title: "导出失败", message: error.localizedDescription)
             }
             exportingRecordID = nil
         }
@@ -243,7 +428,7 @@ struct DownloadListPage: View {
                 pdfExportFileName = export.fileName
                 showsPDFExporter = true
             } catch {
-                exportFeedback = DownloadArchiveExportFeedback(title: "导出失败", message: error.localizedDescription)
+                listAlert = DownloadListFeedback(title: "导出失败", message: error.localizedDescription)
             }
             exportingRecordID = nil
         }
@@ -251,6 +436,15 @@ struct DownloadListPage: View {
 
     private func refreshDisplayRecords() {
         var records = downloadService.records
+
+        switch libraryFilter {
+        case .all:
+            break
+        case .normal:
+            records = records.filter { !$0.isSuperResolution }
+        case .superResolution:
+            records = records.filter(\.isSuperResolution)
+        }
 
         if let selectedPlatform {
             records = records.filter { $0.item.platform == selectedPlatform }
@@ -310,10 +504,16 @@ struct DownloadListPage: View {
     }
 
     private var emptyTitle: String {
-        hasActiveFilters ? "没有匹配的下载" : "暂无已下载"
+        if libraryFilter == .superResolution {
+            return "暂无超分漫画"
+        }
+        return hasActiveFilters ? "没有匹配的下载" : "暂无已下载"
     }
 
     private var emptyDescription: String {
+        if libraryFilter == .superResolution {
+            return "在“全部”或“正常”分类中多选漫画，点击底部“批量超分”生成。"
+        }
         if hasActiveFilters {
             return "调整右上角高级筛选后再试。"
         }
@@ -369,7 +569,7 @@ private enum DownloadedComicExportDocumentError: LocalizedError {
     }
 }
 
-private struct DownloadArchiveExportFeedback: Identifiable {
+private struct DownloadListFeedback: Identifiable {
     let id = UUID()
     let title: String
     let message: String
@@ -600,9 +800,20 @@ private struct DownloadRecordRow: View {
             ComicCoverView(url: coverURL, accentColor: record.item.accentColor, width: 58, height: 78)
 
             VStack(alignment: .leading, spacing: 5) {
-                Text(record.item.title)
-                    .font(.headline)
-                    .lineLimit(2)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(record.item.title)
+                        .font(.headline)
+                        .lineLimit(2)
+
+                    if record.isSuperResolution {
+                        Text("超分")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(record.item.accentColor.opacity(0.16), in: Capsule())
+                            .foregroundStyle(record.item.accentColor)
+                    }
+                }
 
                 Text(record.detailText)
                     .font(.subheadline.weight(.medium))
@@ -634,6 +845,25 @@ private enum DownloadCompletionFilter: String, CaseIterable, Identifiable {
             "完整"
         case .partial:
             "部分"
+        }
+    }
+}
+
+private enum DownloadLibraryFilter: String, CaseIterable, Identifiable {
+    case all
+    case normal
+    case superResolution
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all:
+            "全部"
+        case .normal:
+            "正常"
+        case .superResolution:
+            "超分"
         }
     }
 }

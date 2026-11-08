@@ -19,7 +19,10 @@ struct DownloadIntegritySheet: View {
                     Section("检查结果") {
                         Text("已检查 \(report.checkedPages) 页，发现 \(report.issues.count) 页缺失或损坏")
                         if !report.issues.isEmpty {
-                            if record.item.platform == .local {
+                            if record.isSuperResolution {
+                                Text("超分页面无法从原站重新获取；请删除该超分版本后重新批量超分。")
+                                    .foregroundStyle(.secondary)
+                            } else if record.item.platform == .local {
                                 Text("请从原始文件重新导入，以恢复损坏页面。").foregroundStyle(.secondary)
                             } else {
                                 Button("仅修复有问题的页面") { repair() }.disabled(isWorking)

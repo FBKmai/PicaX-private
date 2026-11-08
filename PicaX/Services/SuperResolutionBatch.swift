@@ -184,6 +184,10 @@ nonisolated enum ReaderBatchRenderStore {
         String(format: "E%03d-P%04d.png", chapterIndex + 1, pageIndex + 1)
     }
 
+    static func libraryPageFileName(pageIndex: Int) -> String {
+        String(format: "P%04d.png", pageIndex + 1)
+    }
+
     static func archiveFileName(bookTitle: String) -> String {
         "PicaX-\(safeFileName(bookTitle))-2x.zip"
     }
@@ -277,10 +281,14 @@ nonisolated enum ReaderBatchRenderStore {
         preset: SuperResolutionPreset,
         requestedMode: SuperResolutionInferenceMode,
         chapterCount: Int,
-        createdAt: Date
+        createdAt: Date,
+        storesInLibrary: Bool = false
     ) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
+        let destination = storesInLibrary
+            ? "PicaX 下载 → 超分分类（App 内阅读；文件位于 PicaX/Downloads）"
+            : "文件 App → 我的 iPhone → PicaX → SuperResolution"
         return """
         PicaX 整本 2x 超分输出
 
@@ -290,6 +298,7 @@ nonisolated enum ReaderBatchRenderStore {
         请求推理模式：\(requestedMode.title)
         计算单元：仅 CPU（固定；批量不使用 CPU+GPU/全部）
         开始时间：\(formatter.string(from: createdAt))
+        输出位置：\(destination)
 
         本目录的 PNG 是逐页 Core ML 输出，原图未被覆盖或修改。
         每页实际模型、版本、精度、输入/输出尺寸、耗时、回退原因和失败原因
@@ -403,6 +412,13 @@ nonisolated enum ReaderBatchRenderStore {
     }
 }
 
+struct ReaderBatchRenderLibraryOutput {
+    let recordID: String
+    let directory: URL
+    let retainPage: @MainActor (URL, Int, ComicChapter, Int) throws -> Int
+    let finish: @MainActor (Bool) -> Void
+}
+
 struct ReaderBatchRenderRequest: Identifiable {
     let id = UUID()
     let bookID: String
@@ -410,6 +426,14 @@ struct ReaderBatchRenderRequest: Identifiable {
     let chapters: [ComicChapter]
     let initialChapterIndex: Int
     let loadChapterImages: @MainActor (Int) async throws -> [ComicChapterImage]
+    /// When present, page results are written into the PicaX downloads library
+    /// under the "超分" category instead of Documents/SuperResolution.
+    var libraryOutput: (@MainActor () throws -> ReaderBatchRenderLibraryOutput)? = nil
+}
+
+private struct ReaderBatchRenderWorkItem {
+    let request: ReaderBatchRenderRequest
+    let chapterIndices: [Int]
 }
 
 @MainActor
@@ -437,12 +461,22 @@ final class ReaderBatchRenderModel: ObservableObject {
     @Published private(set) var archiveURL: URL?
     @Published private(set) var archiveMessage: String?
     @Published private(set) var isArchiving = false
+    @Published private(set) var currentBookOrdinal = 0
+    @Published private(set) var currentBookTitle = ""
+    @Published private(set) var bookCount = 0
+    @Published private(set) var bookSuccessCount = 0
+    @Published private(set) var bookFailureCount = 0
 
-    private(set) var request: ReaderBatchRenderRequest?
+    private(set) var requests: [ReaderBatchRenderRequest] = []
+    var request: ReaderBatchRenderRequest? { requests.first }
+    var isLibraryBatch: Bool { requests.contains { $0.libraryOutput != nil } }
     private var task: Task<Void, Never>?
     private var archiveTask: Task<Void, Never>?
     private var manifest: ReaderBatchRenderManifest?
     private var batchStartedAt: Date?
+    private var activeLibraryOutput: ReaderBatchRenderLibraryOutput?
+    private var progressBookOffset = 0
+    private var progressBookCount = 1
 
     var isRunning: Bool {
         phase == .running || phase == .cancelling
@@ -463,12 +497,22 @@ final class ReaderBatchRenderModel: ObservableObject {
         chapterRecords.filter { $0.status == .failed }
     }
 
+    func prepare(requests: [ReaderBatchRenderRequest]) {
+        guard self.requests.isEmpty else { return }
+        self.requests = requests
+        if requests.isEmpty {
+            message = "没有可批量渲染的漫画。"
+        } else if requests.count == 1 {
+            message = requests[0].chapters.isEmpty
+                ? "当前漫画没有章节，无法批量渲染。"
+                : "尚未开始；不会修改下载原图。"
+        } else {
+            message = "尚未开始；将串行处理 \(requests.count) 本漫画，不修改原始下载。"
+        }
+    }
+
     func prepare(request: ReaderBatchRenderRequest) {
-        guard self.request == nil else { return }
-        self.request = request
-        message = request.chapters.isEmpty
-            ? "当前漫画没有章节，无法批量渲染。"
-            : "尚未开始；不会修改下载原图。"
+        prepare(requests: [request])
     }
 
     func start(
@@ -476,11 +520,15 @@ final class ReaderBatchRenderModel: ObservableObject {
         preset: SuperResolutionPreset,
         mode: SuperResolutionInferenceMode
     ) {
-        guard let request, !isRunning else { return }
-        let indices = scope.chapterIndices(
-            totalChapters: request.chapters.count,
-            currentChapterIndex: request.initialChapterIndex)
-        guard !indices.isEmpty else {
+        guard !requests.isEmpty, !isRunning else { return }
+        let workItems = requests.compactMap { request -> ReaderBatchRenderWorkItem? in
+            let indices = scope.chapterIndices(
+                totalChapters: request.chapters.count,
+                currentChapterIndex: request.initialChapterIndex)
+            guard !indices.isEmpty else { return nil }
+            return ReaderBatchRenderWorkItem(request: request, chapterIndices: indices)
+        }
+        guard !workItems.isEmpty else {
             phase = .failed
             fatalMessage = "没有可处理的章节。"
             message = "没有可处理的章节；原图未修改。"
@@ -491,31 +539,85 @@ final class ReaderBatchRenderModel: ObservableObject {
         self.scope = scope
         self.preset = preset
         requestedMode = mode
-        scopeChapterCount = indices.count
-        currentChapterTitle = request.chapters[min(
-            max(request.initialChapterIndex, 0), request.chapters.count - 1)].title
+        bookCount = workItems.count
+        progressBookCount = workItems.count
         phase = .running
-        message = "正在创建输出目录…"
+        message = workItems.count == 1
+            ? "正在创建输出目录…"
+            : "共 \(workItems.count) 本；正在准备第 1 本…"
         batchStartedAt = Date()
         elapsedSeconds = 0
 
         task = Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.run(
-                    request: request, indices: indices, scope: scope, preset: preset, mode: mode)
+                for (bookOffset, item) in workItems.enumerated() {
+                    try Task.checkCancellation()
+                    self.currentBookOrdinal = bookOffset + 1
+                    self.currentBookTitle = item.request.bookTitle
+                    self.progressBookOffset = bookOffset
+                    self.progressBookCount = workItems.count
+                    self.scopeChapterCount = item.chapterIndices.count
+                    self.currentChapterOrdinal = 0
+                    self.currentChapterTitle = ""
+                    self.currentPageOrdinal = 0
+                    self.currentChapterPageCount = 0
+                    self.currentPageProgress = 0
+                    self.outputDirectory = nil
+                    self.manifest = nil
+                    self.activeLibraryOutput = nil
+                    self.overallProgress = Double(bookOffset) / Double(workItems.count)
+                    self.message = workItems.count == 1
+                        ? "正在创建输出目录…"
+                        : "第 \(bookOffset + 1)/\(workItems.count) 本：\(item.request.bookTitle)"
+                    do {
+                        let pagesBefore = self.pageSuccessCount
+                        try await self.run(
+                            request: item.request,
+                            indices: item.chapterIndices,
+                            scope: scope,
+                            preset: preset,
+                            mode: mode)
+                        self.activeLibraryOutput?.finish(true)
+                        if item.request.libraryOutput != nil,
+                           self.pageSuccessCount == pagesBefore {
+                            // No page reached the library (all pages skipped or
+                            // failed). The synthetic record was removed by
+                            // finish; do not report this book as successful.
+                            self.bookFailureCount += 1
+                            self.message = "第 \(bookOffset + 1) 本没有生成任何页面。"
+                        } else {
+                            self.bookSuccessCount += 1
+                        }
+                    } catch is CancellationError {
+                        self.activeLibraryOutput?.finish(false)
+                        self.finalizeManifest(status: .cancelled)
+                        throw CancellationError()
+                    } catch {
+                        self.activeLibraryOutput?.finish(false)
+                        self.finalizeManifest(status: .failed)
+                        self.bookFailureCount += 1
+                        if Self.isFatal(error) {
+                            throw error
+                        }
+                        self.message = "第 \(bookOffset + 1) 本失败，继续下一本：\(error.localizedDescription)"
+                    }
+                    self.overallProgress = Double(bookOffset + 1) / Double(workItems.count)
+                }
+                self.phase = .completed
+                self.overallProgress = 1
+                self.message = self.completionMessage
             } catch is CancellationError {
-                self.finalizeManifest(status: .cancelled)
                 self.phase = .cancelled
-                self.message = "已取消：\(self.pageSuccessCount) 页已完成并保留；已完成页面不会标记为失败。"
+                self.message = "已取消：\(self.bookSuccessCount) 本完成、\(self.pageSuccessCount) 页已完成并保留；未完成页面不会标记为成功。"
             } catch {
-                self.finalizeManifest(status: .failed)
                 self.phase = .failed
                 self.fatalMessage = error.localizedDescription
                 self.message = "批量渲染停止：\(error.localizedDescription)"
             }
             self.refreshElapsed()
             self.currentPageProgress = 0
+            self.activeLibraryOutput = nil
             self.task = nil
         }
     }
@@ -530,13 +632,26 @@ final class ReaderBatchRenderModel: ObservableObject {
     func resetForNewBatch() {
         guard !isRunning else { return }
         resetBatchState()
-        message = request?.chapters.isEmpty == false
-            ? "尚未开始；不会修改下载原图。"
-            : "当前漫画没有章节，无法批量渲染。"
+        if requests.isEmpty {
+            message = "没有可批量渲染的漫画。"
+        } else {
+            message = "尚未开始；不会修改下载原图。"
+        }
+    }
+
+    private var completionMessage: String {
+        if pageSuccessCount == 0, isLibraryBatch {
+            return "批量渲染结束：没有生成任何页面，未创建超分下载。"
+        }
+        if bookCount <= 1 {
+            return "批量渲染完成：\(pageSuccessCount) 页成功，\(pageSkippedCount) 页跳过，\(pageFailureCount) 页失败。结果已保留。"
+        }
+        return "全部完成：\(bookSuccessCount) 本成功，\(bookFailureCount) 本失败；\(pageSuccessCount) 页成功，\(pageSkippedCount) 页跳过，\(pageFailureCount) 页失败。"
     }
 
     func prepareArchive() {
         guard let directory = outputDirectory,
+              !isLibraryBatch,
               !isRunning,
               !isArchiving,
               archiveURL == nil,
@@ -604,14 +719,33 @@ final class ReaderBatchRenderModel: ObservableObject {
     /// Model/OS/storage failures will repeat for every page; abort instead of
     /// walking through an entire book producing identical failed records.
     nonisolated static func isFatal(_ error: Error) -> Bool {
-        guard let error = error as? SuperResolutionError else { return false }
-        switch error {
-        case .modelUnavailable, .modelLoadFailed, .unsupportedOS,
-             .modelDescriptionMismatch, .fullPageUnavailable, .insufficientStorage:
-            return true
-        default:
-            return false
+        if let error = error as? SuperResolutionError {
+            switch error {
+            case .modelUnavailable, .modelLoadFailed, .unsupportedOS,
+                 .modelDescriptionMismatch, .fullPageUnavailable, .insufficientStorage:
+                return true
+            default:
+                return false
+            }
         }
+        if let error = error as? ReaderBatchRenderError {
+            switch error {
+            case .documentsUnavailable, .outputDirectoryUnavailable,
+                 .manifestWriteFailed, .outputWriteFailed, .outputFileExists:
+                return true
+            default:
+                return false
+            }
+        }
+        if let error = error as? SuperResolutionLibraryError {
+            switch error {
+            case .storageUnavailable, .pageWriteFailed, .recordNotFound:
+                return true
+            case .unsupportedSource, .noDownloadedChapters, .alreadyExists, .sourceBusy:
+                return false
+            }
+        }
+        return false
     }
 
     private func run(
@@ -633,8 +767,18 @@ final class ReaderBatchRenderModel: ObservableObject {
             refreshElapsed()
         }
 
-        let directory = try ReaderBatchRenderStore.createOutputDirectory(
-            bookTitle: request.bookTitle)
+        let libraryOutput: ReaderBatchRenderLibraryOutput?
+        let directory: URL
+        if let factory = request.libraryOutput {
+            let output = try factory()
+            activeLibraryOutput = output
+            libraryOutput = output
+            directory = output.directory
+        } else {
+            libraryOutput = nil
+            directory = try ReaderBatchRenderStore.createOutputDirectory(
+                bookTitle: request.bookTitle)
+        }
         outputDirectory = directory
         try ReaderBatchRenderStore.writeReadme(
             ReaderBatchRenderStore.readmeText(
@@ -643,7 +787,8 @@ final class ReaderBatchRenderModel: ObservableObject {
                 preset: preset,
                 requestedMode: mode,
                 chapterCount: indices.count,
-                createdAt: batchStartedAt ?? Date()),
+                createdAt: batchStartedAt ?? Date(),
+                storesInLibrary: libraryOutput != nil),
             to: directory)
 
         var manifest = ReaderBatchRenderManifest(
@@ -666,7 +811,7 @@ final class ReaderBatchRenderModel: ObservableObject {
             currentPageOrdinal = 0
             currentChapterPageCount = 0
             currentPageProgress = 0
-            overallProgress = Double(offset) / Double(indices.count)
+            setOverallProgress(bookFraction: Double(offset) / Double(indices.count))
             message = "读取章节 \(offset + 1)/\(indices.count)：\(chapter.title)"
 
             let images: [ComicChapterImage]
@@ -686,7 +831,7 @@ final class ReaderBatchRenderModel: ObservableObject {
                 manifest.chapters.append(record)
                 self.manifest = manifest
                 try persist(manifest)
-                overallProgress = Double(offset + 1) / Double(indices.count)
+                setOverallProgress(bookFraction: Double(offset + 1) / Double(indices.count))
                 message = "章节读取失败，已跳过：\(chapter.title)"
                 continue
             }
@@ -704,7 +849,7 @@ final class ReaderBatchRenderModel: ObservableObject {
             try persist(manifest)
 
             if images.isEmpty {
-                overallProgress = Double(offset + 1) / Double(indices.count)
+                setOverallProgress(bookFraction: Double(offset + 1) / Double(indices.count))
                 message = "章节没有页面，已跳过：\(chapter.title)"
                 continue
             }
@@ -714,8 +859,10 @@ final class ReaderBatchRenderModel: ObservableObject {
                 currentPageOrdinal = pageIndex + 1
                 currentPageProgress = 0
                 updateOverallProgress(chapterOffset: offset, chapterCount: indices.count)
-                let fileName = ReaderBatchRenderStore.pageFileName(
-                    chapterIndex: chapterIndex, pageIndex: pageIndex)
+                let fileName = libraryOutput == nil
+                    ? ReaderBatchRenderStore.pageFileName(
+                        chapterIndex: chapterIndex, pageIndex: pageIndex)
+                    : ReaderBatchRenderStore.libraryPageFileName(pageIndex: pageIndex)
                 message = "E\(chapterIndex + 1) · P\(pageIndex + 1)/\(images.count)：读取原图…"
 
                 var acceptedRecord: ReaderBatchRenderPageRecord?
@@ -743,8 +890,20 @@ final class ReaderBatchRenderModel: ObservableObject {
                         ReaderBatchRenderStore.discardTrialOutput(result.outputURL)
                         throw CancellationError()
                     }
-                    let outputByteCount = try ReaderBatchRenderStore.retainOutput(
-                        result.outputURL, in: directory, fileName: fileName)
+                    let outputByteCount: Int
+                    if let libraryOutput {
+                        do {
+                            outputByteCount = try libraryOutput.retainPage(
+                                result.outputURL, chapterIndex, chapter, pageIndex)
+                        } catch {
+                            ReaderBatchRenderStore.discardTrialOutput(result.outputURL)
+                            throw error
+                        }
+                        ReaderBatchRenderStore.discardTrialOutput(result.outputURL)
+                    } else {
+                        outputByteCount = try ReaderBatchRenderStore.retainOutput(
+                            result.outputURL, in: directory, fileName: fileName)
+                    }
 
                     var record = ReaderBatchRenderPageRecord(
                         chapterIndex: chapterIndex,
@@ -809,7 +968,7 @@ final class ReaderBatchRenderModel: ObservableObject {
                 }
                 refreshElapsed()
             }
-            overallProgress = Double(offset + 1) / Double(indices.count)
+            setOverallProgress(bookFraction: Double(offset + 1) / Double(indices.count))
             currentPageProgress = 0
             refreshElapsed()
         }
@@ -818,9 +977,6 @@ final class ReaderBatchRenderModel: ObservableObject {
         manifest.finishedAt = Date()
         self.manifest = manifest
         try persist(manifest)
-        overallProgress = 1
-        phase = .completed
-        message = "批量渲染完成：\(pageSuccessCount) 页成功，\(pageSkippedCount) 页跳过，\(pageFailureCount) 页失败。PNG 与 manifest 已保留。"
     }
 
     private func persist(_ manifest: ReaderBatchRenderManifest) throws {
@@ -845,6 +1001,13 @@ final class ReaderBatchRenderModel: ObservableObject {
     private func resetBatchState() {
         discardTemporaryArchive()
         phase = .idle
+        bookCount = 0
+        bookSuccessCount = 0
+        bookFailureCount = 0
+        currentBookOrdinal = 0
+        currentBookTitle = ""
+        progressBookOffset = 0
+        progressBookCount = 1
         scopeChapterCount = 0
         currentChapterOrdinal = 0
         currentChapterTitle = ""
@@ -861,13 +1024,14 @@ final class ReaderBatchRenderModel: ObservableObject {
         pageFailureCount = 0
         outputDirectory = nil
         manifest = nil
+        activeLibraryOutput = nil
         fatalMessage = nil
         archiveMessage = nil
     }
 
     private func updateOverallProgress(chapterOffset: Int, chapterCount: Int) {
         guard chapterCount > 0 else {
-            overallProgress = 0
+            setOverallProgress(bookFraction: 0)
             return
         }
         let pageFraction: Double
@@ -877,7 +1041,14 @@ final class ReaderBatchRenderModel: ObservableObject {
         } else {
             pageFraction = 0
         }
-        let value = (Double(chapterOffset) + pageFraction) / Double(chapterCount)
+        setOverallProgress(
+            bookFraction: (Double(chapterOffset) + pageFraction) / Double(chapterCount))
+    }
+
+    private func setOverallProgress(bookFraction: Double) {
+        let total = Double(max(progressBookCount, 1))
+        let clamped = min(max(bookFraction, 0), 1)
+        let value = (Double(progressBookOffset) + clamped) / total
         overallProgress = min(max(value, 0), 1)
     }
 

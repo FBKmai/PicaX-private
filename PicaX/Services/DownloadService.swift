@@ -53,6 +53,19 @@ struct DownloadedChapterRecord: Identifiable, Equatable, Codable {
     }
 }
 
+/// Describes a synthetic download record that holds 2x super-resolved pages.
+/// The original download record and its files are never modified.
+struct SuperResolutionDownloadInfo: Equatable, Codable {
+    let sourceRecordID: String
+    let sourceItemID: String
+    let sourcePlatform: ComicPlatform
+    let sourceTitle: String
+    let createdAt: Date
+    var completedAt: Date?
+    /// Compact chapter index -> source page count at the time the batch began.
+    var expectedPageCounts: [Int: Int]? = nil
+}
+
 struct DownloadRecord: Identifiable, Equatable, Codable {
     let item: ComicListItem
     var chapters: [DownloadedChapterRecord]
@@ -63,9 +76,29 @@ struct DownloadRecord: Identifiable, Equatable, Codable {
     var detail: ComicDetailInfo?
     var comments: [ComicComment]
     var updatedAt: Date
+    var superResolution: SuperResolutionDownloadInfo? = nil
 
     var id: String {
         "\(item.platform.id)-\(item.id)"
+    }
+
+    var isSuperResolution: Bool {
+        superResolution != nil
+    }
+
+    var isSuperResolutionComplete: Bool {
+        guard let superResolution,
+              superResolution.completedAt != nil,
+              totalChapterCount > 0,
+              chapters.count >= totalChapterCount else {
+            return false
+        }
+        guard let expectedPageCounts = superResolution.expectedPageCounts else {
+            return true
+        }
+        return expectedPageCounts.allSatisfy { chapterIndex, pageCount in
+            (chapters.first { $0.index == chapterIndex }?.pageCount ?? 0) >= pageCount
+        }
     }
 
     var downloadedChapterIndexes: Set<Int> {
@@ -73,10 +106,25 @@ struct DownloadRecord: Identifiable, Equatable, Codable {
     }
 
     var isFullyDownloaded: Bool {
-        totalChapterCount > 0 && chapters.count >= totalChapterCount
+        if isSuperResolution {
+            return isSuperResolutionComplete
+        }
+        return totalChapterCount > 0 && chapters.count >= totalChapterCount
     }
 
     var statusText: String {
+        if let superResolution {
+            let pages = chapters.reduce(0) { $0 + $1.pageCount }
+            let state: String
+            if superResolution.completedAt == nil {
+                state = "超分中断"
+            } else if isSuperResolutionComplete {
+                state = "超分完成"
+            } else {
+                state = "超分部分完成"
+            }
+            return pages > 0 ? "\(state) \(pages) 页" : state
+        }
         if totalChapterCount <= 1 {
             let pages = chapters.first?.pageCount ?? item.pageCount ?? 0
             return pages > 0 ? "已下载 \(pages) 页" : "已下载"
@@ -283,6 +331,35 @@ enum DownloadPDFExportError: LocalizedError {
             "无法创建 PDF 文件。"
         case .unreadableImage(let name):
             "无法读取图片：\(name)"
+        }
+    }
+}
+
+nonisolated enum SuperResolutionLibraryError: LocalizedError, Equatable {
+    case unsupportedSource
+    case noDownloadedChapters
+    case alreadyExists(String)
+    case sourceBusy(String)
+    case recordNotFound
+    case storageUnavailable
+    case pageWriteFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unsupportedSource:
+            "超分版本不能再次超分，请选择普通下载。"
+        case .noDownloadedChapters:
+            "没有已下载章节，无法超分。"
+        case .alreadyExists(let title):
+            "《\(title)》已有超分版本；请先在下载中删除旧版本，或直接阅读。"
+        case .sourceBusy(let title):
+            "《\(title)》仍在下载，请等下载完成后再超分。"
+        case .recordNotFound:
+            "超分记录已不存在。"
+        case .storageUnavailable:
+            "无法创建超分下载目录，请检查存储空间。"
+        case .pageWriteFailed:
+            "超分页面写入下载目录失败。"
         }
     }
 }
@@ -559,6 +636,285 @@ final class DownloadService: ObservableObject {
             return chapter.comments
         }
         return record.comments
+    }
+
+    // MARK: - Super-resolution downloads
+
+    nonisolated static func superResolutionItem(for item: ComicListItem) -> ComicListItem {
+        ComicListItem(
+            id: "picax-sr-\(item.id)",
+            platform: item.platform,
+            title: item.title,
+            subtitle: "2× AI 超分（来自下载）",
+            coverURLString: item.coverURLString,
+            tags: item.tags,
+            pageCount: item.pageCount,
+            likesCount: item.likesCount,
+            favoriteDate: nil,
+            language: item.language
+        )
+    }
+
+    func superResolutionRecord(forSourceRecordID sourceRecordID: String) -> DownloadRecord? {
+        records.first { $0.superResolution?.sourceRecordID == sourceRecordID }
+    }
+
+    /// A record can be super-resolved when it is a normal download with local
+    /// chapters, no download worker is touching it, and no SR copy exists yet.
+    func canSuperResolution(_ record: DownloadRecord) -> Bool {
+        !record.isSuperResolution
+            && !record.chapters.isEmpty
+            && task(for: record.item) == nil
+            && superResolutionRecord(forSourceRecordID: record.id) == nil
+    }
+
+    /// Build a whole-book request for the downloaded chapters. The request is
+    /// scoped to the chapters that actually exist on disk; chapter indices are
+    /// compacted for the synthetic SR record, and the original indices are kept
+    /// only for reading the source files.
+    func makeSuperResolutionBatchRequest(
+        for sourceRecord: DownloadRecord
+    ) throws -> ReaderBatchRenderRequest {
+        guard !sourceRecord.isSuperResolution else {
+            throw SuperResolutionLibraryError.unsupportedSource
+        }
+        let sourceChapters = sourceRecord.chapters.sorted { $0.index < $1.index }
+        guard !sourceChapters.isEmpty else {
+            throw SuperResolutionLibraryError.noDownloadedChapters
+        }
+        guard task(for: sourceRecord.item) == nil else {
+            throw SuperResolutionLibraryError.sourceBusy(sourceRecord.item.title)
+        }
+        guard superResolutionRecord(forSourceRecordID: sourceRecord.id) == nil else {
+            throw SuperResolutionLibraryError.alreadyExists(sourceRecord.item.title)
+        }
+
+        let chapters = sourceChapters.map(\.chapter)
+        let sourceChapterIndexes = sourceChapters.map(\.index)
+        let sourceItem = sourceRecord.item
+        return ReaderBatchRenderRequest(
+            bookID: sourceItem.readingHistoryID,
+            bookTitle: sourceItem.title,
+            chapters: chapters,
+            initialChapterIndex: 0,
+            loadChapterImages: { chapterIndex in
+                guard sourceChapterIndexes.indices.contains(chapterIndex) else { return [] }
+                return await Self.localChapterImages(
+                    item: sourceItem,
+                    chapter: chapters[chapterIndex],
+                    chapterIndex: sourceChapterIndexes[chapterIndex])
+            },
+            libraryOutput: { [weak self] in
+                guard let self else {
+                    throw SuperResolutionLibraryError.storageUnavailable
+                }
+                return try self.makeSuperResolutionBatchTarget(for: sourceRecord)
+            }
+        )
+    }
+
+    /// Create the synthetic download record and the per-page writer used by the
+    /// batch model. Only the synthetic `picax-sr-*` directory is ever cleared;
+    /// the normal download record and its files remain untouched.
+    func makeSuperResolutionBatchTarget(
+        for sourceRecord: DownloadRecord
+    ) throws -> ReaderBatchRenderLibraryOutput {
+        guard !sourceRecord.isSuperResolution else {
+            throw SuperResolutionLibraryError.unsupportedSource
+        }
+        let sourceChapters = sourceRecord.chapters.sorted { $0.index < $1.index }
+        guard !sourceChapters.isEmpty else {
+            throw SuperResolutionLibraryError.noDownloadedChapters
+        }
+        guard task(for: sourceRecord.item) == nil else {
+            throw SuperResolutionLibraryError.sourceBusy(sourceRecord.item.title)
+        }
+
+        let srItem = Self.superResolutionItem(for: sourceRecord.item)
+        let recordID = downloadID(for: srItem)
+        guard !records.contains(where: { $0.id == recordID }),
+              superResolutionRecord(forSourceRecordID: sourceRecord.id) == nil else {
+            throw SuperResolutionLibraryError.alreadyExists(sourceRecord.item.title)
+        }
+
+        let directoryURL: URL
+        do {
+            directoryURL = try comicDirectory(for: srItem)
+            if fileManager.fileExists(atPath: directoryURL.path) {
+                try fileManager.removeItem(at: directoryURL)
+            }
+            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        } catch {
+            throw SuperResolutionLibraryError.storageUnavailable
+        }
+
+        var coverFileName: String?
+        if let sourceCoverURL = localCoverURL(for: sourceRecord) {
+            let destinationURL = directoryURL.appendingPathComponent("cover.jpg", isDirectory: false)
+            if (try? fileManager.copyItem(at: sourceCoverURL, to: destinationURL)) != nil {
+                coverFileName = "cover.jpg"
+            }
+        }
+
+        let chapters = sourceChapters.map(\.chapter)
+        var expectedPageCounts: [Int: Int] = [:]
+        for (offset, chapter) in sourceChapters.enumerated() {
+            expectedPageCounts[offset] = chapter.pageCount
+        }
+        let info = SuperResolutionDownloadInfo(
+            sourceRecordID: sourceRecord.id,
+            sourceItemID: sourceRecord.item.id,
+            sourcePlatform: sourceRecord.item.platform,
+            sourceTitle: sourceRecord.item.title,
+            createdAt: Date(),
+            completedAt: nil,
+            expectedPageCounts: expectedPageCounts)
+        let record = DownloadRecord(
+            item: srItem,
+            chapters: [],
+            totalChapterCount: chapters.count,
+            totalBytes: 0,
+            directoryName: Self.directoryName(for: srItem),
+            coverFileName: coverFileName,
+            detail: ComicDetailInfo(
+                item: srItem,
+                description: "由已下载原图批量生成的 2× AI 超分版本；原下载未被覆盖或修改。",
+                tagGroups: [],
+                chapters: chapters,
+                related: [],
+                updatedText: nil),
+            comments: [],
+            updatedAt: Date(),
+            superResolution: info)
+        var nextRecords = records
+        nextRecords.removeAll { $0.id == recordID }
+        nextRecords.insert(record, at: 0)
+        records = nextRecords
+        PicaXSQLiteStore.upsertDownloadRecord(record)
+
+        return ReaderBatchRenderLibraryOutput(
+            recordID: recordID,
+            directory: directoryURL,
+            retainPage: { [weak self] outputURL, chapterIndex, chapter, pageIndex in
+                guard let self else {
+                    throw SuperResolutionLibraryError.storageUnavailable
+                }
+                return try self.appendSuperResolutionPage(
+                    recordID: recordID,
+                    item: srItem,
+                    chapterIndex: chapterIndex,
+                    chapter: chapter,
+                    pageIndex: pageIndex,
+                    outputURL: outputURL)
+            },
+            finish: { [weak self] completed in
+                self?.finishSuperResolutionRecord(recordID: recordID, completed: completed)
+            })
+    }
+
+    private func appendSuperResolutionPage(
+        recordID: String,
+        item: ComicListItem,
+        chapterIndex: Int,
+        chapter: ComicChapter,
+        pageIndex: Int,
+        outputURL: URL
+    ) throws -> Int {
+        guard let recordIndex = records.firstIndex(where: { $0.id == recordID }) else {
+            throw SuperResolutionLibraryError.recordNotFound
+        }
+        guard fileManager.fileExists(atPath: outputURL.path) else {
+            throw SuperResolutionLibraryError.pageWriteFailed
+        }
+
+        let chapterDirectory: URL
+        do {
+            chapterDirectory = try Self.chapterDirectoryURL(
+                item: item, chapter: chapter, index: chapterIndex)
+            try fileManager.createDirectory(at: chapterDirectory, withIntermediateDirectories: true)
+        } catch {
+            throw SuperResolutionLibraryError.storageUnavailable
+        }
+
+        let destinationURL = chapterDirectory.appendingPathComponent(
+            ReaderBatchRenderStore.libraryPageFileName(pageIndex: pageIndex),
+            isDirectory: false)
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try? fileManager.removeItem(at: destinationURL)
+        }
+        do {
+            try fileManager.moveItem(at: outputURL, to: destinationURL)
+        } catch {
+            do {
+                try fileManager.copyItem(at: outputURL, to: destinationURL)
+            } catch {
+                throw SuperResolutionLibraryError.pageWriteFailed
+            }
+        }
+        ReaderBatchRenderStore.discardTrialOutput(outputURL)
+
+        guard let size = try? destinationURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+              size > 0 else {
+            try? fileManager.removeItem(at: destinationURL)
+            throw SuperResolutionLibraryError.pageWriteFailed
+        }
+
+        var record = records[recordIndex]
+        let retainedPageCount = (try? fileManager.contentsOfDirectory(
+            at: chapterDirectory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ))?.filter(Self.isImageFile).count ?? (pageIndex + 1)
+        if let index = record.chapters.firstIndex(where: { $0.index == chapterIndex }) {
+            var chapterRecord = record.chapters[index]
+            chapterRecord.pageCount = retainedPageCount
+            chapterRecord.bytes += Int64(size)
+            chapterRecord.downloadedAt = Date()
+            record.chapters[index] = chapterRecord
+        } else {
+            record.chapters.append(DownloadedChapterRecord(
+                index: chapterIndex,
+                chapter: chapter,
+                pageCount: retainedPageCount,
+                bytes: Int64(size),
+                downloadedAt: Date()))
+            record.chapters.sort { $0.index < $1.index }
+        }
+        record.totalBytes = record.chapters.reduce(0) { $0 + $1.bytes }
+        record.updatedAt = Date()
+
+        var nextRecords = records
+        nextRecords[recordIndex] = record
+        records = nextRecords
+        PicaXSQLiteStore.upsertDownloadRecord(record)
+        return size
+    }
+
+    private func finishSuperResolutionRecord(recordID: String, completed: Bool) {
+        guard let recordIndex = records.firstIndex(where: { $0.id == recordID }) else { return }
+        var record = records[recordIndex]
+        guard record.isSuperResolution else { return }
+
+        if record.chapters.isEmpty {
+            var nextRecords = records
+            nextRecords.remove(at: recordIndex)
+            records = nextRecords
+            PicaXSQLiteStore.deleteDownloadRecord(id: recordID)
+            if let directoryURL = comicDirectoryURLIfAvailable(for: record.item) {
+                try? fileManager.removeItem(at: directoryURL)
+            }
+            return
+        }
+
+        if completed, var info = record.superResolution {
+            info.completedAt = Date()
+            record.superResolution = info
+        }
+        record.updatedAt = Date()
+        var nextRecords = records
+        nextRecords[recordIndex] = record
+        records = nextRecords
+        PicaXSQLiteStore.upsertDownloadRecord(record)
     }
 
     func enqueue(detail: ComicDetailInfo, chapterIndexes: [Int], downloadsComments: Bool = false) -> DownloadEnqueueResult {

@@ -25,7 +25,12 @@ nonisolated enum DownloadImageValidation {
         guard FileManager.default.fileExists(atPath: directory.path) else { return [:] }
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
         return Dictionary(files.compactMap { url -> (Int, URL)? in
-            guard DownloadService.isImageFile(url), let number = Int(url.deletingPathExtension().lastPathComponent), number > 0 else { return nil }
+            // Normal downloads use 0001.jpg; super-resolution downloads use
+            // P0001.png so they remain recognizable in Finder and still sort
+            // (and integrity-check) as pages in the local reader.
+            let stem = url.deletingPathExtension().lastPathComponent
+            let digits = stem.hasPrefix("P") ? String(stem.dropFirst()) : stem
+            guard DownloadService.isImageFile(url), let number = Int(digits), number > 0 else { return nil }
             return (number - 1, url)
         }, uniquingKeysWith: { first, _ in first })
     }
