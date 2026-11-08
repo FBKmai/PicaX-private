@@ -32,6 +32,7 @@ struct PlatformLoginView: View {
     let platform: ComicPlatform
     private let service = ComicContentService()
 
+    @AppStorage(PlatformFeatureSettingsKey.jmAutoLogin) private var jmAutoLogin = true
     @State private var username = ""
     @State private var password = ""
     @State private var errorMessage: String?
@@ -78,6 +79,14 @@ struct PlatformLoginView: View {
                         title: "登录时间",
                         value: account.loggedInAt.formatted(date: .abbreviated, time: .shortened)
                     )
+                    if platform == .jmComic {
+                        SettingsValueRow(title: "自动登录", value: jmAutoLoginStatusText)
+                        if let error = platformAccounts.lastJmAutoLoginError, jmAutoLogin {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
                 }
             }
 
@@ -129,6 +138,22 @@ struct PlatformLoginView: View {
         .navigationTitle(platform.title)
         .picaxHidesTabBar()
         .onAppear(perform: populateUsername)
+    }
+
+    private var jmAutoLoginStatusText: String {
+        guard jmAutoLogin else {
+            return "已关闭"
+        }
+        if platformAccounts.isJmAutoLoginRunning {
+            return "正在登录…"
+        }
+        if platformAccounts.lastJmAutoLoginError != nil {
+            return "最近一次失败"
+        }
+        if platformAccounts.lastJmAutoLoginAt != nil {
+            return "最近一次成功"
+        }
+        return "启动时自动尝试"
     }
 
     private func beginLogin() {

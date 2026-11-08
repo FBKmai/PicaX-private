@@ -170,8 +170,19 @@ struct ComicDownloadTask: Identifiable, Equatable, Codable {
     var currentPageCount: Int
     var downloadedBytes: Int64
     var errorMessage: String?
+    /// When true, a successful download schedules this book for automatic
+    /// super-resolution. Optional so download tasks persisted before this
+    /// option was added still decode.
+    var autoSuperResolutionAfterDownload: Bool?
 
-    init(item: ComicListItem, chapters: [ComicChapter], chapterIndexes: [Int], detail: ComicDetailInfo?, downloadsComments: Bool) {
+    init(
+        item: ComicListItem,
+        chapters: [ComicChapter],
+        chapterIndexes: [Int],
+        detail: ComicDetailInfo?,
+        downloadsComments: Bool,
+        autoSuperResolutionAfterDownload: Bool = false
+    ) {
         self.id = UUID().uuidString
         self.item = item
         self.chapters = chapters
@@ -187,16 +198,26 @@ struct ComicDownloadTask: Identifiable, Equatable, Codable {
         self.currentPageCount = 0
         self.downloadedBytes = 0
         self.errorMessage = nil
+        self.autoSuperResolutionAfterDownload = autoSuperResolutionAfterDownload ? true : nil
     }
 
-    init(item: ComicListItem, downloadsComments: Bool) {
+    init(
+        item: ComicListItem,
+        downloadsComments: Bool,
+        autoSuperResolutionAfterDownload: Bool = false
+    ) {
         self.init(
             item: item,
             chapters: [],
             chapterIndexes: [],
             detail: nil,
-            downloadsComments: downloadsComments
+            downloadsComments: downloadsComments,
+            autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
         )
+    }
+
+    var requestsAutoSuperResolution: Bool {
+        autoSuperResolutionAfterDownload == true
     }
 
     var needsChapterResolution: Bool {
@@ -470,9 +491,21 @@ final class DownloadTaskStore: ObservableObject {
     }
 }
 
+struct AutoSuperResolutionStatus: Equatable {
+    var isRunning: Bool
+    var title: String
+    var detail: String
+    var progress: Double
+}
+
 @MainActor
 final class DownloadService: ObservableObject {
+    /// The app-wide service. Background processing tasks use this instance so
+    /// their progress and records stay in sync with the foreground UI.
+    static let shared = DownloadService()
+
     @Published private(set) var records: [DownloadRecord] = []
+    @Published private(set) var autoSuperResolutionStatus: AutoSuperResolutionStatus?
     let taskStore: DownloadTaskStore
 
     private(set) var tasks: [ComicDownloadTask] {
@@ -489,10 +522,20 @@ final class DownloadService: ObservableObject {
     private var taskStructureCancellable: AnyCancellable?
     private var lastTaskProgressPublicationDate = Date.distantPast
     private var lastProgressPresentationRefreshDate = Date.distantPast
+    private var autoSuperResolutionModel: ReaderBatchRenderModel?
+    private var autoSuperResolutionObserverTask: Task<Void, Never>?
+    private var pendingAutoSuperResolutionRecordIDs: [String] = []
+    private var currentAutoSuperResolutionRecordID: String?
+    #if os(iOS)
+    private var autoSuperResolutionSetIdleTimerDisabled = false
+    #endif
     var accountProvider: ((ComicPlatform) -> PlatformAccount?)?
     #if os(iOS)
     private lazy var backgroundExecution = DownloadBackgroundExecutionController { [weak self] in
         self?.handleBackgroundExecutionExpired()
+    }
+    private lazy var autoSuperResolutionBackgroundExecution = DownloadBackgroundExecutionController { [weak self] in
+        self?.handleAutoSuperResolutionBackgroundExpired()
     }
     private var backgroundExecutionExpired = false
     #endif
@@ -549,6 +592,13 @@ final class DownloadService: ObservableObject {
             )
         }
         records = PicaXSQLiteStore.loadDownloadRecords()
+        let pendingRecordIDs = defaults.stringArray(forKey: DownloadSettingsKey.autoSuperResolutionQueue) ?? []
+        let availableRecordIDs = Set(records.map(\.id))
+        var seenPendingRecordIDs = Set<String>()
+        pendingAutoSuperResolutionRecordIDs = pendingRecordIDs.filter { recordID in
+            availableRecordIDs.contains(recordID) && seenPendingRecordIDs.insert(recordID).inserted
+        }
+        persistAutoSuperResolutionQueue()
         taskStructureCancellable = taskStore.$tasks
             .map { tasks in
                 tasks.map {
@@ -568,6 +618,7 @@ final class DownloadService: ObservableObject {
 
     deinit {
         workerTask?.cancel()
+        autoSuperResolutionObserverTask?.cancel()
     }
 
     func configure(accountProvider: @escaping (ComicPlatform) -> PlatformAccount?) {
@@ -575,12 +626,17 @@ final class DownloadService: ObservableObject {
         startIfNeeded()
         refreshProgressPresentation()
         refreshBackgroundExecution()
+        // Resume automatic super-resolution that was interrupted by app
+        // termination before this launch.
+        processAutoSuperResolutionQueueIfNeeded()
     }
 
     func applicationDidEnterBackground() {
         #if os(iOS)
         backgroundExecutionExpired = false
         refreshBackgroundExecution()
+        refreshAutoSuperResolutionBackgroundExecution()
+        AutoSuperResolutionBackgroundCoordinator.shared.scheduleIfNeeded()
         #endif
     }
 
@@ -588,8 +644,11 @@ final class DownloadService: ObservableObject {
         #if os(iOS)
         backgroundExecutionExpired = false
         backgroundExecution.end()
+        refreshAutoSuperResolutionBackgroundExecution()
+        AutoSuperResolutionBackgroundCoordinator.shared.applicationDidBecomeActive()
         #endif
         startIfNeeded()
+        processAutoSuperResolutionQueueIfNeeded()
     }
 
     func latest(limit: Int) -> [DownloadRecord] {
@@ -718,6 +777,232 @@ final class DownloadService: ObservableObject {
             }
         )
     }
+
+    // MARK: - Automatic super-resolution queue
+
+    static func hasPersistedAutoSuperResolutionWork(defaults: UserDefaults = .standard) -> Bool {
+        !(defaults.stringArray(forKey: DownloadSettingsKey.autoSuperResolutionQueue) ?? []).isEmpty
+    }
+
+    var hasPendingAutoSuperResolutionWork: Bool {
+        autoSuperResolutionModel != nil
+            || currentAutoSuperResolutionRecordID != nil
+            || !pendingAutoSuperResolutionRecordIDs.isEmpty
+    }
+
+    /// Queues a completed download for the single-worker automatic SR queue.
+    /// The queue is persisted in `UserDefaults` so it can survive the app being
+    /// suspended or terminated while a book is being processed.
+    func scheduleAutoSuperResolution(for item: ComicListItem) {
+        let recordID = downloadID(for: item)
+        guard !pendingAutoSuperResolutionRecordIDs.contains(recordID),
+              currentAutoSuperResolutionRecordID != recordID else { return }
+        pendingAutoSuperResolutionRecordIDs.append(recordID)
+        persistAutoSuperResolutionQueue()
+        #if os(iOS)
+        AutoSuperResolutionBackgroundCoordinator.shared.scheduleIfNeeded()
+        #endif
+        processAutoSuperResolutionQueueIfNeeded()
+    }
+
+    func processAutoSuperResolutionQueueIfNeeded() {
+        guard autoSuperResolutionModel == nil else { return }
+        #if os(iOS)
+        // When background continuation is disabled, leave the persisted queue
+        // alone until the app is active again instead of starting a model that
+        // iOS would immediately suspend.
+        if UIApplication.shared.applicationState != .active,
+           !DownloadSettingsKey.allowsAutoSuperResolutionInBackground(defaults: defaults) {
+            return
+        }
+        #endif
+
+        while !pendingAutoSuperResolutionRecordIDs.isEmpty {
+            let recordID = pendingAutoSuperResolutionRecordIDs.removeFirst()
+            guard let record = records.first(where: { $0.id == recordID }) else {
+                removePersistedAutoSuperResolutionRecord(recordID)
+                autoSuperResolutionStatus = AutoSuperResolutionStatus(
+                    isRunning: false,
+                    title: "自动超分已跳过",
+                    detail: "找不到对应的下载记录，可能已被删除。",
+                    progress: 0
+                )
+                continue
+            }
+            // A queued book whose automatic run was interrupted by suspension or
+            // termination leaves an unfinished synthetic record behind. Remove
+            // that derived record and start the book over; the original download
+            // is untouched.
+            if let interruptedRecord = superResolutionRecord(forSourceRecordID: recordID),
+               interruptedRecord.superResolution?.completedAt == nil {
+                removeRecord(interruptedRecord)
+            }
+            guard canSuperResolution(record) else {
+                removePersistedAutoSuperResolutionRecord(recordID)
+                autoSuperResolutionStatus = AutoSuperResolutionStatus(
+                    isRunning: false,
+                    title: "自动超分已跳过",
+                    detail: "\(record.item.title)：已有超分版本或下载记录当前不可用。",
+                    progress: 0
+                )
+                continue
+            }
+            do {
+                let request = try makeSuperResolutionBatchRequest(for: record)
+                currentAutoSuperResolutionRecordID = recordID
+                persistAutoSuperResolutionQueue()
+                startAutoSuperResolution(request: request)
+                return
+            } catch {
+                removePersistedAutoSuperResolutionRecord(recordID)
+                autoSuperResolutionStatus = AutoSuperResolutionStatus(
+                    isRunning: false,
+                    title: "自动超分无法开始",
+                    detail: "\(record.item.title)：\(error.localizedDescription)",
+                    progress: 0
+                )
+            }
+        }
+
+        #if os(iOS)
+        AutoSuperResolutionBackgroundCoordinator.shared.cancelIfIdle()
+        #endif
+    }
+
+    func cancelAutoSuperResolution() {
+        // Cancelling from the banner stops the whole automatic queue, not just
+        // the book that happens to be rendering right now.
+        pendingAutoSuperResolutionRecordIDs.removeAll()
+        persistAutoSuperResolutionQueue()
+        autoSuperResolutionModel?.cancel()
+    }
+
+    func dismissAutoSuperResolutionStatus() {
+        guard autoSuperResolutionModel == nil else { return }
+        autoSuperResolutionStatus = nil
+    }
+
+    private func persistAutoSuperResolutionQueue() {
+        var recordIDs = pendingAutoSuperResolutionRecordIDs
+        if let currentAutoSuperResolutionRecordID,
+           !recordIDs.contains(currentAutoSuperResolutionRecordID) {
+            recordIDs.insert(currentAutoSuperResolutionRecordID, at: 0)
+        }
+        defaults.set(recordIDs, forKey: DownloadSettingsKey.autoSuperResolutionQueue)
+    }
+
+    private func removePersistedAutoSuperResolutionRecord(_ recordID: String) {
+        pendingAutoSuperResolutionRecordIDs.removeAll { $0 == recordID }
+        persistAutoSuperResolutionQueue()
+    }
+
+    private func startAutoSuperResolution(request: ReaderBatchRenderRequest) {
+        let model = ReaderBatchRenderModel()
+        model.prepare(request: request)
+        autoSuperResolutionModel = model
+        autoSuperResolutionStatus = AutoSuperResolutionStatus(
+            isRunning: true,
+            title: "正在自动超分",
+            detail: request.bookTitle,
+            progress: 0
+        )
+
+        let preset = DownloadSettingsKey.autoSuperResolutionPreset(defaults: defaults)
+        let mode = DownloadSettingsKey.autoSuperResolutionInferenceMode(defaults: defaults)
+        #if os(iOS)
+        refreshAutoSuperResolutionBackgroundExecution()
+        if !UIApplication.shared.isIdleTimerDisabled {
+            UIApplication.shared.isIdleTimerDisabled = true
+            autoSuperResolutionSetIdleTimerDisabled = true
+        }
+        #endif
+        model.start(scope: .wholeBook, preset: preset, mode: mode)
+        observeAutoSuperResolution(model: model)
+    }
+
+    private func observeAutoSuperResolution(model: ReaderBatchRenderModel) {
+        autoSuperResolutionObserverTask?.cancel()
+        autoSuperResolutionObserverTask = Task { [weak self, weak model] in
+            while let model, model.isRunning {
+                self?.refreshAutoSuperResolutionStatus(model: model)
+                try? await Task.sleep(nanoseconds: 700_000_000)
+                if Task.isCancelled { return }
+            }
+            guard let self, let model else { return }
+            self.refreshAutoSuperResolutionStatus(model: model)
+            self.finishAutoSuperResolution(model: model)
+        }
+    }
+
+    private func refreshAutoSuperResolutionStatus(model: ReaderBatchRenderModel) {
+        let title: String
+        switch model.phase {
+        case .idle:
+            title = "等待自动超分"
+        case .running:
+            title = "正在自动超分"
+        case .cancelling:
+            title = "正在取消自动超分"
+        case .completed:
+            title = "自动超分完成"
+        case .cancelled:
+            title = "自动超分已取消"
+        case .failed:
+            title = "自动超分失败"
+        }
+
+        var detail = model.currentBookTitle.isEmpty ? model.message : "\(model.currentBookTitle) · \(model.message)"
+        if model.bookCount > 1, model.currentBookOrdinal > 0 {
+            detail = "第 \(model.currentBookOrdinal)/\(model.bookCount) 本 · \(detail)"
+        }
+        autoSuperResolutionStatus = AutoSuperResolutionStatus(
+            isRunning: model.isRunning,
+            title: title,
+            detail: detail,
+            progress: min(max(model.overallProgress, 0), 1)
+        )
+    }
+
+    private func finishAutoSuperResolution(model: ReaderBatchRenderModel) {
+        guard autoSuperResolutionModel === model else { return }
+        autoSuperResolutionModel = nil
+        autoSuperResolutionObserverTask = nil
+        #if os(iOS)
+        autoSuperResolutionBackgroundExecution.end()
+        if autoSuperResolutionSetIdleTimerDisabled {
+            UIApplication.shared.isIdleTimerDisabled = false
+            autoSuperResolutionSetIdleTimerDisabled = false
+        }
+        #endif
+        if let finishedRecordID = currentAutoSuperResolutionRecordID {
+            currentAutoSuperResolutionRecordID = nil
+            removePersistedAutoSuperResolutionRecord(finishedRecordID)
+        }
+        #if os(iOS)
+        AutoSuperResolutionBackgroundCoordinator.shared.cancelIfIdle()
+        #endif
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.processAutoSuperResolutionQueueIfNeeded()
+        }
+    }
+
+    #if os(iOS)
+    private func refreshAutoSuperResolutionBackgroundExecution() {
+        let shouldKeepRunning = autoSuperResolutionModel != nil
+            && DownloadSettingsKey.allowsAutoSuperResolutionInBackground(defaults: defaults)
+            && UIApplication.shared.applicationState != .active
+        autoSuperResolutionBackgroundExecution.update(keepsRunning: shouldKeepRunning)
+    }
+
+    private func handleAutoSuperResolutionBackgroundExpired() {
+        // If the regular background assertion runs out, ask BGProcessingTask
+        // for additional time. The render model is left running and resumes
+        // when iOS schedules the app again.
+        AutoSuperResolutionBackgroundCoordinator.shared.scheduleIfNeeded()
+    }
+    #endif
 
     /// Create the synthetic download record and the per-page writer used by the
     /// batch model. Only the synthetic `picax-sr-*` directory is ever cleared;
@@ -923,7 +1208,12 @@ final class DownloadService: ObservableObject {
         PicaXSQLiteStore.upsertDownloadRecord(record)
     }
 
-    func enqueue(detail: ComicDetailInfo, chapterIndexes: [Int], downloadsComments: Bool = false) -> DownloadEnqueueResult {
+    func enqueue(
+        detail: ComicDetailInfo,
+        chapterIndexes: [Int],
+        downloadsComments: Bool = false,
+        autoSuperResolutionAfterDownload: Bool = false
+    ) -> DownloadEnqueueResult {
         guard task(for: detail.item) == nil else {
             return .alreadyDownloading
         }
@@ -943,14 +1233,19 @@ final class DownloadService: ObservableObject {
             chapters: detail.chapters,
             chapterIndexes: uniqueIndexes,
             detail: detail,
-            downloadsComments: downloadsComments
+            downloadsComments: downloadsComments,
+            autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
         ))
         saveTasks()
         startIfNeeded()
         return .queued(uniqueIndexes.count)
     }
 
-    func enqueue(item: ComicListItem, downloadsComments: Bool = false) -> DownloadEnqueueResult {
+    func enqueue(
+        item: ComicListItem,
+        downloadsComments: Bool = false,
+        autoSuperResolutionAfterDownload: Bool = false
+    ) -> DownloadEnqueueResult {
         guard task(for: item) == nil else {
             return .alreadyDownloading
         }
@@ -961,7 +1256,8 @@ final class DownloadService: ObservableObject {
 
         tasks.append(ComicDownloadTask(
             item: item,
-            downloadsComments: downloadsComments
+            downloadsComments: downloadsComments,
+            autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
         ))
         saveTasks()
         startIfNeeded()
@@ -970,6 +1266,7 @@ final class DownloadService: ObservableObject {
 
     func enqueue(
         items: [ComicListItem],
+        autoSuperResolutionAfterDownload: Bool = false,
         downloadsComments: (ComicListItem) -> Bool
     ) -> [DownloadEnqueueResult] {
         guard !items.isEmpty else { return [] }
@@ -991,7 +1288,8 @@ final class DownloadService: ObservableObject {
             taskIDs.insert(id)
             queuedTasks.append(ComicDownloadTask(
                 item: item,
-                downloadsComments: downloadsComments(item)
+                downloadsComments: downloadsComments(item),
+                autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
             ))
             return .queued(0)
         }
@@ -1274,6 +1572,7 @@ final class DownloadService: ObservableObject {
         do {
             let account = accountProvider?(task.item.platform)
             guard let preparedTask = try await prepareTaskForDownload(id: id, account: account) else { return }
+            let shouldAutoSuperResolution = preparedTask.requestsAutoSuperResolution
             let metadata = await loadMetadata(for: preparedTask, account: account)
             let runnableChapterIndexes = filteredChapterIndexes(preparedTask.chapterIndexes, chapters: preparedTask.chapters)
             guard !runnableChapterIndexes.isEmpty else {
@@ -1339,6 +1638,9 @@ final class DownloadService: ObservableObject {
 
             tasks.removeAll { $0.id == id }
             saveTasks()
+            if shouldAutoSuperResolution {
+                scheduleAutoSuperResolution(for: preparedTask.item)
+            }
         } catch where error.isTaskCancellation {
             updateTask(id) { value in
                 value.status = .queued

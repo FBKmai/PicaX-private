@@ -47,6 +47,14 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>moye.PicaX.superresolution</string>
+	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>NSFaceIDUsageDescription</key>

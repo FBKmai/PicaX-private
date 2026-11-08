@@ -1,5 +1,15 @@
 import SwiftUI
 
+struct ComicListSelectionConfiguration {
+    var selectedIDs: Set<String>
+    var toggle: (ComicListItem) -> Void
+}
+
+struct ComicListRowSelection {
+    let isSelected: Bool
+    let toggle: () -> Void
+}
+
 struct ComicListSection: View {
     @EnvironmentObject private var readingHistory: ReadingHistoryService
     @EnvironmentObject private var blockingKeywords: BlockingKeywordService
@@ -30,6 +40,7 @@ struct ComicListSection: View {
     var isPreparingReadAll = false
     var readAllAction: (() -> Void)?
     var loadMore: (() -> Void)?
+    var selectionContext: ComicListSelectionConfiguration?
     @State private var detailRequest: ComicListDetailRequest?
     @State private var readerRequest: ComicListReaderRequest?
     @State private var readingListRequest: ReadingListRequest?
@@ -463,7 +474,13 @@ struct ComicListSection: View {
             showsPopularity: showsListPopularity,
             comicDetailTransitionNamespace: navigationTransitionNamespace,
             openDetail: { detailRequest = ComicListDetailRequest(item: $0) },
-            openReader: { readerRequest = $0 }
+            openReader: { readerRequest = $0 },
+            selection: selectionContext.map { context in
+                ComicListRowSelection(
+                    isSelected: context.selectedIDs.contains(row.item.readingHistoryID),
+                    toggle: { context.toggle(row.item) }
+                )
+            }
         ) {
             if row.id == lastDisplayedComicID {
                 revealOrLoadMore(totalVisibleCount: totalVisibleCount)
@@ -913,6 +930,7 @@ struct ComicListActionLink: View {
     let comicDetailTransitionNamespace: Namespace.ID
     let openDetail: (ComicListItem) -> Void
     let openReader: (ComicListReaderRequest) -> Void
+    var selection: ComicListRowSelection?
     var onAppear: (() -> Void)?
 
     @State private var favoriteContext: ComicListFavoriteContext?
@@ -920,7 +938,13 @@ struct ComicListActionLink: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        contextMenuSource
+        Group {
+            if selection == nil {
+                contextMenuSource
+            } else {
+                actionButton
+            }
+        }
             .onAppear {
                 onAppear?()
             }
@@ -966,7 +990,11 @@ struct ComicListActionLink: View {
 
     private var actionButton: some View {
         Button {
-            openDetail(item)
+            if let selection {
+                selection.toggle()
+            } else {
+                openDetail(item)
+            }
         } label: {
             actionLabel
         }
@@ -994,6 +1022,8 @@ struct ComicListActionLink: View {
                 showsTags: showsTags,
                 maxVisibleTags: maxVisibleTags,
                 showsPopularity: showsPopularity,
+                isSelectionMode: selection != nil,
+                isSelected: selection?.isSelected ?? false,
                 coverTransitionSource: ComicDetailTransitionSource(
                     item: item,
                     namespace: comicDetailTransitionNamespace
@@ -1008,7 +1038,9 @@ struct ComicListActionLink: View {
                 showsFavoriteState: showsFavoriteState,
                 showsTags: showsTags,
                 maxVisibleTags: maxVisibleTags,
-                showsPopularity: showsPopularity
+                showsPopularity: showsPopularity,
+                isSelectionMode: selection != nil,
+                isSelected: selection?.isSelected ?? false
             )
             .equatable()
             .picaxComicDetailTransitionSource(
@@ -1148,6 +1180,8 @@ struct ComicListRow: View, Equatable {
     var showsTags = true
     var maxVisibleTags = 5
     var showsPopularity = true
+    var isSelectionMode = false
+    var isSelected = false
 
     static func == (lhs: ComicListRow, rhs: ComicListRow) -> Bool {
         lhs.item == rhs.item
@@ -1157,6 +1191,8 @@ struct ComicListRow: View, Equatable {
             && lhs.showsTags == rhs.showsTags
             && lhs.maxVisibleTags == rhs.maxVisibleTags
             && lhs.showsPopularity == rhs.showsPopularity
+            && lhs.isSelectionMode == rhs.isSelectionMode
+            && lhs.isSelected == rhs.isSelected
     }
 
     var body: some View {
@@ -1209,10 +1245,24 @@ struct ComicListRow: View, Equatable {
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 112, alignment: .topLeading)
+
+            if isSelectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                    .padding(.top, 4)
+                    .accessibilityHidden(true)
+            }
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
         .background(AppColor.secondaryGroupedBackground, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay {
+            if isSelectionMode, isSelected {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
+            }
+        }
     }
 
     private var visibleTagLimit: Int {
@@ -1235,6 +1285,8 @@ private struct ComicListWaterfallCard: View, Equatable {
     var maxVisibleTags = 5
     var showsPopularity = true
     var usesOpaqueSurface = false
+    var isSelectionMode = false
+    var isSelected = false
     var coverTransitionSource: ComicDetailTransitionSource? = nil
     @State private var coverTint: Color?
 
@@ -1247,6 +1299,8 @@ private struct ComicListWaterfallCard: View, Equatable {
             && lhs.maxVisibleTags == rhs.maxVisibleTags
             && lhs.showsPopularity == rhs.showsPopularity
             && lhs.usesOpaqueSurface == rhs.usesOpaqueSurface
+            && lhs.isSelectionMode == rhs.isSelectionMode
+            && lhs.isSelected == rhs.isSelected
     }
 
     var body: some View {
@@ -1335,6 +1389,23 @@ private struct ComicListWaterfallCard: View, Equatable {
             cornerRadius: Self.cornerRadius,
             isEnabled: !usesOpaqueSurface
         )
+        .overlay(alignment: .topTrailing) {
+            if isSelectionMode {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(isSelected ? Color.white : Color.white.opacity(0.9))
+                    .padding(6)
+                    .background(.black.opacity(0.38), in: Circle())
+                    .padding(10)
+                    .accessibilityHidden(true)
+            }
+        }
+        .overlay {
+            if isSelectionMode, isSelected {
+                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+            }
+        }
         .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
         .task(id: item.coverURLString) {
             coverTint = nil

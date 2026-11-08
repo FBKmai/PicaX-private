@@ -217,9 +217,28 @@ enum DownloadSettingsKey {
     static let showsProgressNotifications = "settings.download.showsProgressNotifications"
     static let showsProgressLiveActivity = "settings.download.showsProgressLiveActivity"
     static let progressNotificationUpdateIntervalSeconds = "settings.download.progressNotificationUpdateIntervalSeconds"
+    static let autoSuperResolutionAfterDownload = "settings.download.autoSuperResolutionAfterDownload"
+    static let autoSuperResolutionPreset = "settings.download.autoSuperResolutionPreset"
+    static let autoSuperResolutionInferenceMode = "settings.download.autoSuperResolutionInferenceMode"
+    static let autoSuperResolutionInBackground = "settings.download.autoSuperResolutionInBackground"
+    static let autoSuperResolutionQueue = "settings.download.autoSuperResolutionQueue"
 
     static let defaultArchiveFileNameTemplate = "{title}"
     static let defaultProgressNotificationUpdateIntervalSeconds = 2
+
+    static func autoSuperResolutionPreset(defaults: UserDefaults = .standard) -> SuperResolutionPreset {
+        SuperResolutionPreset(rawValue: defaults.string(forKey: autoSuperResolutionPreset) ?? "") ?? .color
+    }
+
+    static func autoSuperResolutionInferenceMode(defaults: UserDefaults = .standard) -> SuperResolutionInferenceMode {
+        SuperResolutionInferenceMode(rawValue: defaults.string(forKey: autoSuperResolutionInferenceMode) ?? "") ?? .automatic
+    }
+
+    static func allowsAutoSuperResolutionInBackground(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: autoSuperResolutionInBackground) == nil
+            ? true
+            : defaults.bool(forKey: autoSuperResolutionInBackground)
+    }
 }
 
 enum SearchSettingsKey {
@@ -474,6 +493,7 @@ enum PlatformFeatureSettingsKey {
     static let jmAppVersion = "settings.platformFeature.jm.appVersion"
     static let jmAutoSelectAPIEndpoint = "settings.platformFeature.jm.autoSelectAPIEndpoint"
     static let jmAutoCheckIn = "settings.platformFeature.jm.autoCheckIn"
+    static let jmAutoLogin = "settings.platformFeature.jm.autoLogin"
     static let jmFavoriteSort = "settings.platformFeature.jm.favoriteSort"
     static let hitomiDataDomain = "settings.platformFeature.hitomi.dataDomain"
     static let ehentaiPrefersOriginalImage = "settings.platformFeature.ehentai.prefersOriginalImage"
@@ -510,6 +530,12 @@ enum PlatformFeatureSettings {
     static func jmFavoriteSort(defaults: UserDefaults = .standard) -> String {
         let rawValue = defaults.string(forKey: PlatformFeatureSettingsKey.jmFavoriteSort) ?? JmFavoriteSort.latest.rawValue
         return JmFavoriteSort(rawValue: rawValue)?.apiValue ?? JmFavoriteSort.latest.apiValue
+    }
+
+    static func jmAutoLogin(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: PlatformFeatureSettingsKey.jmAutoLogin) == nil
+            ? true
+            : defaults.bool(forKey: PlatformFeatureSettingsKey.jmAutoLogin)
     }
 
     static func jmAPIBaseURLs(defaults: UserDefaults = .standard) -> [String] {
@@ -666,9 +692,9 @@ enum PicacgFavoriteSort: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .oldest:
-            "旧到新"
+            "收藏时间：旧到新"
         case .newest:
-            "新到旧"
+            "收藏时间：新到旧"
         }
     }
 }

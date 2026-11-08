@@ -4,6 +4,9 @@ import Foundation
 @MainActor
 final class PlatformAccountService: ObservableObject {
     @Published private(set) var accounts: [ComicPlatform: PlatformAccount]
+    @Published private(set) var isJmAutoLoginRunning = false
+    @Published private(set) var lastJmAutoLoginAt: Date?
+    @Published private(set) var lastJmAutoLoginError: String?
 
     init(defaults: UserDefaults = .standard) {
         accounts = PicaXSQLiteStore.loadPlatformAccounts(defaults: defaults)
@@ -33,6 +36,39 @@ final class PlatformAccountService: ObservableObject {
 
     func reloadFromDefaults() {
         accounts = PicaXSQLiteStore.loadPlatformAccounts()
+    }
+
+    /// Attempts a fresh JMComic sign-in with the locally saved password. The
+    /// attempt is throttled so app launch and `scenePhase` changes do not issue
+    /// duplicate logins back to back.
+    func autoLoginJmComicIfNeeded(minimumInterval: TimeInterval = 300) async {
+        guard PlatformFeatureSettings.jmAutoLogin() else {
+            return
+        }
+        guard let account = accounts[.jmComic], account.hasReusableCredential else {
+            return
+        }
+        guard !isJmAutoLoginRunning else {
+            return
+        }
+        if let lastJmAutoLoginAt,
+           Date().timeIntervalSince(lastJmAutoLoginAt) < minimumInterval {
+            return
+        }
+
+        isJmAutoLoginRunning = true
+        lastJmAutoLoginAt = Date()
+        defer { isJmAutoLoginRunning = false }
+
+        do {
+            let refreshedAccount = try await ComicContentService().refreshJmSession(account: account)
+            accounts[refreshedAccount.platform] = refreshedAccount
+            lastJmAutoLoginError = nil
+        } catch where error.isTaskCancellation {
+            return
+        } catch {
+            lastJmAutoLoginError = error.localizedDescription
+        }
     }
 }
 

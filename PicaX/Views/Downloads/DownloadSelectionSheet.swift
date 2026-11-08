@@ -5,11 +5,13 @@ struct DownloadSelectionSheet: View {
     @EnvironmentObject private var downloadService: DownloadService
     @EnvironmentObject private var downloadTaskStore: DownloadTaskStore
     @AppStorage(DownloadSettingsKey.downloadsCommentsByDefault) private var downloadsCommentsByDefault = false
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionAfterDownload) private var autoSuperResolutionByDefault = false
 
     let detail: ComicDetailInfo
     @State private var selectedIndexes: Set<Int> = []
     @State private var message: String?
     @State private var downloadsComments = false
+    @State private var autoSuperResolutionAfterDownload = false
     @State private var didApplyDefaultOptions = false
 
     var body: some View {
@@ -26,8 +28,10 @@ struct DownloadSelectionSheet: View {
                     Section {
                         Toggle("一并下载评论区", isOn: $downloadsComments)
                             .disabled(!detail.item.supportsComments || currentTask != nil)
+                        Toggle("下载完成后自动超分", isOn: $autoSuperResolutionAfterDownload)
+                            .disabled(currentTask != nil)
                     } footer: {
-                        Text(detail.item.supportsComments ? "详情评论和章节评论会保存到本地。" : "当前来源不支持评论区下载。")
+                        Text(footerText)
                     }
 
                     Section {
@@ -105,6 +109,7 @@ struct DownloadSelectionSheet: View {
             .onAppear {
                 if !didApplyDefaultOptions {
                     downloadsComments = downloadsCommentsByDefault && detail.item.supportsComments
+                    autoSuperResolutionAfterDownload = autoSuperResolutionByDefault
                     didApplyDefaultOptions = true
                 }
 
@@ -125,6 +130,13 @@ struct DownloadSelectionSheet: View {
         downloadTaskStore.task(for: detail.item)
     }
 
+    private var footerText: String {
+        let commentsText = detail.item.supportsComments
+            ? "详情评论和章节评论会保存到本地。"
+            : "当前来源不支持评论区下载。"
+        return commentsText + " 自动超分会在下载完成后使用下载设置中的模型处理；开启后台超分后可在 App 进入后台时继续，具体时长由系统决定。"
+    }
+
     private var availableIndexes: Set<Int> {
         Set(detail.chapters.indices.filter { !downloadedIndexes.contains($0) })
     }
@@ -142,7 +154,8 @@ struct DownloadSelectionSheet: View {
         let result = downloadService.enqueue(
             detail: detail,
             chapterIndexes: indexes,
-            downloadsComments: downloadsComments
+            downloadsComments: downloadsComments,
+            autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
         )
         switch result {
         case .queued:

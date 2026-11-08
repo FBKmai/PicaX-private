@@ -747,6 +747,7 @@ enum BackupService {
 
     private static func shouldExportKey(_ key: String, includedContent: Set<BackupContentKind>) -> Bool {
         if key == DownloadSettingsKey.tasks
+            || key == DownloadSettingsKey.autoSuperResolutionQueue
             || key == "picax.accounts"
             || key == "picax.session" {
             return false
@@ -761,6 +762,7 @@ enum BackupService {
 
     private static func shouldRemoveMissingKey(_ key: String, includedContent: Set<BackupContentKind>) -> Bool {
         guard key != DownloadSettingsKey.tasks,
+              key != DownloadSettingsKey.autoSuperResolutionQueue,
               let contentKind = contentKind(for: key) else { return false }
         return includedContent.contains(contentKind)
     }

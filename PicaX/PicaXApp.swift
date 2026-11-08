@@ -11,13 +11,16 @@ import SwiftUI
 struct PicaXApp: App {
     private let appDataMigrationCoordinator = AppDataMigrationCoordinator()
     @Environment(\.scenePhase) private var scenePhase
+    #if os(iOS)
+    @UIApplicationDelegateAdaptor(PicaXAppDelegate.self) private var appDelegate
+    #endif
     @StateObject private var appSettings: AppSettings
     @StateObject private var releaseNotes: AppReleaseNotesStore
     @StateObject private var platformAccountService = PlatformAccountService()
     @StateObject private var readingHistoryService = ReadingHistoryService()
     @StateObject private var readLaterService = ReadLaterService()
     @StateObject private var readingDurationService = ReadingDurationService()
-    @StateObject private var downloadService = DownloadService()
+    @StateObject private var downloadService: DownloadService
     @StateObject private var blockingKeywordService = BlockingKeywordService()
     @StateObject private var searchHistoryService = SearchHistoryService()
     @StateObject private var followUpdatesService = FollowUpdatesService()
@@ -41,6 +44,8 @@ struct PicaXApp: App {
                 currentReleaseNotes: AppReleaseNotesLoader.load()
             )
         )
+        let downloadService = DownloadService.shared
+        _downloadService = StateObject(wrappedValue: downloadService)
     }
 
     var body: some Scene {
@@ -79,6 +84,9 @@ struct PicaXApp: App {
                     }
                     followUpdatesService.checkAutomaticallyIfNeeded()
                     await webDAVSyncService.synchronizeAutomaticallyIfNeeded()
+                    Task {
+                        await platformAccountService.autoLoginJmComicIfNeeded()
+                    }
                 }
                 .onChange(of: scenePhase) { newValue in
                     switch newValue {
@@ -87,6 +95,9 @@ struct PicaXApp: App {
                         followUpdatesService.checkAutomaticallyIfNeeded()
                         Task {
                             await webDAVSyncService.synchronizeAutomaticallyIfNeeded()
+                        }
+                        Task {
+                            await platformAccountService.autoLoginJmComicIfNeeded()
                         }
                     case .background:
                         downloadService.applicationDidEnterBackground()

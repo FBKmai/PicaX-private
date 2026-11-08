@@ -181,6 +181,8 @@ private struct FavoritePlatformFoldersPage: View {
 private struct FavoritesCollectionPage: View {
     let source: FavoriteCollectionSource
     let service: ComicContentService
+    @AppStorage(PlatformFeatureSettingsKey.jmFavoriteSort) private var jmFavoriteSort = JmFavoriteSort.latest.rawValue
+    @AppStorage(PlatformFeatureSettingsKey.picacgFavoriteSort) private var picacgFavoriteSort = PicacgFavoriteSort.oldest.rawValue
     @State private var comics: [ComicListItem] = []
     @State private var filteredComics: [ComicListItem] = []
     @State private var visibleLocalComicCount = Self.localFavoriteInitialCount
@@ -193,6 +195,8 @@ private struct FavoritesCollectionPage: View {
     @State private var nextFavoritePage = 2
     @State private var hasMoreRemoteFavorites = false
     @State private var loadedComicIDs = Set<String>()
+    @State private var isSelectingComics = false
+    @State private var selectedComicIDs = Set<String>()
     @State private var readingListRequest: ReadingListRequest?
     @State private var filterTask: Task<Void, Never>?
 
@@ -229,7 +233,7 @@ private struct FavoritesCollectionPage: View {
                     appliesBlocking: false,
                     appliesReadProgressFilter: false,
                     appliesReadLaterFilter: false,
-                    showsReadAll: true,
+                    showsReadAll: !isSelectingComics && !filteredComics.isEmpty,
                     readAllTitle: source.title,
                     readAllComics: filteredComics,
                     isPreparingReadAll: isPreparingReadAll,
@@ -238,8 +242,12 @@ private struct FavoritesCollectionPage: View {
                             await prepareReadAll()
                         }
                     },
-                    loadMore: favoriteLoadMoreAction
+                    loadMore: favoriteLoadMoreAction,
+                    selectionContext: selectionConfiguration
                 )
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    selectionBar
+                }
                 .refreshable {
                     await load(force: true)
                 }
@@ -254,42 +262,80 @@ private struct FavoritesCollectionPage: View {
             if !normalizedSearchText.isEmpty {
                 downloadSheetContext = nil
             }
+            if isSelectingComics {
+                selectedComicIDs.removeAll()
+            }
+        }
+        .onChange(of: jmFavoriteSort) { _ in
+            if source.platform == .jmComic {
+                reloadForFavoriteSortChange()
+            }
+        }
+        .onChange(of: picacgFavoriteSort) { _ in
+            if source.platform == .picacg {
+                reloadForFavoriteSortChange()
+            }
         }
         .picaxNavigationDestination(item: $readingListRequest) { request in
             ReadingListReaderPage(request: request, service: service)
         }
         .toolbar {
             ToolbarItemGroup(placement: .picaxTopBarTrailing) {
-                if showsDownloadAllButton {
-                    Button {
-                        downloadSheetContext = FavoriteDownloadSheetContext(
-                            title: source.title,
-                            systemImage: source.systemImage,
-                            accentColor: source.accentColor,
-                            loadedCount: comics.count,
-                            mayLoadMoreFavorites: hasMoreRemoteFavorites
-                        )
-                    } label: {
-                        Image(systemName: "arrow.down.circle")
+                if isSelectingComics {
+                    Button("完成") {
+                        endComicSelection()
                     }
-                    .disabled(!canOpenDownloadSheet)
-                    .accessibilityLabel("一键下载收藏夹")
-                }
+                } else {
+                    if source.supportsBatchSelection {
+                        Button {
+                            beginComicSelection()
+                        } label: {
+                            Image(systemName: "checkmark.circle")
+                        }
+                        .accessibilityLabel("选择漫画")
+                    }
 
-                Button {
-                    Task {
-                        await load(force: true)
+                    if showsDownloadAllButton {
+                        Button {
+                            downloadSheetContext = FavoriteDownloadSheetContext(
+                                title: source.title,
+                                systemImage: source.systemImage,
+                                accentColor: source.accentColor,
+                                loadedCount: comics.count,
+                                mayLoadMoreFavorites: hasMoreRemoteFavorites
+                            )
+                        } label: {
+                            Image(systemName: "arrow.down.circle")
+                        }
+                        .disabled(!canOpenDownloadSheet)
+                        .accessibilityLabel("一键下载收藏夹")
                     }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+
+                    if source.supportsFavoriteSort {
+                        favoriteSortMenu
+                    }
+
+                    Button {
+                        Task {
+                            await load(force: true)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel("刷新")
                 }
-                .accessibilityLabel("刷新")
             }
         }
-        .sheet(item: $downloadSheetContext) { context in
+        .sheet(item: $downloadSheetContext, onDismiss: {
+            if isSelectingComics {
+                endComicSelection()
+            }
+        }) { context in
             FavoriteDownloadAllSheet(
                 context: context,
-                loadTargets: loadCompleteFavoritesForDownload
+                loadTargets: {
+                    try await downloadTargets(for: context)
+                }
             )
             .picaxPresentationDetents([.medium, .large])
         }
@@ -345,6 +391,148 @@ private struct FavoritesCollectionPage: View {
 
     private var showsDownloadAllButton: Bool {
         normalizedSearchText.isEmpty
+    }
+
+    private var selectionConfiguration: ComicListSelectionConfiguration? {
+        guard isSelectingComics else { return nil }
+        return ComicListSelectionConfiguration(selectedIDs: selectedComicIDs) { item in
+            toggleComicSelection(item)
+        }
+    }
+
+    @ViewBuilder
+    private var selectionBar: some View {
+        if isSelectingComics {
+            VStack(spacing: 0) {
+                Divider()
+                HStack(spacing: 14) {
+                    Button(areAllSelectableComicsSelected ? "取消全选" : "全选") {
+                        toggleSelectAllComics()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Text("已选 \(selectedComicsForDownload.count) 本")
+                        .font(.subheadline.weight(.medium))
+                        .lineLimit(1)
+
+                    Spacer(minLength: 8)
+
+                    Button {
+                        openSelectedDownloadSheet()
+                    } label: {
+                        Label("下载所选", systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canDownloadSelectedComics)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            }
+            .background(.regularMaterial)
+        }
+    }
+
+    private var favoriteSortMenu: some View {
+        Menu {
+            if source.platform == .jmComic {
+                Picker("收藏排序", selection: $jmFavoriteSort) {
+                    ForEach(JmFavoriteSort.allCases) { sort in
+                        Text(sort.title).tag(sort.rawValue)
+                    }
+                }
+            } else if source.platform == .picacg {
+                Picker("收藏排序", selection: $picacgFavoriteSort) {
+                    ForEach(PicacgFavoriteSort.allCases) { sort in
+                        Text(sort.title).tag(sort.rawValue)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down.circle")
+        }
+        .accessibilityLabel("收藏排序")
+        .accessibilityValue(favoriteSortTitle)
+    }
+
+    private var favoriteSortTitle: String {
+        if source.platform == .jmComic {
+            return (JmFavoriteSort(rawValue: jmFavoriteSort) ?? .latest).title
+        }
+        if source.platform == .picacg {
+            return (PicacgFavoriteSort(rawValue: picacgFavoriteSort) ?? .oldest).title
+        }
+        return ""
+    }
+
+    private var areAllSelectableComicsSelected: Bool {
+        !filteredComics.isEmpty
+            && filteredComics.allSatisfy { selectedComicIDs.contains($0.readingHistoryID) }
+    }
+
+    private var selectedComicsForDownload: [ComicListItem] {
+        comics.filter { selectedComicIDs.contains($0.readingHistoryID) }
+    }
+
+    private var canDownloadSelectedComics: Bool {
+        !isLoading && !isPreparingReadAll && !selectedComicsForDownload.isEmpty
+    }
+
+    private func beginComicSelection() {
+        guard source.supportsBatchSelection else { return }
+        selectedComicIDs.removeAll()
+        isSelectingComics = true
+        downloadSheetContext = nil
+    }
+
+    private func endComicSelection() {
+        isSelectingComics = false
+        selectedComicIDs.removeAll()
+    }
+
+    private func toggleComicSelection(_ item: ComicListItem) {
+        let id = item.readingHistoryID
+        if selectedComicIDs.contains(id) {
+            selectedComicIDs.remove(id)
+        } else {
+            selectedComicIDs.insert(id)
+        }
+    }
+
+    private func toggleSelectAllComics() {
+        if areAllSelectableComicsSelected {
+            selectedComicIDs.removeAll()
+        } else {
+            selectedComicIDs.formUnion(filteredComics.map(\.readingHistoryID))
+        }
+    }
+
+    private func openSelectedDownloadSheet() {
+        let selected = selectedComicsForDownload
+        guard !selected.isEmpty else { return }
+        downloadSheetContext = FavoriteDownloadSheetContext(
+            title: source.title,
+            systemImage: source.systemImage,
+            accentColor: source.accentColor,
+            loadedCount: selected.count,
+            mayLoadMoreFavorites: false,
+            selectedComicIDs: Set(selected.map(\.readingHistoryID))
+        )
+    }
+
+    private func reloadForFavoriteSortChange() {
+        guard source.supportsFavoriteSort else { return }
+        endComicSelection()
+        Task {
+            await load(force: true)
+        }
+    }
+
+    @MainActor
+    private func downloadTargets(for context: FavoriteDownloadSheetContext) async throws -> [ComicListItem] {
+        if let selectedComicIDs = context.selectedComicIDs {
+            return comics.filter { selectedComicIDs.contains($0.readingHistoryID) }
+        }
+        return try await loadCompleteFavoritesForDownload()
     }
 
     private func loadMoreLocalComics() {
@@ -546,16 +734,23 @@ private struct FavoriteDownloadSheetContext: Identifiable {
     let accentColor: Color
     let loadedCount: Int
     let mayLoadMoreFavorites: Bool
+    var selectedComicIDs: Set<String>? = nil
+
+    var isSelection: Bool {
+        selectedComicIDs != nil
+    }
 }
 
 private struct FavoriteDownloadAllSheet: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var downloadService: DownloadService
     @AppStorage(DownloadSettingsKey.downloadsCommentsByDefault) private var downloadsCommentsByDefault = false
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionAfterDownload) private var autoSuperResolutionByDefault = false
 
     let context: FavoriteDownloadSheetContext
     let loadTargets: @MainActor () async throws -> [ComicListItem]
     @State private var downloadsComments = false
+    @State private var autoSuperResolutionAfterDownload = false
     @State private var didApplyDefaultOptions = false
     @State private var loadState: FavoriteDownloadAllLoadState = .idle
     @State private var feedback: FavoriteDownloadAllFeedback?
@@ -576,7 +771,7 @@ private struct FavoriteDownloadAllSheet: View {
             }
             .picaxInsetGroupedListStyle()
             .background(AppColor.groupedBackground)
-            .navigationTitle("下载收藏")
+            .navigationTitle(context.isSelection ? "下载所选" : "下载收藏")
             .picaxNavigationBarTitleDisplayModeInline()
             .picaxSensitiveImageContent(containsCoverContent)
             .toolbar {
@@ -600,6 +795,7 @@ private struct FavoriteDownloadAllSheet: View {
             .onAppear {
                 if !didApplyDefaultOptions {
                     downloadsComments = downloadsCommentsByDefault
+                    autoSuperResolutionAfterDownload = autoSuperResolutionByDefault
                     didApplyDefaultOptions = true
                 }
             }
@@ -629,12 +825,12 @@ private struct FavoriteDownloadAllSheet: View {
 
                 HStack(spacing: 12) {
                     ProgressView()
-                    Text("正在加载完整收藏夹")
+                    Text(context.isSelection ? "正在准备所选漫画" : "正在加载完整收藏夹")
                         .foregroundStyle(.secondary)
                 }
                 .padding(.vertical, 8)
             } footer: {
-                Text(context.mayLoadMoreFavorites ? "会继续加载剩余收藏页面。" : "正在准备收藏列表。")
+                Text(context.isSelection ? "正在准备所选漫画。" : (context.mayLoadMoreFavorites ? "会继续加载剩余收藏页面。" : "正在准备收藏列表。"))
             }
         case .failed(let message):
             Section {
@@ -644,8 +840,9 @@ private struct FavoriteDownloadAllSheet: View {
         case .loaded(let items):
             Section {
                 Toggle("一并下载评论区", isOn: $downloadsComments)
+                Toggle("下载完成后自动超分", isOn: $autoSuperResolutionAfterDownload)
             } footer: {
-                Text("支持评论区下载的漫画会在任务执行时同时保存详情评论和章节评论。")
+                Text("支持评论区下载的漫画会在任务执行时同时保存详情评论和章节评论。自动超分会在下载完成后逐本执行，使用 PicaX 下载设置中的模型和推理模式；可在设置中允许后台继续，实际时长由系统决定。")
             }
 
             Section {
@@ -660,7 +857,7 @@ private struct FavoriteDownloadAllSheet: View {
                 Text("每本漫画会作为独立下载任务加入队列，章节会在任务开始时解析。")
             }
 
-            Section("收藏漫画") {
+            Section(context.isSelection ? "所选漫画" : "收藏漫画") {
                 if items.isEmpty {
                     ContentUnavailableView("暂无收藏", systemImage: context.systemImage)
                         .listRowBackground(Color.clear)
@@ -758,7 +955,10 @@ private struct FavoriteDownloadAllSheet: View {
 
     private func enqueue(_ items: [ComicListItem]) {
         var summary = FavoriteDownloadAllSummary()
-        let results = downloadService.enqueue(items: items) { item in
+        let results = downloadService.enqueue(
+            items: items,
+            autoSuperResolutionAfterDownload: autoSuperResolutionAfterDownload
+        ) { item in
             downloadsComments && item.supportsComments
         }
         for result in results {
@@ -1071,5 +1271,27 @@ private enum FavoriteCollectionSource: Identifiable {
             return true
         }
         return false
+    }
+
+    var supportsBatchSelection: Bool {
+        switch self {
+        case .local:
+            return false
+        case .platform, .platformFolder:
+            return true
+        }
+    }
+
+    var platform: ComicPlatform? {
+        switch self {
+        case .local:
+            return nil
+        case .platform(let account), .platformFolder(let account, _):
+            return account.platform
+        }
+    }
+
+    var supportsFavoriteSort: Bool {
+        platform == .jmComic || platform == .picacg
     }
 }

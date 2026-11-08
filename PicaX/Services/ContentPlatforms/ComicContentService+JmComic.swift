@@ -78,14 +78,15 @@ extension ComicContentService {
     }
 
     func loadJmComicFavorites(account: PlatformAccount, folderID: String? = nil, page: Int = 1) async throws -> ComicFavoritePage {
-        let context = try await jmAuthenticatedContext(account: account)
-        let cookies = context.cookies
-        let baseURL = context.loginInfo.baseURL
-        let sort = PlatformFeatureSettings.jmFavoriteSort()
-        let folderID = folderID?.nilIfEmpty ?? "0"
+        var items: [ComicListItem] = []
+        try await withJmAuthenticatedSession(account: account) { cookies, loginInfo in
+            let sort = PlatformFeatureSettings.jmFavoriteSort()
+            let folderID = folderID?.nilIfEmpty ?? "0"
+            let page = max(page, 1)
+            let json = try await jmJSON(path: "favorite?page=\(page)&folder_id=\(folderID.urlEncoded)&o=\(sort)", cookies: cookies, baseURL: loginInfo.baseURL)
+            items = try jmComicItems(from: json, favoriteDate: Date())
+        }
         let page = max(page, 1)
-        let json = try await jmJSON(path: "favorite?page=\(page)&folder_id=\(folderID.urlEncoded)&o=\(sort)", cookies: cookies, baseURL: baseURL)
-        let items = try jmComicItems(from: json, favoriteDate: Date())
         return ComicFavoritePage(items: items, page: page, hasMore: !items.isEmpty)
     }
 
@@ -93,16 +94,16 @@ extension ComicContentService {
         guard let account else {
             throw ComicContentError.loginRequired("JMComic 收藏需要先登录平台账号。")
         }
-        let context = try await jmAuthenticatedContext(account: account)
-        let cookies = context.cookies
-        let baseURL = context.loginInfo.baseURL
-        guard let json = try await jmJSON(path: "favorite", cookies: cookies, baseURL: baseURL) as? [String: Any] else {
-            throw ComicContentError.invalidResponse("JMComic 收藏夹响应不是对象。")
-        }
-        let folders = (json["folder_list"] as? [[String: Any]] ?? []).compactMap { folder -> PlatformFavoriteFolder? in
-            guard let id = jmString(folder["FID"]), !id.isEmpty else { return nil }
-            let title = jmString(folder["name"]) ?? id
-            return PlatformFavoriteFolder(id: id, title: title, subtitle: "JMComic 收藏夹", platform: .jmComic)
+        var folders = [PlatformFavoriteFolder]()
+        try await withJmAuthenticatedSession(account: account) { cookies, loginInfo in
+            guard let json = try await jmJSON(path: "favorite", cookies: cookies, baseURL: loginInfo.baseURL) as? [String: Any] else {
+                throw ComicContentError.invalidResponse("JMComic 收藏夹响应不是对象。")
+            }
+            folders = (json["folder_list"] as? [[String: Any]] ?? []).compactMap { folder -> PlatformFavoriteFolder? in
+                guard let id = jmString(folder["FID"]), !id.isEmpty else { return nil }
+                let title = jmString(folder["name"]) ?? id
+                return PlatformFavoriteFolder(id: id, title: title, subtitle: "JMComic 收藏夹", platform: .jmComic)
+            }
         }
         return [PlatformFavoriteFolder(id: "0", title: "全部收藏", subtitle: "JMComic 默认收藏", platform: .jmComic)] + folders
     }
@@ -111,16 +112,15 @@ extension ComicContentService {
         guard let account else {
             throw ComicContentError.loginRequired("JMComic 收藏需要先登录平台账号。")
         }
-        let context = try await jmAuthenticatedContext(account: account)
-        let cookies = context.cookies
-        let baseURL = context.loginInfo.baseURL
         let id = jmComicID(from: item.id)
-        let first = try await jmJSON(path: "favorite", method: "POST", body: "aid=\(id.urlEncoded)", cookies: cookies, baseURL: baseURL) as? [String: Any]
-        if jmString(first?["type"]) != "add" {
-            _ = try await jmJSON(path: "favorite", method: "POST", body: "aid=\(id.urlEncoded)", cookies: cookies, baseURL: baseURL)
-        }
-        if folderID != "0" {
-            _ = try await jmJSON(path: "favorite_folder", method: "POST", body: "type=move&folder_id=\(folderID.urlEncoded)&aid=\(id.urlEncoded)", cookies: cookies, baseURL: baseURL)
+        try await withJmAuthenticatedSession(account: account) { cookies, loginInfo in
+            let first = try await jmJSON(path: "favorite", method: "POST", body: "aid=\(id.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL) as? [String: Any]
+            if jmString(first?["type"]) != "add" {
+                _ = try await jmJSON(path: "favorite", method: "POST", body: "aid=\(id.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL)
+            }
+            if folderID != "0" {
+                _ = try await jmJSON(path: "favorite_folder", method: "POST", body: "type=move&folder_id=\(folderID.urlEncoded)&aid=\(id.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL)
+            }
         }
     }
 
@@ -176,7 +176,8 @@ extension ComicContentService {
         let storedLoginInfo = try jmStoredLoginInfo(account: account)
         let storedCookies = account.credential.cookieStorage()
         if let url = URL(string: storedLoginInfo.baseURL),
-           storedCookies.cookies(for: url)?.contains(where: { $0.name == "AVS" && !$0.value.isEmpty }) == true {
+           let avs = storedCookies.cookies(for: url)?.first(where: { $0.name == "AVS" && !$0.value.isEmpty }),
+           avs.expiresDate.map({ $0 > Date() }) ?? true {
             return (storedCookies, storedLoginInfo)
         }
 
@@ -187,6 +188,73 @@ extension ComicContentService {
         let cookies = HTTPCookieStorage.makeEphemeral()
         let loginInfo = try await jmLoginInfo(username: account.username, password: password, cookies: cookies)
         return (cookies, loginInfo)
+    }
+
+    /// Uses the stored JM session and, when the server reports `401`, signs in
+    /// again with the locally saved password before retrying the operation once.
+    /// Refreshed cookies are written back to the platform account so the next
+    /// launch starts from a valid session.
+    func withJmAuthenticatedSession<T>(
+        account: PlatformAccount,
+        operation: (_ cookies: HTTPCookieStorage, _ loginInfo: JmLoginInfo) async throws -> T
+    ) async throws -> T {
+        let context = try await jmAuthenticatedContext(account: account)
+        do {
+            return try await operation(context.cookies, context.loginInfo)
+        } catch where error.isTaskCancellation {
+            throw error
+        } catch {
+            guard jmIsLoginRequired(error),
+                  let password = account.credential.password?.nilIfEmpty else {
+                throw error
+            }
+            let refreshedAccount = try await jmRelogin(account: account, password: password)
+            let refreshedContext = try await jmAuthenticatedContext(account: refreshedAccount)
+            return try await operation(refreshedContext.cookies, refreshedContext.loginInfo)
+        }
+    }
+
+    /// Re-authenticates with the saved password and persists the refreshed
+    /// cookies. Used on app launch and whenever a stored session is rejected.
+    @discardableResult
+    func refreshJmSession(account: PlatformAccount) async throws -> PlatformAccount {
+        guard account.platform == .jmComic else {
+            return account
+        }
+        if let password = account.credential.password?.nilIfEmpty {
+            return try await jmRelogin(account: account, password: password)
+        }
+
+        let context = try await jmAuthenticatedContext(account: account)
+        _ = try await jmJSON(path: "favorite", cookies: context.cookies, baseURL: context.loginInfo.baseURL)
+        return account
+    }
+
+    @discardableResult
+    func jmRelogin(account: PlatformAccount, password: String) async throws -> PlatformAccount {
+        let cookies = HTTPCookieStorage.makeEphemeral()
+        let loginInfo = try await jmLoginInfo(username: account.username, password: password, cookies: cookies)
+        var updatedAccount = account
+        updatedAccount.credential.password = password
+        updatedAccount.credential.cookies = storedCookies(from: cookies, baseURLs: [loginInfo.baseURL])
+        updatedAccount.credential.baseURL = loginInfo.baseURL
+        updatedAccount.credential.source = .api
+        var profile = updatedAccount.credential.profile ?? PlatformAccountProfile(email: nil, username: nil, nickname: nil)
+        if let userID = loginInfo.userID?.nilIfEmpty {
+            profile.username = userID
+        }
+        updatedAccount.credential.profile = profile
+        updatedAccount.loggedInAt = Date()
+        try PicaXSQLiteStore.upsertPlatformAccountOrThrow(updatedAccount)
+        NotificationCenter.default.post(name: .picaxPlatformAccountsDidChange, object: nil)
+        return updatedAccount
+    }
+
+    func jmIsLoginRequired(_ error: Error) -> Bool {
+        guard case ComicContentError.loginRequired = error else {
+            return false
+        }
+        return true
     }
 
     func loadJmComicDetail(item: ComicListItem) async throws -> ComicDetailInfo {
@@ -278,10 +346,10 @@ extension ComicContentService {
         guard let account else {
             throw ComicContentError.loginRequired("JMComic 评论需要先登录平台账号。")
         }
-        let cookies = HTTPCookieStorage.makeEphemeral()
-        let baseURL = try await jmLogin(account: account, cookies: cookies)
         let id = jmComicID(from: item.id)
-        _ = try await jmJSON(path: "comment", method: "POST", body: "comment=\(content.urlEncoded)&status=undefined&aid=\(id.urlEncoded)", cookies: cookies, baseURL: baseURL)
+        try await withJmAuthenticatedSession(account: account) { cookies, loginInfo in
+            _ = try await jmJSON(path: "comment", method: "POST", body: "comment=\(content.urlEncoded)&status=undefined&aid=\(id.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL)
+        }
     }
 
     func jmComment(from doc: [String: Any]) -> ComicComment {

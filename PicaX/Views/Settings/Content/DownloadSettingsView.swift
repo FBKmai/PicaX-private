@@ -16,6 +16,10 @@ struct DownloadSettingsView: View {
     @AppStorage(DownloadSettingsKey.showsProgressNotifications) private var showsProgressNotifications = true
     @AppStorage(DownloadSettingsKey.showsProgressLiveActivity) private var showsProgressLiveActivity = true
     @AppStorage(DownloadSettingsKey.progressNotificationUpdateIntervalSeconds) private var progressNotificationUpdateIntervalSeconds = DownloadSettingsKey.defaultProgressNotificationUpdateIntervalSeconds
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionAfterDownload) private var autoSuperResolutionByDefault = false
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionPreset) private var autoSuperResolutionPreset = SuperResolutionPreset.color.rawValue
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionInferenceMode) private var autoSuperResolutionInferenceMode = SuperResolutionInferenceMode.automatic.rawValue
+    @AppStorage(DownloadSettingsKey.autoSuperResolutionInBackground) private var autoSuperResolutionInBackground = true
 
     var body: some View {
         List {
@@ -59,6 +63,36 @@ struct DownloadSettingsView: View {
                 Text("进度显示")
             } footer: {
                 Text("常驻通知会按设定间隔合并更新队列进度；灵动岛开关会启用实时活动，支持的 iPhone 会在灵动岛显示。")
+            }
+            #endif
+
+            Section {
+                Toggle("下载面板默认启用", isOn: $autoSuperResolutionByDefault)
+
+                Picker("模型预设", selection: $autoSuperResolutionPreset) {
+                    ForEach(SuperResolutionPreset.allCases) { preset in
+                        Text(preset.title).tag(preset.rawValue)
+                    }
+                }
+
+                Picker("推理模式", selection: $autoSuperResolutionInferenceMode) {
+                    ForEach(SuperResolutionInferenceMode.allCases) { mode in
+                        Text(mode.title).tag(mode.rawValue)
+                    }
+                }
+            } header: {
+                Text("下载后自动超分")
+            } footer: {
+                Text("开启后，下载面板中的“下载完成后自动超分”会默认打开；实际是否执行以每次下载的开关为准。自动超分使用仅 CPU 的本地模型串行处理，结果保存到“PicaX 下载 → 超分”分类，不会覆盖原图。")
+            }
+
+            #if os(iOS)
+            Section {
+                Toggle("允许在后台继续超分", isOn: $autoSuperResolutionInBackground)
+            } header: {
+                Text("后台超分")
+            } footer: {
+                Text("开启后，App 进入后台时自动超分会尽量继续运行；iOS 由系统分配后台时间，长时间整本超分可能被暂停或终止，充电或空闲时更容易继续。关闭后，自动超分只在 App 位于前台时执行。普通下载流程仍会在后台完成。")
             }
             #endif
 

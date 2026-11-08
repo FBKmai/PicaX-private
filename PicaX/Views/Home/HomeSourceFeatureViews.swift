@@ -479,6 +479,7 @@ private struct JmComicSourceFeatureSection: View {
     @AppStorage(PlatformFeatureSettingsKey.jmAppVersion) private var appVersion = "2.1.4"
     @AppStorage(PlatformFeatureSettingsKey.jmFavoriteSort) private var favoriteSort = JmFavoriteSort.latest.rawValue
     @AppStorage(PlatformFeatureSettingsKey.jmAutoCheckIn) private var autoCheckIn = false
+    @AppStorage(PlatformFeatureSettingsKey.jmAutoLogin) private var autoLogin = true
 
     @State private var isUpdatingDomains = false
     @State private var isUpdatingVersion = false
@@ -490,6 +491,8 @@ private struct JmComicSourceFeatureSection: View {
 
     var body: some View {
         Section {
+            Toggle("启动时自动登录", isOn: $autoLogin)
+
             Toggle("自动选择域名", isOn: $autoSelectAPIEndpoint)
 
             Picker("API 域名", selection: $apiEndpoint) {
@@ -591,7 +594,7 @@ private struct JmComicSourceFeatureSection: View {
         } header: {
             Text("JMComic")
         } footer: {
-            Text("API 域名影响登录和漫画数据，图片分流影响封面、头像和章节图片。")
+            Text("启动时自动登录会用本地保存的账号密码刷新会话。API 域名影响登录和漫画数据，图片分流影响封面、头像和章节图片。")
         }
 
         Section("签到") {

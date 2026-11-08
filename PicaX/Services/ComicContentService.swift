@@ -507,28 +507,27 @@ struct ComicContentService: Sendable {
         guard let account else {
             throw ComicContentError.loginRequired("JMComic 签到需要先登录平台账号。")
         }
-        let context = try await jmAuthenticatedContext(account: account)
-        let cookies = context.cookies
-        let loginInfo = context.loginInfo
-        guard let userID = loginInfo.userID, !userID.isEmpty else {
-            throw ComicContentError.invalidResponse("JMComic 登录响应缺少用户 ID。")
+        return try await withJmAuthenticatedSession(account: account) { cookies, loginInfo in
+            guard let userID = loginInfo.userID, !userID.isEmpty else {
+                throw ComicContentError.invalidResponse("JMComic 登录响应缺少用户 ID。")
+            }
+            guard let daily = try await jmJSON(path: "daily?user_id=\(userID.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL) as? [String: Any] else {
+                throw ComicContentError.invalidResponse("JMComic 签到响应不是对象。")
+            }
+            guard let dailyID = jmString(daily["daily_id"]), !dailyID.isEmpty else {
+                throw ComicContentError.invalidResponse("JMComic 签到响应缺少 daily_id。")
+            }
+            guard let result = try await jmJSON(
+                path: "daily_chk",
+                method: "POST",
+                body: "user_id=\(userID.urlEncoded)&daily_id=\(dailyID.urlEncoded)&",
+                cookies: cookies,
+                baseURL: loginInfo.baseURL
+            ) as? [String: Any] else {
+                throw ComicContentError.invalidResponse("JMComic 签到结果不是对象。")
+            }
+            return jmString(result["msg"]) ?? "签到完成"
         }
-        guard let daily = try await jmJSON(path: "daily?user_id=\(userID.urlEncoded)", cookies: cookies, baseURL: loginInfo.baseURL) as? [String: Any] else {
-            throw ComicContentError.invalidResponse("JMComic 签到响应不是对象。")
-        }
-        guard let dailyID = jmString(daily["daily_id"]), !dailyID.isEmpty else {
-            throw ComicContentError.invalidResponse("JMComic 签到响应缺少 daily_id。")
-        }
-        guard let result = try await jmJSON(
-            path: "daily_chk",
-            method: "POST",
-            body: "user_id=\(userID.urlEncoded)&daily_id=\(dailyID.urlEncoded)&",
-            cookies: cookies,
-            baseURL: loginInfo.baseURL
-        ) as? [String: Any] else {
-            throw ComicContentError.invalidResponse("JMComic 签到结果不是对象。")
-        }
-        return jmString(result["msg"]) ?? "签到完成"
     }
 
     func refreshJmAPIEndpoints() async throws -> JmAPIUpdateResult {

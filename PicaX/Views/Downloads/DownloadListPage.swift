@@ -177,8 +177,58 @@ struct DownloadListPage: View {
         }
     }
 
+    private func autoSuperResolutionBanner(_ status: AutoSuperResolutionStatus) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "sparkles")
+                    .font(.title3)
+                    .foregroundStyle(.purple)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(status.title)
+                        .font(.subheadline.weight(.semibold))
+                    Text(status.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 8)
+
+                if status.isRunning {
+                    Button("取消") {
+                        downloadService.cancelAutoSuperResolution()
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        downloadService.dismissAutoSuperResolutionStatus()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭自动超分提示")
+                }
+            }
+
+            if status.isRunning {
+                ProgressView(value: status.progress)
+                    .tint(.purple)
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
     private var downloadList: some View {
         VStack(spacing: 0) {
+            if let status = downloadService.autoSuperResolutionStatus {
+                autoSuperResolutionBanner(status)
+            }
             libraryFilterBar
             List {
                 if displayRecords.isEmpty {
