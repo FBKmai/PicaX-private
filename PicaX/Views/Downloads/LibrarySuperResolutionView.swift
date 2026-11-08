@@ -222,6 +222,11 @@ struct LibrarySuperResolutionView: View {
                 Label("未生成的页面", systemImage: "exclamationmark.octagon")
                     .font(.headline)
                     .foregroundStyle(.orange)
+                if model.bookCount > 1 {
+                    Text("E/P 编号按每本书重新计数；完整清单见每本书的 manifest.json。")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
                 ForEach(Array(chapters.suffix(10))) { chapter in
                     Text("章节 \(chapter.chapterIndex + 1) · \(chapter.title)：\(chapter.errorDescription ?? "读取失败")")
                         .font(.caption2)
@@ -264,7 +269,9 @@ struct LibrarySuperResolutionView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                Text("结果已保存到 PicaX 下载的超分分类；返回后可用分类器筛选。")
+                Text(model.pageSuccessCount > 0
+                     ? "结果已保存到 PicaX 下载的超分分类；返回后可用分类器筛选。"
+                     : "没有生成页面；返回下载列表后不会出现新的超分记录。")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.6))
             } else {

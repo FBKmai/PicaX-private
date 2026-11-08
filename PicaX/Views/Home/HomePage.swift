@@ -149,7 +149,9 @@ struct HomePage: View {
                 Section {
                     HomeHistoryCard(
                         records: readingHistory.latest(limit: historyHomeLimit),
-                        service: contentService
+                        service: contentService,
+                        openReader: { downloadedReaderRequest = $0 },
+                        openSearch: { downloadedSearchRequest = $0 }
                     )
                 } header: {
                     HomeHistoryHeader(service: contentService)

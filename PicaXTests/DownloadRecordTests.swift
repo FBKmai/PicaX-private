@@ -26,6 +26,8 @@ final class DownloadRecordTests: XCTestCase {
         let source = makeRecord(totalChapterCount: 1, downloadedChapterCount: 1)
         let srItem = DownloadService.superResolutionItem(for: source.item)
         XCTAssertEqual(srItem.id, "picax-sr-download-test")
+        XCTAssertTrue(DownloadService.isSuperResolutionItemID(srItem.id))
+        XCTAssertFalse(DownloadService.isSuperResolutionItemID(source.item.id))
         XCTAssertEqual(srItem.platform, source.item.platform)
         XCTAssertEqual(srItem.title, source.item.title)
 

@@ -22,6 +22,8 @@ struct HomeHistoryHeader: View {
 struct HomeHistoryCard: View {
     let records: [ReadingHistoryRecord]
     let service: ComicContentService
+    let openReader: (DownloadedComicReaderRequest) -> Void
+    let openSearch: (DownloadedComicSearchRequest) -> Void
 
     var body: some View {
         Group {
@@ -39,7 +41,12 @@ struct HomeHistoryCard: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     LazyHStack(spacing: 12) {
                         ForEach(records) { record in
-                            ComicDetailNavigationLink(item: record.item, service: service) {
+                            DownloadedComicNavigationLink(
+                                item: record.item,
+                                service: service,
+                                openReader: openReader,
+                                openSearch: openSearch
+                            ) {
                                 HistoryCardItem(record: record)
                             }
                             .buttonStyle(.plain)
@@ -95,6 +102,8 @@ private struct HistoryCardItem: View {
 private struct ReadingHistoryListPage: View {
     @EnvironmentObject private var readingHistory: ReadingHistoryService
     let service: ComicContentService
+    @State private var readerRequest: DownloadedComicReaderRequest?
+    @State private var searchRequest: DownloadedComicSearchRequest?
 
     var body: some View {
         List {
@@ -104,7 +113,12 @@ private struct ReadingHistoryListPage: View {
             } else {
                 Section {
                     ForEach(readingHistory.records) { record in
-                        ComicDetailNavigationLink(item: record.item, service: service) {
+                        DownloadedComicNavigationLink(
+                            item: record.item,
+                            service: service,
+                            openReader: { readerRequest = $0 },
+                            openSearch: { searchRequest = $0 }
+                        ) {
                             ReadingHistoryRow(record: record)
                         }
                         .swipeActions(edge: .trailing) {
@@ -124,6 +138,12 @@ private struct ReadingHistoryListPage: View {
         .background(AppColor.groupedBackground)
         .picaxSensitiveImageContent(!readingHistory.records.isEmpty)
         .navigationTitle("历史记录")
+        .picaxNavigationDestination(item: $readerRequest) { request in
+            DownloadedComicReaderPage(request: request, service: service)
+        }
+        .picaxNavigationDestination(item: $searchRequest) { request in
+            ComicSearchPage(initialQuery: request.tag.query, platform: request.tag.platform, service: service)
+        }
     }
 }
 

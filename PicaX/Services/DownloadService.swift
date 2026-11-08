@@ -640,9 +640,15 @@ final class DownloadService: ObservableObject {
 
     // MARK: - Super-resolution downloads
 
+    nonisolated static let superResolutionIDPrefix = "picax-sr-"
+
+    nonisolated static func isSuperResolutionItemID(_ id: String) -> Bool {
+        id.hasPrefix(superResolutionIDPrefix)
+    }
+
     nonisolated static func superResolutionItem(for item: ComicListItem) -> ComicListItem {
         ComicListItem(
-            id: "picax-sr-\(item.id)",
+            id: "\(superResolutionIDPrefix)\(item.id)",
             platform: item.platform,
             title: item.title,
             subtitle: "2× AI 超分（来自下载）",

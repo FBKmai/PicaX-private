@@ -164,6 +164,73 @@ struct DownloadedComicInfoSheet: View {
     }
 }
 
+/// History and reading-duration entries can point at a synthetic
+/// `picax-sr-*` item, which has no online detail page. Those entries open the
+/// local download info sheet instead; normal comics keep their usual
+/// navigation.
+struct DownloadedComicNavigationLink<Label: View>: View {
+    @EnvironmentObject private var downloadService: DownloadService
+
+    private let item: ComicListItem
+    private let service: ComicContentService
+    private let openReader: (DownloadedComicReaderRequest) -> Void
+    private let openSearch: (DownloadedComicSearchRequest) -> Void
+    private let label: () -> Label
+
+    @State private var selectedRecord: DownloadRecord?
+
+    init(
+        item: ComicListItem,
+        service: ComicContentService,
+        openReader: @escaping (DownloadedComicReaderRequest) -> Void,
+        openSearch: @escaping (DownloadedComicSearchRequest) -> Void,
+        @ViewBuilder label: @escaping () -> Label
+    ) {
+        self.item = item
+        self.service = service
+        self.openReader = openReader
+        self.openSearch = openSearch
+        self.label = label
+    }
+
+    var body: some View {
+        Group {
+            if let record = superResolutionRecord {
+                Button {
+                    selectedRecord = record
+                } label: {
+                    label()
+                }
+                .buttonStyle(.plain)
+            } else if DownloadService.isSuperResolutionItemID(item.id) {
+                // The SR download was deleted, so there is no local content
+                // left to open. Keep the entry visible but inactive.
+                label()
+                    .opacity(0.45)
+            } else {
+                ComicDetailNavigationLink(item: item, service: service, label: label)
+            }
+        }
+        .sheet(item: $selectedRecord) { record in
+            DownloadedComicInfoSheet(record: record, service: service) { request in
+                selectedRecord = nil
+                openReader(request)
+            } openSearch: { request in
+                selectedRecord = nil
+                openSearch(request)
+            }
+            .picaxPresentationDetents([.medium, .large])
+        }
+    }
+
+    private var superResolutionRecord: DownloadRecord? {
+        guard let record = downloadService.record(for: item), record.isSuperResolution else {
+            return nil
+        }
+        return record
+    }
+}
+
 struct DownloadedComicReaderRequest: Identifiable, Hashable {
     let id = UUID()
     let record: DownloadRecord

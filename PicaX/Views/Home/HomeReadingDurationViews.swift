@@ -216,11 +216,18 @@ private struct ReadingDurationListPage: View {
 struct ReadingDurationDetailPage: View {
     let record: ReadingDurationRecord
     let service: ComicContentService
+    @State private var readerRequest: DownloadedComicReaderRequest?
+    @State private var searchRequest: DownloadedComicSearchRequest?
 
     var body: some View {
         List {
             Section("漫画") {
-                ComicDetailNavigationLink(item: record.item, service: service) {
+                DownloadedComicNavigationLink(
+                    item: record.item,
+                    service: service,
+                    openReader: { readerRequest = $0 },
+                    openSearch: { searchRequest = $0 }
+                ) {
                     ReadingDurationComicSummaryRow(record: record)
                 }
             }
@@ -241,6 +248,12 @@ struct ReadingDurationDetailPage: View {
         .picaxSensitiveImageContent(record.item.coverURL != nil)
         .navigationTitle("阅读时长")
         .picaxNavigationBarTitleDisplayModeInline()
+        .picaxNavigationDestination(item: $readerRequest) { request in
+            DownloadedComicReaderPage(request: request, service: service)
+        }
+        .picaxNavigationDestination(item: $searchRequest) { request in
+            ComicSearchPage(initialQuery: request.tag.query, platform: request.tag.platform, service: service)
+        }
     }
 
     private var trendPoints: [ReadingDurationTrendPoint] {

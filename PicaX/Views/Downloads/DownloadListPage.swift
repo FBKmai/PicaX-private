@@ -454,9 +454,17 @@ struct DownloadListPage: View {
         case .all:
             break
         case .complete:
-            records = records.filter { $0.chapters.count >= max($0.totalChapterCount, 1) }
+            records = records.filter {
+                $0.isSuperResolution
+                    ? $0.isSuperResolutionComplete
+                    : $0.chapters.count >= max($0.totalChapterCount, 1)
+            }
         case .partial:
-            records = records.filter { $0.chapters.count < max($0.totalChapterCount, 1) }
+            records = records.filter {
+                $0.isSuperResolution
+                    ? !$0.isSuperResolutionComplete
+                    : $0.chapters.count < max($0.totalChapterCount, 1)
+            }
         }
 
         records.sort { lhs, rhs in
@@ -506,6 +514,9 @@ struct DownloadListPage: View {
     private var emptyTitle: String {
         if libraryFilter == .superResolution {
             return "暂无超分漫画"
+        }
+        if libraryFilter == .normal {
+            return "暂无普通下载"
         }
         return hasActiveFilters ? "没有匹配的下载" : "暂无已下载"
     }
