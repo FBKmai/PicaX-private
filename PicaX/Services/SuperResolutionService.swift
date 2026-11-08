@@ -25,7 +25,7 @@ nonisolated struct SuperResolutionResult: @unchecked Sendable {
 }
 
 extension SuperResolutionComputeUnit {
-    var mlComputeUnits: MLComputeUnits {
+    nonisolated var mlComputeUnits: MLComputeUnits {
         switch self {
         case .all: .all
         case .cpuAndGPU: .cpuAndGPU
@@ -248,7 +248,6 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
         }
         Self.logger.notice("Super-resolution start: model=\(selected.descriptor.id, privacy: .public) actual=\(resolution.actual.rawValue, privacy: .public) units=\(computeUnit.rawValue, privacy: .public) page=\(width)x\(height)")
 
-        let estimatedPeakBytes: Int
         let requiredFreeBytes: Int64
         var fullPageBudget: SuperResolutionFullPageBudget?
         switch resolution.actual {
@@ -262,14 +261,12 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
                 capability: capability,
                 physicalMemory: ProcessInfo.processInfo.physicalMemory
             )
-            estimatedPeakBytes = budget.estimatedPeakBytes
             requiredFreeBytes = budget.requiredFreeBytes
             fullPageBudget = budget
         case .tiled:
             let budget = try SuperResolutionBudget.make(
                 width: width, height: height, sourceBytesPerRow: source.image.bytesPerRow
             )
-            estimatedPeakBytes = budget.estimatedPeakBytes
             requiredFreeBytes = budget.requiredFreeBytes
         case .automatic:
             throw SuperResolutionError.inferenceFailed
@@ -396,7 +393,9 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
             let inputArray: MLMultiArray
             do {
                 inputArray = try MLMultiArray(
-                    shape: [1, 3, budget.inputHeight, budget.inputWidth], dataType: .float32)
+                    shape: [NSNumber(value: 1), NSNumber(value: 3),
+                            NSNumber(value: budget.inputHeight), NSNumber(value: budget.inputWidth)],
+                    dataType: .float32)
             } catch {
                 throw SuperResolutionError.budgetExceeded
             }
@@ -632,8 +631,7 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
             // constraint for a dynamic output. The exact 2x output shape and
             // strides are therefore checked on the prediction result in
             // copyFullPageOutput, before any pixel is written.
-            guard let inputShapes = inputConstraint.shapeConstraint,
-                  accepts(inputShapes, width: inputWidth, height: inputHeight) else {
+            guard accepts(inputConstraint, width: inputWidth, height: inputHeight) else {
                 throw SuperResolutionError.modelDescriptionMismatch
             }
         } else {
@@ -643,14 +641,15 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
 
     @available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *)
     private static func accepts(
-        _ constraint: MLMultiArrayShapeConstraint,
+        _ constraint: MLMultiArrayConstraint,
         width: Int,
         height: Int
     ) -> Bool {
         let expected = [1, 3, height, width]
-        switch constraint.type {
+        let fixedShapeMatches = constraint.shape.map(\.intValue) == expected
+        switch constraint.shapeConstraint.type {
         case .range:
-            let ranges = constraint.sizeRangeForDimension
+            let ranges = constraint.shapeConstraint.sizeRangeForDimension
             guard ranges.count == expected.count else { return false }
             for index in expected.indices {
                 let range = ranges[index].rangeValue
@@ -659,11 +658,11 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
             }
             return true
         case .enumerated:
-            return constraint.enumeratedShapes.contains { shape in
+            return constraint.shapeConstraint.enumeratedShapes.contains { shape in
                 shape.map(\.intValue) == expected
             }
         case .unspecified:
-            return constraint.shape.map(\.intValue) == expected
+            return fixedShapeMatches
         @unknown default:
             return false
         }

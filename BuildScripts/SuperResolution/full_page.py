@@ -283,9 +283,35 @@ def check_full_page_spec(ct, model, alignment, maximum_side, report):
     return descriptions
 
 
+def _export_aten(torch, model, example, dynamic_shapes):
+    """Return an ATEN/EDGE ExportedProgram for coremltools 8.3.
+
+    PyTorch 2.6's OSS rollout makes ``torch.export.export`` return the
+    TRAINING dialect, which coremltools 8.3 rejects. Disable that rollout only
+    for this call, then assert the actual dialect instead of assuming it.
+    """
+    import torch._utils_internal as internal
+
+    original = getattr(internal, "export_training_ir_rollout_check", None)
+    if original is not None:
+        internal.export_training_ir_rollout_check = lambda: False
+    try:
+        program = torch.export.export(
+            model, (example,), strict=False, dynamic_shapes=dynamic_shapes)
+    finally:
+        if original is not None:
+            internal.export_training_ir_rollout_check = original
+    dialect = str(getattr(program, "dialect", ""))
+    if dialect not in ("ATEN", "EDGE"):
+        raise FullPageValidationError(
+            f"torch.export produced unsupported dialect {dialect!r}; "
+            "coremltools 8.3 requires ATEN or EDGE")
+    return program
+
+
 def export_dynamic(torch, np, model, architecture, alignment, maximum_side):
     """Export a model whose spatial axes are constrained by the alignment."""
-    from torch.export import Dim, export
+    from torch.export import Dim
 
     if maximum_side % alignment:
         raise ValueError("maximum side must be a multiple of the alignment")
@@ -301,9 +327,8 @@ def export_dynamic(torch, np, model, architecture, alignment, maximum_side):
         example_width = maximum_side
         example_height = maximum_side
     example = seeded_input(np, torch, example_width, example_height)
-    program = export(model, (example,), strict=False,
-                     dynamic_shapes=({2: multiplier * height_symbol,
-                                      3: multiplier * width_symbol},))
+    program = _export_aten(torch, model, example, ({2: multiplier * height_symbol,
+                                                   3: multiplier * width_symbol},))
     constraints = {}
     for symbol, value_range in program.range_constraints.items():
         constraints[str(symbol)] = {"lower": str(value_range.lower),
@@ -400,6 +425,7 @@ def convert_full_page(np, torch, ct, model, architecture, args, package, package
         torch, np, model, architecture, args.full_page_alignment, args.full_page_max_side)
     report["fullPageConversion"].update({
         "dynamicDivisibility": multiplier,
+        "exportDialect": str(program.dialect),
         "exampleSize": list(example),
         "exportRangeConstraints": constraints,
         "exportVsEager": verify_export(
