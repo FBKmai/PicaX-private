@@ -2161,8 +2161,7 @@ struct ComicReaderPage: View {
     }
 
     private var canCompareCurrentImage: Bool {
-        guard ImageEnhancementMode(rawValue: imageEnhancementMode)?.isEnabled == true,
-              !usesWholeBookContinuousReading,
+        guard !usesWholeBookContinuousReading,
               let images = loadedReaderImages,
               !images.isEmpty else {
             return false
@@ -2171,10 +2170,8 @@ struct ComicReaderPage: View {
     }
 
     private func presentImageComparison() {
-        guard ImageEnhancementMode(rawValue: imageEnhancementMode)?.isEnabled == true else {
-            showReaderToast("请先在画质增强中开启增强")
-            return
-        }
+        // Source comparison and explicit AI trials also work with traditional
+        // filters off; they must not require enabling the default 60% sharpen.
         guard !usesWholeBookContinuousReading else {
             showReaderToast("整卷连续阅读暂不支持前后对比")
             return

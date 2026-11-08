@@ -18,7 +18,7 @@ enum ImageEnhancementMode: String, CaseIterable, Identifiable, Sendable {
         case .sharpen:
             "锐化"
         case .upscaleSharpen:
-            "放大 + 锐化"
+            "插值放大 + 锐化"
         case .strong:
             "强力线条增强"
         }
@@ -162,7 +162,7 @@ enum ImageEnhancementService {
         let sourceWidth = Double(cgImage.width)
         let sourceHeight = Double(cgImage.height)
         var width = min(Double(screenPixelWidth) * enhancement.scale, sourceWidth * maxUpscaleRatio)
-        width = min(width, maxOutputSide)
+        width = min(width, maxOutputSide, maxOutputSide * sourceWidth / sourceHeight)
 
         let height = width * sourceHeight / sourceWidth
         let pixels = width * height
@@ -170,7 +170,7 @@ enum ImageEnhancementService {
             width *= (maxOutputPixels / pixels).squareRoot()
         }
 
-        let rounded = Int(width.rounded())
+        let rounded = Int(width.rounded(.down))
         return rounded > cgImage.width ? rounded : nil
     }
 

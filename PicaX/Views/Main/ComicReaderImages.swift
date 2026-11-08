@@ -652,6 +652,8 @@ enum ReaderImageDecoder {
             decoded = try await decode(data: data, url: url, targetPixelWidth: targetPixelWidth, enhancement: resolvedEnhancement, priority: decodePriority)
         } catch where error.isTaskCancellation {
             throw error
+        } catch ReaderImageSourceError.budgetExceeded {
+            throw ReaderImageSourceError.budgetExceeded
         } catch {
             ImageCacheService.removeCachedImageData(for: url)
             data = try await ImageCacheService.data(for: url, storesInCache: false)
@@ -697,11 +699,24 @@ enum ReaderImageDecoder {
                 throw CancellationError()
             }
 
+            let dimensions = try ReaderImageDimensions.read(from: data)
+            let decodeWidth = ReaderImageSourceLoader.displayPixelWidth(
+                dimensions: dimensions,
+                targetPixelWidth: targetPixelWidth,
+                enhancement: enhancement
+            )
+            // JM reordering needs the original bitmap. Bound that allocation too,
+            // rather than decoding an arbitrarily large page before downsampling.
+            if JmImageScrambler.requiresReordering(url: url),
+               (dimensions.pixels > ReaderImageSourceLoader.maximumPixels ||
+                max(dimensions.width, dimensions.height) > ReaderImageSourceLoader.maximumSide) {
+                throw ReaderImageSourceError.budgetExceeded
+            }
             let decodedImage = JmImageScrambler.decodedImage(
                 data: data,
                 url: url,
-                targetPixelWidth: targetPixelWidth
-            ) ?? downsampledImage(data: data, targetPixelWidth: targetPixelWidth) ?? PicaXPlatformImage.picaxImage(data: data)
+                targetPixelWidth: decodeWidth
+            ) ?? downsampledImage(data: data, targetPixelWidth: decodeWidth)
 
             guard let decodedImage else {
                 throw URLError(.cannotDecodeContentData)
@@ -737,19 +752,15 @@ enum ReaderImageDecoder {
         guard let targetPixelWidth,
               targetPixelWidth > 0,
               let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let sourceWidthNumber = properties[kCGImagePropertyPixelWidth] as? NSNumber,
-              let sourceHeightNumber = properties[kCGImagePropertyPixelHeight] as? NSNumber,
-              sourceWidthNumber.doubleValue > 0,
-              sourceHeightNumber.doubleValue > 0 else {
+              let dimensions = try? ReaderImageDimensions.read(from: data) else {
             return nil
         }
 
-        let sourceWidth = CGFloat(sourceWidthNumber.doubleValue)
-        let sourceHeight = CGFloat(sourceHeightNumber.doubleValue)
+        let sourceWidth = CGFloat(dimensions.width)
+        let sourceHeight = CGFloat(dimensions.height)
         let outputWidth = min(CGFloat(targetPixelWidth), sourceWidth)
         let scale = outputWidth / sourceWidth
-        let maxPixelSize = max(Int((sourceHeight * scale).rounded(.up)), Int(outputWidth.rounded(.up)), 1)
+        let maxPixelSize = min(max(Int((sourceHeight * scale).rounded(.up)), Int(outputWidth.rounded(.up)), 1), 8192)
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceShouldCacheImmediately: true,
@@ -781,7 +792,7 @@ enum ReaderImageDecoder {
     }
 
     private nonisolated static func cacheKey(url: URL, targetPixelWidth: Int?, enhancement: ReaderImageEnhancement) -> String {
-        "\(url.absoluteString)#\(targetPixelWidth ?? 0)#\(enhancement.cacheKeyFragment)"
+        "display-v2#\(url.absoluteString)#\(targetPixelWidth ?? 0)#\(enhancement.cacheKeyFragment)"
     }
 }
 
@@ -808,6 +819,26 @@ enum JmImageScrambler {
                 "JMComic 图片解密后无法保存。"
             }
         }
+    }
+
+    nonisolated static func requiresReordering(url: URL) -> Bool {
+        guard let info = imageInfo(from: url),
+              let count = segmentCount(epsID: info.epsID, pictureName: info.pictureName) else { return false }
+        return count > 1
+    }
+
+    /// Strict source path for comparison and AI. Unlike the compatibility
+    /// display path, a failed reorder must never silently return scrambled data.
+    nonisolated static func sourceImage(data: Data, url: URL) throws -> CGImage? {
+        guard let info = imageInfo(from: url),
+              let count = segmentCount(epsID: info.epsID, pictureName: info.pictureName),
+              count > 1 else { return nil }
+        guard let image = originalCGImage(data: data) else { throw ReaderImageSourceError.invalidImage }
+        guard image.height >= count,
+              let reordered = reorderedImage(cgImage: image, segmentCount: count) else {
+            throw ReaderImageSourceError.cannotUnscramble
+        }
+        return reordered
     }
 
     nonisolated static func decodedImage(data: Data, url: URL, targetPixelWidth: Int?) -> PicaXPlatformImage? {

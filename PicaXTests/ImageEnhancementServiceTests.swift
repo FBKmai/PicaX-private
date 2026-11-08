@@ -144,6 +144,17 @@ final class ImageEnhancementServiceTests: XCTestCase {
         XCTAssertEqual(enhanced.height, 90)
     }
 
+    func testUpscaleBoundsHeightAsWellAsWidth() throws {
+        let source = makeImage(width: 110, height: 8000)
+        let output = try XCTUnwrap(ImageEnhancementService.enhancedImage(
+            cgImage: source, targetPixelWidth: 1000,
+            enhancement: ReaderImageEnhancement(mode: .upscaleSharpen, strength: 0, scale: 2)
+        ))
+        XCTAssertLessThanOrEqual(output.width, 8192)
+        XCTAssertLessThanOrEqual(output.height, 8192)
+        XCTAssertLessThanOrEqual(output.width * output.height, 16_000_000)
+    }
+
     private func makeImage(width: Int, height: Int) -> CGImage {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue

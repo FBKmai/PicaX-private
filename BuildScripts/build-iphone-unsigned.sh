@@ -104,6 +104,14 @@ if 1 not in info.get("UIDeviceFamily", []):
 print("Verified iPhone app SDK:", info["DTSDKName"])
 PY
 
+# The engineering build may intentionally omit weights. Label that explicitly;
+# never ship an unvalidated descriptor as an apparently working AI preset.
+python -I "$ROOT/BuildScripts/verify-super-resolution-bundle.py" \
+  "$APP" "$BUILD/SuperResolutionModels.json"
+if [[ -f "$ROOT/Docs/SuperResolution.md" ]]; then
+  ditto "$ROOT/Docs/SuperResolution.md" "$BUILD/SuperResolution.md"
+fi
+
 if [[ -e "$BUILD/Payload" || -e "$IPA" ]]; then
   printf '%s\n' 'Packaging output already exists; use a clean checkout for a new build.' >&2
   exit 1
