@@ -32,6 +32,10 @@ final class SuperResolutionBatchTests: XCTestCase {
             ReaderBatchRenderStore.archiveFileName(bookTitle: "A/B: C"),
             "PicaX-A-B- C-2x.zip")
         XCTAssertEqual(ReaderBatchRenderStore.safeFileName("  "), "untitled")
+        let longChineseTitle = String(repeating: "漫", count: 100)
+        let truncated = ReaderBatchRenderStore.safeFileName(longChineseTitle)
+        XCTAssertLessThanOrEqual(truncated.utf8.count, 80)
+        XCTAssertFalse(truncated.isEmpty)
     }
 
     func testUnsupportedSizesAreSkippedButModelFailuresAreNot() {

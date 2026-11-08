@@ -1,4 +1,5 @@
 import Combine
+import CoreGraphics
 import Foundation
 
 nonisolated enum ReaderBatchRenderScope: String, CaseIterable, Codable, Identifiable, Sendable, Hashable {
@@ -195,7 +196,16 @@ nonisolated enum ReaderBatchRenderStore {
             .components(separatedBy: invalidCharacters)
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? "untitled" : String(cleaned.prefix(maximumLength))
+        guard !cleaned.isEmpty else { return "untitled" }
+        // Limit by UTF-8 bytes, not Characters: 80 CJK characters would be
+        // 240 bytes before the timestamp suffix and can exceed NAME_MAX.
+        var result = ""
+        for character in cleaned {
+            let candidate = result + String(character)
+            guard candidate.utf8.count <= maximumLength else { break }
+            result = candidate
+        }
+        return result.isEmpty ? "untitled" : result
     }
 
     static func createOutputDirectory(
@@ -333,7 +343,7 @@ nonisolated enum ReaderBatchRenderStore {
         var seen = Set<String>()
         for name in [manifestName, readmeName] + fileNames {
             guard seen.insert(name).inserted else { continue }
-            guard !name.isEmpty, name == name.lastPathComponent else {
+            guard !name.isEmpty, name == (name as NSString).lastPathComponent else {
                 throw ReaderBatchRenderError.outputFileMissing(name)
             }
             let url = directory.appendingPathComponent(name, isDirectory: false)
@@ -377,6 +387,12 @@ nonisolated enum ReaderBatchRenderStore {
             .standardizedFileURL
         guard container.deletingLastPathComponent().standardizedFileURL == root else { return }
         try? fileManager.removeItem(at: container)
+    }
+
+    /// Remove only the service-owned trial directory for a result that was
+    /// produced after cancellation but never retained in the batch folder.
+    static func discardTrialOutput(_ outputURL: URL) {
+        removeTrialDirectory(outputURL.deletingLastPathComponent())
     }
 
     private static func removeTrialDirectory(_ directory: URL) {
@@ -723,7 +739,10 @@ final class ReaderBatchRenderModel: ObservableObject {
                                 chapterOffset: offset, chapterCount: indices.count)
                         }
                     }
-                    try Task.checkCancellation()
+                    if Task.isCancelled {
+                        ReaderBatchRenderStore.discardTrialOutput(result.outputURL)
+                        throw CancellationError()
+                    }
                     let outputByteCount = try ReaderBatchRenderStore.retainOutput(
                         result.outputURL, in: directory, fileName: fileName)
 

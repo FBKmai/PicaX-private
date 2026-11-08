@@ -45,13 +45,17 @@ struct ReaderBatchRenderView: View {
         .onChange(of: scenePhase) { phase in
             if phase == .background {
                 model.cancel()
-                model.discardTemporaryArchive()
+                if !showsShareSheet {
+                    model.discardTemporaryArchive()
+                }
             }
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
             model.cancel()
-            model.discardTemporaryArchive()
+            if !showsShareSheet {
+                model.discardTemporaryArchive()
+            }
         }
         .onChange(of: model.archiveURL) { url in
             if url != nil { showsShareSheet = true }
@@ -280,7 +284,8 @@ struct ReaderBatchRenderView: View {
                 Text("取消后当前 Core ML 调用返回即停止；已完成页面和 manifest 保留。")
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.6))
-            } else if model.phase == .completed || model.phase == .cancelled {
+            } else if model.phase == .completed || model.phase == .cancelled
+                        || model.phase == .failed {
                 if model.isArchiving {
                     ProgressView("正在打包 ZIP…")
                         .frame(maxWidth: .infinity)
