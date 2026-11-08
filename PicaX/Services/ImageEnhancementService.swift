@@ -101,10 +101,25 @@ enum ImageEnhancementService {
         )
     }
 
+    /// 期望的解码/输出像素宽：放大模式下为屏幕物理像素宽 × 倍率，其余模式为屏幕物理像素宽。
+    nonisolated static func outputPixelWidth(
+        screenPixelWidth: Int?,
+        enhancement: ReaderImageEnhancement
+    ) -> Int? {
+        guard let screenPixelWidth, screenPixelWidth > 0 else {
+            return nil
+        }
+        guard enhancement.mode.usesUpscale else {
+            return screenPixelWidth
+        }
+        let scaled = (Double(screenPixelWidth) * enhancement.scale).rounded()
+        return min(max(Int(scaled), 1), Int(maxOutputSide))
+    }
+
     /// 返回增强后的图片；返回 `nil` 表示无需或无法增强，调用方应继续使用原图。
     nonisolated static func enhancedImage(
         cgImage: CGImage,
-        targetPixelWidth: Int?,
+        outputPixelWidth: Int?,
         enhancement: ReaderImageEnhancement
     ) -> CGImage? {
         guard enhancement.isEnabled, cgImage.width > 0, cgImage.height > 0 else {
@@ -114,12 +129,12 @@ enum ImageEnhancementService {
         var image = CIImage(cgImage: cgImage)
         var didChange = false
 
-        if let outputWidth = upscaledPixelWidth(
+        if let width = limitedOutputPixelWidth(
             cgImage: cgImage,
-            screenPixelWidth: targetPixelWidth,
+            desiredPixelWidth: outputPixelWidth,
             enhancement: enhancement
         ) {
-            let factor = CGFloat(outputWidth) / CGFloat(cgImage.width)
+            let factor = CGFloat(width) / CGFloat(cgImage.width)
             let lanczos = CIFilter.lanczosScaleTransform()
             lanczos.inputImage = image
             lanczos.scale = Float(factor)
@@ -146,22 +161,22 @@ enum ImageEnhancementService {
         return ciContext.createCGImage(image, from: extent)
     }
 
-    private nonisolated static func upscaledPixelWidth(
+    private nonisolated static func limitedOutputPixelWidth(
         cgImage: CGImage,
-        screenPixelWidth: Int?,
+        desiredPixelWidth: Int?,
         enhancement: ReaderImageEnhancement
     ) -> Int? {
         guard enhancement.mode.usesUpscale,
               cgImage.width > 0,
               cgImage.height > 0,
-              let screenPixelWidth,
-              screenPixelWidth > 0 else {
+              let desiredPixelWidth,
+              desiredPixelWidth > cgImage.width else {
             return nil
         }
 
         let sourceWidth = Double(cgImage.width)
         let sourceHeight = Double(cgImage.height)
-        var width = min(Double(screenPixelWidth) * enhancement.scale, sourceWidth * maxUpscaleRatio)
+        var width = min(Double(desiredPixelWidth), sourceWidth * maxUpscaleRatio)
         width = min(width, maxOutputSide, maxOutputSide * sourceWidth / sourceHeight)
 
         let height = width * sourceHeight / sourceWidth

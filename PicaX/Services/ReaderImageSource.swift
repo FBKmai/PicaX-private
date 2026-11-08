@@ -160,7 +160,11 @@ nonisolated enum ReaderImageSourceLoader {
             decoded = image
         } else { decoded = source.image }
         return ImageEnhancementService.enhancedImage(
-            cgImage: decoded, targetPixelWidth: targetPixelWidth, enhancement: enhancement
+            cgImage: decoded,
+            outputPixelWidth: ImageEnhancementService.outputPixelWidth(
+                screenPixelWidth: targetPixelWidth, enhancement: enhancement
+            ),
+            enhancement: enhancement
         ) ?? decoded
     }
 

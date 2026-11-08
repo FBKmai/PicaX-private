@@ -640,7 +640,6 @@ enum ReaderImageDecoder {
         if usesMemoryCache, let cached = ReaderImageMemoryCache.image(for: cacheKey) {
             return cached
         }
-
         var data = try await ImageCacheService.data(for: url)
         guard !Task.isCancelled else { throw CancellationError() }
         if let aspectRatio = encodedAspectRatio(data: data) {
@@ -721,7 +720,13 @@ enum ReaderImageDecoder {
             guard let decodedImage else {
                 throw URLError(.cannotDecodeContentData)
             }
-            let image = applyEnhancement(decodedImage, targetPixelWidth: targetPixelWidth, enhancement: enhancement)
+            let image = applyEnhancement(
+                decodedImage,
+                outputPixelWidth: ImageEnhancementService.outputPixelWidth(
+                    screenPixelWidth: targetPixelWidth, enhancement: enhancement
+                ),
+                enhancement: enhancement
+            )
             return ReaderDecodedImage(image: image)
         }
         return try await withTaskCancellationHandler {
@@ -733,14 +738,14 @@ enum ReaderImageDecoder {
 
     private nonisolated static func applyEnhancement(
         _ image: PicaXPlatformImage,
-        targetPixelWidth: Int?,
+        outputPixelWidth: Int?,
         enhancement: ReaderImageEnhancement
     ) -> PicaXPlatformImage {
         guard enhancement.isEnabled,
               let cgImage = image.picaxCGImage,
               let enhanced = ImageEnhancementService.enhancedImage(
                   cgImage: cgImage,
-                  targetPixelWidth: targetPixelWidth,
+                  outputPixelWidth: outputPixelWidth,
                   enhancement: enhancement
               ) else {
             return image

@@ -46,7 +46,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
         let image = makeImage(width: 50, height: 70)
         let enhanced = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: 200,
+            outputPixelWidth: 200,
             enhancement: .off
         )
         XCTAssertNil(enhanced)
@@ -58,7 +58,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
 
         guard let doubled = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: 100,
+            outputPixelWidth: 100,
             enhancement: enhancement
         ) else {
             XCTFail("expected an upscaled image")
@@ -68,13 +68,26 @@ final class ImageEnhancementServiceTests: XCTestCase {
         XCTAssertEqual(doubled.height, 140)
     }
 
+    func testOutputPixelWidthAppliesScaleOnlyForUpscaleModes() {
+        let sharpen = ReaderImageEnhancement(mode: .sharpen, strength: 0.5, scale: 2)
+        XCTAssertEqual(ImageEnhancementService.outputPixelWidth(screenPixelWidth: 1000, enhancement: sharpen), 1000)
+
+        let upscale = ReaderImageEnhancement(mode: .upscaleSharpen, strength: 0, scale: 1.5)
+        XCTAssertEqual(ImageEnhancementService.outputPixelWidth(screenPixelWidth: 1000, enhancement: upscale), 1500)
+
+        XCTAssertNil(ImageEnhancementService.outputPixelWidth(screenPixelWidth: nil, enhancement: upscale))
+        XCTAssertNil(ImageEnhancementService.outputPixelWidth(screenPixelWidth: 0, enhancement: upscale))
+    }
+
     func testScaleMultipliesTargetWidth() {
         let image = makeImage(width: 50, height: 70)
         let enhancement = ReaderImageEnhancement(mode: .upscaleSharpen, strength: 0, scale: 2)
+        let outputWidth = ImageEnhancementService.outputPixelWidth(screenPixelWidth: 60, enhancement: enhancement)
+        XCTAssertEqual(outputWidth, 120)
 
         guard let upscaled = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: 60,
+            outputPixelWidth: outputWidth,
             enhancement: enhancement
         ) else {
             XCTFail("expected an upscaled image")
@@ -90,7 +103,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
 
         guard let capped = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: 600,
+            outputPixelWidth: 600,
             enhancement: enhancement
         ) else {
             XCTFail("expected a capped upscaled image")
@@ -106,7 +119,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
         XCTAssertNil(
             ImageEnhancementService.enhancedImage(
                 cgImage: image,
-                targetPixelWidth: 300,
+                outputPixelWidth: 300,
                 enhancement: enhancement
             )
         )
@@ -118,7 +131,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
 
         guard let sharpened = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: 600,
+            outputPixelWidth: 600,
             enhancement: enhancement
         ) else {
             XCTFail("expected a sharpened image")
@@ -134,7 +147,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
 
         guard let enhanced = ImageEnhancementService.enhancedImage(
             cgImage: image,
-            targetPixelWidth: nil,
+            outputPixelWidth: nil,
             enhancement: enhancement
         ) else {
             XCTFail("expected an enhanced image")
@@ -147,7 +160,7 @@ final class ImageEnhancementServiceTests: XCTestCase {
     func testUpscaleBoundsHeightAsWellAsWidth() throws {
         let source = makeImage(width: 110, height: 8000)
         let output = try XCTUnwrap(ImageEnhancementService.enhancedImage(
-            cgImage: source, targetPixelWidth: 1000,
+            cgImage: source, outputPixelWidth: 1000,
             enhancement: ReaderImageEnhancement(mode: .upscaleSharpen, strength: 0, scale: 2)
         ))
         XCTAssertLessThanOrEqual(output.width, 8192)
