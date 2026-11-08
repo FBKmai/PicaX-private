@@ -539,7 +539,7 @@ def run_conversion(args, info, weight_data, package, report):
         report.update(full_page.convert_full_page(
             np=np, torch=torch, ct=ct, model=model, architecture=info["architecture"],
             args=args, package=package, package_hasher=package_sha256,
-            fallback_sizes=FULL_PAGE_SIZES))
+            fallback_sizes=FULL_PAGE_SIZES, report=report))
         return
     samples = synthetic_inputs(np)
     reference = {}

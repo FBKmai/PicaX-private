@@ -255,8 +255,16 @@ def check_full_page_spec(ct, model, alignment, maximum_side, report):
             raise FullPageValidationError(f"{expected_name} must be float32")
         description = _shape_description(ct, array)
         if description["flexibility"] is None:
-            raise FullPageValidationError(
-                f"{expected_name} has a fixed shape; a full page would be rejected")
+            if expected_name == "output" and not description["shape"]:
+                # An ML Program with a dynamic output leaves the feature shape
+                # unspecified; Core ML takes the real extent from each
+                # prediction.  A non-empty shape here would be a real fixed
+                # output and is rejected.
+                description["flexibility"] = "unspecified"
+            else:
+                raise FullPageValidationError(
+                    f"{expected_name} has a fixed shape {description['shape']}; "
+                    "a full page would be rejected")
         descriptions.append(description)
     input_description, output_description = descriptions
     if input_description["flexibility"] == "shapeRange":
@@ -283,6 +291,25 @@ def check_full_page_spec(ct, model, alignment, maximum_side, report):
                 raise FullPageValidationError("enumerated input shape exceeds the side limit")
             if shape[2] % alignment or shape[3] % alignment:
                 raise FullPageValidationError("enumerated input shape is not aligned")
+    if output_description["flexibility"] == "shapeRange":
+        ranges = output_description["shapeRange"]
+        if len(ranges) != 4:
+            raise FullPageValidationError("output shape range must have four dimensions")
+        if ranges[0]["lowerBound"] != [1] or ranges[1]["lowerBound"] != [3]:
+            raise FullPageValidationError("output must be one three-channel image")
+        for index in (2, 3):
+            if ranges[index]["upperBound"][0] < maximum_side * 2:
+                raise FullPageValidationError(
+                    f"output dimension {index} upper bound is below {maximum_side * 2}")
+    elif output_description["flexibility"] == "enumeratedShapes":
+        shapes = output_description["enumeratedShapes"]
+        if not shapes:
+            raise FullPageValidationError("output enumerated shapes are empty")
+        for shape in shapes:
+            if (len(shape) != 4 or shape[0] != 1 or shape[1] != 3
+                    or shape[2] % 2 or shape[3] % 2
+                    or shape[2] > maximum_side * 2 or shape[3] > maximum_side * 2):
+                raise FullPageValidationError("enumerated output shape is not a 2x page")
     report["input"] = input_description
     report["output"] = output_description
     return descriptions
@@ -311,20 +338,30 @@ def _attention_forward_without_padding(torch):
 
     The branch is provably a no-op when the feature map is a whole number of
     windows, which ``_attention_requirement`` verifies for the export contract.
+
+    The original window partition is a rank-6 ``view`` + ``permute``, which
+    Core ML rejects (max tensor rank 5).  ``pixel_unshuffle`` / ``pixel_shuffle``
+    produce exactly the same token order with rank 4: the unshuffled channel
+    index is ``c * ws^2 + iy * ws + ix``, so a rank-5 view can separate window,
+    channel and token axes without changing the sequence the attention sees.
     """
     functional = torch.nn.functional
 
     def forward(self, x, height, width):
         batch, length, channels = x.shape
+        window = self.ws
+        windows_h, windows_w = height // window, width // window
+        x = functional.pixel_unshuffle(
+            x.view(batch, height, width, channels).permute(0, 3, 1, 2), window)
         x = (
-            x.view(batch, height // self.ws, self.ws, width // self.ws, self.ws, channels)
-            .permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(-1, self.ws * self.ws, channels)
+            x.reshape(batch, channels, window * window, windows_h, windows_w)
+            .permute(0, 3, 4, 1, 2)
+            .reshape(-1, channels, window * window)
+            .transpose(1, 2)
         )
         qkv = (
             self.qkv(x)
-            .view(-1, self.ws * self.ws, 3, self.nh, channels // self.nh)
+            .view(-1, window * window, 3, self.nh, channels // self.nh)
             .permute(2, 0, 3, 1, 4)
         )
         query, key, value = qkv.unbind(0)
@@ -332,18 +369,34 @@ def _attention_forward_without_padding(torch):
         x = (
             (functional.softmax(attention, dim=-1) @ value)
             .transpose(1, 2)
-            .reshape(-1, self.ws * self.ws, channels)
+            .reshape(-1, window * window, channels)
         )
+        x = self.proj(x)
         x = (
-            self.proj(x)
-            .view(batch, height // self.ws, width // self.ws, self.ws, self.ws, channels)
-            .permute(0, 1, 3, 2, 4, 5)
-            .contiguous()
-            .view(batch, height, width, channels)
+            x.transpose(1, 2)
+            .reshape(batch, windows_h, windows_w, channels, window * window)
+            .permute(0, 3, 4, 1, 2)
+            .reshape(batch, channels * window * window, windows_h, windows_w)
         )
-        return x.view(batch, length, channels)
+        x = functional.pixel_shuffle(x, window)
+        return x.permute(0, 2, 3, 1).reshape(batch, length, channels)
 
     return forward
+
+
+def _fdat_forward_without_crop(self, x):
+    """FDAT's forward without the final crop.
+
+    The upsampler returns exactly ``height * self.upscale`` pixels for the
+    pinned architecture, so the crop is empty; removing it also removes a
+    dynamic slice whose bounds depend on the input shape.
+    """
+    _, _, height, width = x.shape
+    x = self.check_img_size(x, height, width)
+    x_shallow = self.conv_first(x)
+    x_deep = self.groups(x_shallow)
+    x_deep = self.conv_after(x_deep)
+    return self.upsampler(x_deep + x_shallow)
 
 
 def specialize_aligned_export(torch, np, model, architecture, alignment, sizes):
@@ -376,6 +429,7 @@ def specialize_aligned_export(torch, np, model, architecture, alignment, sizes):
     inner = model.model
     if hasattr(inner, "check_img_size"):
         inner.check_img_size = types.MethodType(lambda self, x, h, w: x, inner)
+    inner.forward = types.MethodType(_fdat_forward_without_crop, inner)
     forward = _attention_forward_without_padding(torch)
     patched = 0
     for module in inner.modules():
@@ -394,12 +448,14 @@ def specialize_aligned_export(torch, np, model, architecture, alignment, sizes):
             "removing FDAT's aligned padding branches changed its output")
     return {
         "architecture": architecture,
-        "reason": "FDAT computes window padding with symbolic modulo, which coremltools "
-                  "8.3 cannot lower; the full-page input contract makes the branch empty",
+        "reason": "FDAT computes window padding with symbolic modulo and crops its "
+                  "output with a dynamic slice, which coremltools 8.3 cannot lower; "
+                  "the full-page input contract makes both operations empty",
         "inputMultiple": required,
         "padding": structure["padding"],
         "windows": structure["windows"],
         "patchedAttentionModules": patched,
+        "removedFinalCrop": True,
         "originalVsSpecialized": results,
     }
 
@@ -491,6 +547,9 @@ def convert_flexible(np, ct, program, alignment, maximum_side, example):
                             default=example_height),
                 ct.RangeDim(lower_bound=FULL_PAGE_MINIMUM, upper_bound=maximum_side,
                             default=example_width))))],
+        # Core ML rejects a user shape on outputs; an inferred dynamic output
+        # has no feature shape, which check_full_page_spec records as
+        # "unspecified" rather than a fixed shape.
         outputs=[ct.TensorType(name="output", dtype=np.float32)],
         compute_precision=ct.precision.FLOAT32,
         minimum_deployment_target=ct.target.iOS16)
@@ -533,32 +592,35 @@ def small_page_check(np, ct, compiled, model, torch, width, height, alignment,
 
 
 def convert_full_page(np, torch, ct, model, architecture, args, package, package_hasher,
-                      fallback_sizes):
+                      fallback_sizes, report=None):
     """Convert and smoke-test a genuine one-call full-page model.
 
     Raises on failure so convert.py does not emit a descriptor for a package
-    whose shape contract was never verified.
+    whose shape contract was never verified.  The caller's report is updated in
+    place so partial conversion evidence survives an exception.
     """
-    report = {"fullPageConversion": {
+    if report is None:
+        report = {}
+    conversion = report.setdefault("fullPageConversion", {
         "alignment": args.full_page_alignment,
         "maximumSide": args.full_page_max_side,
         "maximumPixels": args.full_page_max_pixels,
         "minimumSide": FULL_PAGE_MINIMUM,
         "shapeMode": None,
         "fallbackReason": None,
-    }}
+    })
     example = export_example(args.full_page_max_side)
     verification_sizes = [(128, 192), (256, 384)]
     if example not in verification_sizes:
         verification_sizes.append(example)
-    report["fullPageConversion"].update({
+    conversion.update({
         "exportGraphSpecialization": specialize_aligned_export(
             torch, np, model, architecture, args.full_page_alignment,
             verification_sizes),
     })
     program, multiplier, example, constraints = export_dynamic(
         torch, np, model, architecture, args.full_page_alignment, args.full_page_max_side)
-    report["fullPageConversion"].update({
+    conversion.update({
         "dynamicDivisibility": multiplier,
         "exportDialect": str(program.dialect),
         "exampleSize": list(example),
@@ -571,33 +633,33 @@ def convert_full_page(np, torch, ct, model, architecture, args, package, package
     try:
         converted = convert_flexible(
             np, ct, program, args.full_page_alignment, args.full_page_max_side, example)
-        report["fullPageConversion"]["shapeMode"] = "range"
+        conversion["shapeMode"] = "range"
     except Exception as error:  # conversion errors are experiment evidence
         conversion_error = f"{type(error).__name__}: {error}"
-        report["fullPageConversion"]["fallbackReason"] = conversion_error
+        conversion["fallbackReason"] = conversion_error
     if converted is None:
         fallback = aligned_fallback_sizes(
             fallback_sizes, args.full_page_alignment,
             args.full_page_max_side, args.full_page_max_pixels)
-        report["fullPageConversion"].update({
+        conversion.update({
             "shapeMode": "enumerated",
             "enumeratedSizes": [list(size) for size in fallback],
         })
         try:
             converted = convert_enumerated(np, ct, program, fallback, example)
         except Exception as error:
-            report["fullPageConversion"]["enumeratedConversionError"] = (
+            conversion["enumeratedConversionError"] = (
                 f"{type(error).__name__}: {error}")
             raise FullPageValidationError(
                 "neither flexible-range nor enumerated full-page conversion succeeded; "
                 f"range error: {conversion_error}; enumerated error: {error}") from error
     check_full_page_spec(ct, converted, args.full_page_alignment,
-                         args.full_page_max_side, report["fullPageConversion"])
+                         args.full_page_max_side, conversion)
     converted.save(str(package))
     report["packageSHA256"] = package_hasher(package)
     compiled = ct.models.MLModel(str(package), compute_units=ct.ComputeUnit.CPU_ONLY)
     check_full_page_spec(ct, compiled, args.full_page_alignment,
-                         args.full_page_max_side, report["fullPageConversion"])
+                         args.full_page_max_side, conversion)
     metrics = small_page_check(
         np, ct, compiled, model, torch, 256, 384, args.full_page_alignment,
         args.full_page_max_side, args.full_page_max_pixels,

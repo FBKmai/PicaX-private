@@ -30,14 +30,16 @@ def _save_array(path, array):
         np.save(output, array)
 
 
-def _crop(np, array, width, height):
+def _crop(np, array, width, height, padded_width, padded_height):
+    """Validate the whole padded canvas, then keep the app-visible 2x page."""
     array = np.asarray(array)
-    expected = (1, 3, height * 2, width * 2)
+    expected = (1, 3, padded_height * 2, padded_width * 2)
     if array.shape != expected:
         raise ValueError(f"model output shape {array.shape} != {expected}")
     if not np.isfinite(array).all():
         raise ValueError("model output contains non-finite values")
-    return np.array(array, dtype=np.float32, copy=True, order="C")
+    cropped = array[:, :, :height * 2, :width * 2]
+    return np.array(cropped, dtype=np.float32, copy=True, order="C")
 
 
 def torch_worker(args):
@@ -61,7 +63,8 @@ def torch_worker(args):
     with torch.no_grad():
         prediction = model(sample)
     prediction_seconds = time.monotonic() - started
-    cropped = _crop(np, prediction.detach().cpu().numpy(), args.width, args.height)
+    cropped = _crop(np, prediction.detach().cpu().numpy(), args.width, args.height,
+                    padded_width, padded_height)
     _save_array(args.output_npy, cropped)
     return {
         "status": "success", "backend": "PyTorch eager CPU",
@@ -70,6 +73,7 @@ def torch_worker(args):
         "loadSeconds": load_seconds, "predictionSeconds": prediction_seconds,
         "outputWidth": args.width * 2, "outputHeight": args.height * 2,
         "paddedInputDimensions": [padded_width, padded_height],
+        "paddedOutputDimensions": [padded_width * 2, padded_height * 2],
         "range": [float(cropped.min()), float(cropped.max())],
     }
 
@@ -98,7 +102,7 @@ def coreml_worker(args):
         array = np.asarray(output)
     else:
         array = full_page.multiarray_to_numpy(np, output)
-    cropped = _crop(np, array, args.width, args.height)
+    cropped = _crop(np, array, args.width, args.height, padded_width, padded_height)
     _save_array(args.output_npy, cropped)
     return {
         "status": "success", "backend": "Core ML MLProgram float32",
@@ -106,6 +110,7 @@ def coreml_worker(args):
         "loadSeconds": load_seconds, "predictionSeconds": prediction_seconds,
         "outputWidth": args.width * 2, "outputHeight": args.height * 2,
         "paddedInputDimensions": [padded_width, padded_height],
+        "paddedOutputDimensions": [padded_width * 2, padded_height * 2],
         "range": [float(cropped.min()), float(cropped.max())],
     }
 

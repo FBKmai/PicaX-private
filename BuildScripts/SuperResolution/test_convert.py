@@ -255,6 +255,71 @@ class ConversionLogicTests(unittest.TestCase):
         Inner.pad = 0
         self.assertEqual(full_page._attention_requirement(Model())["inputMultiple"], 8)
 
+    def test_full_page_spec_accepts_unspecified_dynamic_output(self):
+        class Size:
+            def __init__(self, lower, upper):
+                self.lowerBound = lower
+                self.upperBound = upper
+
+        class ShapeRange:
+            sizeRanges = [Size(1, 1), Size(3, 3), Size(64, 2048), Size(64, 2048)]
+
+        class Array:
+            dataType = 1
+
+            def __init__(self, shape, flexibility):
+                self.shape = shape
+                self.shapeRange = ShapeRange()
+                self._flexibility = flexibility
+
+            def WhichOneof(self, _name):
+                return self._flexibility
+
+        class FeatureType:
+            def __init__(self, array):
+                self.multiArrayType = array
+
+            @staticmethod
+            def WhichOneof(_name):
+                return "multiArrayType"
+
+        class Feature:
+            def __init__(self, name, array):
+                self.name = name
+                self.type = FeatureType(array)
+
+        class Description:
+            input = [Feature("input", Array([1, 3, 64, 64], "shapeRange"))]
+            output = [Feature("output", Array([], None))]
+
+        class Spec:
+            description = Description()
+
+        class Model:
+            @staticmethod
+            def get_spec():
+                return Spec()
+
+        class Proto:
+            class FeatureTypes_pb2:
+                class ArrayFeatureType:
+                    FLOAT32 = 1
+
+        class CT:
+            proto = Proto
+
+        report = {}
+        descriptions = full_page.check_full_page_spec(CT, Model(), 16, 2048, report)
+        self.assertEqual(descriptions[1]["flexibility"], "unspecified")
+        self.assertEqual(descriptions[1]["shape"], [])
+        self.assertEqual(report["output"]["flexibility"], "unspecified")
+
+        Description.output = [Feature("output", Array([1, 3, 512, 768], None))]
+        report = {}
+        with self.assertRaises(full_page.FullPageValidationError) as raised:
+            full_page.check_full_page_spec(CT, Model(), 16, 2048, report)
+        self.assertIn("[1, 3, 512, 768]", str(raised.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
