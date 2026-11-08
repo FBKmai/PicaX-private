@@ -120,6 +120,13 @@ def worker_main(args):
               "width": args.width, "height": args.height}
     if args.kind == "coreml":
         result["computeUnit"] = args.compute_unit
+        result["addressSpaceLimit"] = {
+            "requestedMiB": args.memory_mb, "applied": False,
+            "reason": "Core ML reserves large virtual address ranges; the parent "
+                      "RSS watchdog enforces the memory limit"}
+    else:
+        # Apply before importing Torch/NumPy so the limit covers the whole worker.
+        result["addressSpaceLimit"] = full_page.apply_memory_limit(args.memory_mb)
     try:
         if args.kind == "torch":
             result.update(torch_worker(args))
@@ -152,6 +159,7 @@ def build_parser():
     worker.add_argument("--alignment", type=int, required=True)
     worker.add_argument("--max-side", type=int, required=True)
     worker.add_argument("--max-pixels", type=int, required=True)
+    worker.add_argument("--memory-mb", type=int, default=0)
     worker.add_argument("--result-json", type=Path, required=True)
     worker.add_argument("--output-npy", type=Path, required=True)
     validate = subparsers.add_parser("validate", help="Run all isolated size/unit trials")
@@ -184,8 +192,10 @@ def summary_main(args):
     print(f"- scope: {report.get('scope')}")
     policy = report.get("workerPolicy", {})
     print(f"- isolated process per prediction: {policy.get('isolatedProcessPerPrediction')}; "
-          f"timeout {policy.get('timeoutSeconds')}s; address-space limit "
-          f"{policy.get('addressSpaceLimitMB')} MiB")
+          f"timeout {policy.get('timeoutSeconds')}s; memory limit "
+          f"{policy.get('memoryLimitMiB')} MiB")
+    print(f"- memory protection: {policy.get('rssWatchdog')}; "
+          f"{policy.get('addressSpaceLimit')}")
     print("| page | torch | unit | status | max err | mean err | P99 err | predict s | peak RSS MiB |")
     print("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
     for label, entry in report.get("sizes", {}).items():

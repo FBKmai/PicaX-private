@@ -24,6 +24,7 @@ import math
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -167,6 +168,34 @@ def peak_rss_bytes():
         return None
     # macOS reports bytes; Linux reports KiB.
     return int(value if sys.platform == "darwin" else value * 1024)
+
+
+def apply_memory_limit(memory_mb):
+    """Best-effort RLIMIT_AS for a CPU-only worker, clamped to the hard limit.
+
+    macOS can publish an address-space hard limit below the requested value and
+    then reject the call; the caller records the outcome instead of aborting.
+    Core ML workers do not use this because graphics frameworks reserve large
+    virtual ranges; the parent RSS watchdog is the enforced memory protection.
+    """
+    if memory_mb <= 0:
+        return {"requestedMiB": 0, "applied": False, "reason": "disabled"}
+    try:
+        import resource
+        requested = int(memory_mb) * 1024 * 1024
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except Exception as error:
+        return {"requestedMiB": int(memory_mb), "applied": False,
+                "reason": f"{type(error).__name__}: {error}"}
+    return {
+        "requestedMiB": int(memory_mb),
+        "applied": True,
+        "limitMiB": limit // (1024 * 1024),
+        "hardLimitMiB": (None if hard == resource.RLIM_INFINITY
+                         else hard // (1024 * 1024)),
+    }
 
 
 def multiarray_to_numpy(np, array):
@@ -697,40 +726,72 @@ def _worker_environment():
     return environment
 
 
+def _rss_bytes(pid):
+    """Sampled resident size for the parent watchdog; 0 if it cannot be read."""
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5)
+        value = completed.stdout.strip()
+        return int(value) * 1024 if value else 0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
 def _run_worker(kind, arguments, run_directory, timeout, memory_mb):
     command = _worker_command(kind, arguments)
     started = time.monotonic()
-    kwargs = {"cwd": str(run_directory), "env": _worker_environment(),
-              "capture_output": True, "text": True, "timeout": timeout}
-    if memory_mb > 0:
-        try:
-            import resource
-            limit = memory_mb * 1024 * 1024
+    # The RSS watchdog is enforced here rather than with preexec_fn: a failing
+    # setrlimit in preexec_fn raises SubprocessError and used to abort the whole
+    # validation run on macOS.  The worker records its own best-effort
+    # RLIMIT_AS result separately.
+    process = subprocess.Popen(
+        command, cwd=str(run_directory), env=_worker_environment(),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stop = threading.Event()
+    watchdog = {"memoryLimitMiB": memory_mb, "sampledPeakRSSBytes": 0,
+                "rssLimitExceeded": False}
 
-            def limit_address_space():
-                resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+    def watch_memory():
+        limit = memory_mb * 1024 * 1024 if memory_mb > 0 else None
+        while not stop.wait(0.5):
+            rss = _rss_bytes(process.pid)
+            if rss > watchdog["sampledPeakRSSBytes"]:
+                watchdog["sampledPeakRSSBytes"] = rss
+            if limit is not None and rss > limit:
+                watchdog["rssLimitExceeded"] = True
+                process.kill()
+                return
 
-            kwargs["preexec_fn"] = limit_address_space
-        except ImportError:
-            pass
+    thread = threading.Thread(target=watch_memory, name="full-page-rss-watchdog",
+                              daemon=True)
+    thread.start()
+    timed_out = False
     try:
-        completed = subprocess.run(command, **kwargs)
-        return {"returnCode": completed.returncode,
-                "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:],
-                "wallSeconds": time.monotonic() - started, "timedOut": False}
-    except subprocess.TimeoutExpired as error:
-        def decode(value):
-            return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
-        return {"returnCode": None, "stdout": decode(error.stdout)[-4000:],
-                "stderr": decode(error.stderr)[-4000:],
-                "wallSeconds": time.monotonic() - started, "timedOut": True}
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        stdout, stderr = process.communicate()
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+    return {"returnCode": process.returncode,
+            "stdout": (stdout or "")[-4000:], "stderr": (stderr or "")[-4000:],
+            "wallSeconds": time.monotonic() - started, "timedOut": timed_out,
+            "memoryWatchdog": watchdog}
 
 
 def _read_worker_result(result_path, run):
     if result_path.is_file():
         with result_path.open("r", encoding="utf-8") as source:
             return json.load(source)
-    detail = "timeout" if run["timedOut"] else f"exit {run['returnCode']}"
+    if run["timedOut"]:
+        detail = "timeout"
+    elif run["memoryWatchdog"]["rssLimitExceeded"]:
+        detail = "RSS watchdog kill"
+    else:
+        detail = f"exit {run['returnCode']}"
     return {"status": "failed",
             "error": f"worker produced no result ({detail})",
             "stderr": run["stderr"], "stdout": run["stdout"]}
@@ -786,7 +847,10 @@ def run_validation(args):
                        "meanAbsoluteError": args.max_mean_error},
         "workerPolicy": {
             "isolatedProcessPerPrediction": True, "timeoutSeconds": args.timeout,
-            "addressSpaceLimitMB": args.memory_mb,
+            "memoryLimitMiB": args.memory_mb,
+            "rssWatchdog": "parent samples each worker's RSS and kills it above the limit",
+            "addressSpaceLimit": ("best-effort RLIMIT_AS inside CPU-only workers; "
+                                  "clamped to the platform hard limit and recorded"),
             "requiredUnits": ["cpuOnly"],
             "unitsAtEverySize": ["cpuOnly"],
             "additionalUnitsAt": [list(size) for size in sorted(all_units_at)],
@@ -807,10 +871,13 @@ def run_validation(args):
             "--width", str(width), "--height", str(height),
             "--alignment", str(args.alignment), "--max-side", str(args.max_side),
             "--max-pixels", str(args.max_pixels),
+            "--memory-mb", str(args.memory_mb),
             "--result-json", str(torch_result_path), "--output-npy", str(reference_path),
         ], run_directory, args.timeout, args.memory_mb)
         torch_result = _read_worker_result(torch_result_path, run)
-        torch_result["run"] = {key: run[key] for key in ("returnCode", "timedOut", "wallSeconds")}
+        torch_result["run"] = {key: run[key]
+                               for key in ("returnCode", "timedOut", "wallSeconds",
+                                           "memoryWatchdog")}
         entry["torch"] = torch_result
         if torch_result.get("status") != "success":
             for unit in units:
@@ -834,11 +901,13 @@ def run_validation(args):
                 "--alignment", str(args.alignment), "--max-side", str(args.max_side),
                 "--max-pixels", str(args.max_pixels),
                 "--compute-unit", unit,
+                "--memory-mb", str(args.memory_mb),
                 "--result-json", str(result_path), "--output-npy", str(output_path),
             ], run_directory, args.timeout, args.memory_mb)
             unit_result = _read_worker_result(result_path, coreml_run)
             unit_result["run"] = {key: coreml_run[key]
-                                  for key in ("returnCode", "timedOut", "wallSeconds")}
+                                  for key in ("returnCode", "timedOut", "wallSeconds",
+                                              "memoryWatchdog")}
             if unit_result.get("status") == "success":
                 actual = np.load(output_path)
                 if actual.shape != expected_shape:

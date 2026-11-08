@@ -215,6 +215,11 @@ class ConversionLogicTests(unittest.TestCase):
             self.assertEqual(full_page.reflected(coordinate, 7),
                              convert.reflected(coordinate, 7))
 
+    def test_memory_limit_is_recorded_and_disabled_on_request(self):
+        self.assertEqual(full_page.apply_memory_limit(0),
+                         {"requestedMiB": 0, "applied": False, "reason": "disabled"})
+        self.assertEqual(full_page.apply_memory_limit(-1)["reason"], "disabled")
+
     def test_full_page_shape_description_reads_scalar_range_bounds(self):
         class Size:
             lowerBound = 64
