@@ -4,7 +4,9 @@
 
 首轮只支持用户**显式前台**试处理当前页或少量页面，不做整章、后台任务或自动逐页运行；原图必须保留。本仓库**没有随代码提供这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**。因此未自行取得合规权重并完成转换、验证、资源集成之前，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。
 
-本机为 Windows / Python 3.9，无 Xcode、macOS、权重；本次只检查了来源、转换配置与 Python 纯逻辑，**没有完成任何真实权重加载、Core ML 转换、macOS 预测、iOS 编译、拼接或真机画质/耗时/内存验证**。上游列出候选配置不等于已经证明此脚本、设备或目标应用能成功运行。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+截至 2026-11-08，已通过 [Actions 工程构建 #6](https://github.com/FBKmai/PicaX-private/actions/runs/42445750760)：Xcode 27.1 / iOS 27.1 SDK，145 项 iOS 模拟器测试及 20 项 Python 工具测试通过。未签名 IPA 的提交为 `6c558161a66e7374c2e8f77d6aef92e1a19d804c`，SHA-256 为 `4a629cab5951693e89a4115551369749b3344b3767baff7488cf807f3c327cf9`；已独立核对 ZIP CRC、构建提交和 SDK。该包的资源审计仍为 `engineering-build-no-models`，不是 AI 可用版，安装前需要签名。
+
+本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；**尚未完成真实权重加载、Core ML 转换、macOS 预测、拼接或真机画质/耗时/内存验证**。新增的手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -25,12 +27,14 @@
 | `2x_MangaJaNai_2048p_V1_ESRGAN_95k.pth` | `146cd009b9589203a8444fe0aa7195709bb5b9fdeaca3808b7fbbd5538f94c41` |
 | `2x_IllustrationJaNai_V3detail_FDAT_M_unshuffle_40k_fp16.safetensors` | `8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0` |
 
-上表不是 archive 的 hash，脚本也不下载权重。3.0.0 release API 为整个 `IllustrationJaNai_V3detail.zip` 给出的 SHA-256 是 `27749962bc934779f867730cdb10617e3d7475313f920a7a966c56b75dbdbeda`，大小约 319 MB；1.0.0 的 `MangaJaNai_V1_ModelsOnly.zip` 约 433 MB，API 未给出该 zip 的 SHA-256。两者都不是上表单个文件的 digest。尚未下载/解压这两个巨大文件，也没有独立计算其内部各文件的 hash。
+上表不是 archive 的 hash，`convert.py` 不下载权重。独立的 `fetch_checkpoint.py` 只允许固定的官方发布 URL、归档大小及 hash，下载和提取目录必须各自为空、互不包含且位于项目之外；只提取所选 checkpoint，不执行归档内代码，拒绝路径穿越/链接，并将许可/README/NOTICE 条目写入来源报告。
+
+2026-11-08 已核对：3.0.0 的 `IllustrationJaNai_V3detail.zip`（318641534 字节）实测 SHA-256 与 release API 的 `27749962bc934779f867730cdb10617e3d7475313f920a7a966c56b75dbdbeda` 相同；1.0.0 的 `MangaJaNai_V1_ModelsOnly.zip`（433383160 字节）实测为 `5156f4167875bba51a8ed52bd1c794b0d7277f7103f99b397518066e4dda7e55`，这是观察值，**不是原作者签名或 API 提供的 digest**。两归档未发现名称含 license/readme/notice/copying 的文件，这不能代替许可判断。所选 1200p 黑白权重（33709234 字节）和彩色 FDAT 权重（16198963 字节）的实际 SHA-256 均与上表相同；未加载权重或提取其他模型。
 
 ## 模型许可和分发阻塞
 
-- **Manga V1 有冲突，不能将转换器的条目当作最终许可。** 1.0.0 tag 的上游 [LICENSE](https://github.com/the-database/MangaJaNai/blob/5e9db8e5a26ef9336d6bc6baeebbe3b3ac740963/LICENSE) 是 **CC BY-NC-SA 4.0**；仓库 [2024-06-12 的 `d373dcf7728a355bd5822d190a33162567bb4b41`](https://github.com/the-database/MangaJaNai/commit/d373dcf7728a355bd5822d190a33162567bb4b41) 将仓库 LICENSE 改为 **CC BY-NC 4.0**，而第三方转换器将 V1 权重标为 CC BY-NC 4.0。没有读取权重归档内的任何附加条款，也未获得权利人确认新的许可是否明确覆盖旧 release 的 checkpoint。SA 条件不能擅自忽略。V1 descriptor 的 `license` 为明确的 `UNRESOLVED` 说明；此脚本只写项目外暂存目录，不自动放进 app bundle。**在核实确切权重授权、适用 SA/改作和预期 IPA 分发方式之前不得分发或启用。**
-- **彩色 V3detail：** 3.0.0 tag 的[上游 LICENSE](https://github.com/the-database/MangaJaNai/blob/d2f8f92dc75303c557ca2d7a507913eff512ff32/LICENSE) 和转换器条目均为 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)。仍未读取 release zip 内的附加条款，分发前须核对实际 checkpoint 的许可、贡献者和项目/商店的分发方式；不能因为代码仓库许可证而推断商业分发权。
+- **Manga V1 有冲突，不能将转换器的条目当作最终许可。** 1.0.0 tag 的上游 [LICENSE](https://github.com/the-database/MangaJaNai/blob/5e9db8e5a26ef9336d6bc6baeebbe3b3ac740963/LICENSE) 是 **CC BY-NC-SA 4.0**；仓库 [2024-06-12 的 `d373dcf7728a355bd5822d190a33162567bb4b41`](https://github.com/the-database/MangaJaNai/commit/d373dcf7728a355bd5822d190a33162567bb4b41) 将仓库 LICENSE 改为 **CC BY-NC 4.0**，而第三方转换器将 V1 权重标为 CC BY-NC 4.0。已检查实际归档目录，未发现附带许可/README/NOTICE 文件；未获得权利人确认新的许可是否明确覆盖旧 release 的 checkpoint。SA 条件不能擅自忽略。V1 descriptor 的 `license` 为明确的 `UNRESOLVED` 说明；此脚本只写项目外暂存目录，不自动放进 app bundle。**在核实确切权重授权、适用 SA/改作和预期 IPA 分发方式之前不得分发或启用。**
+- **彩色 V3detail：** 3.0.0 tag 的[上游 LICENSE](https://github.com/the-database/MangaJaNai/blob/d2f8f92dc75303c557ca2d7a507913eff512ff32/LICENSE) 和转换器条目均为 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)。实际 release zip 中未发现附带许可/README/NOTICE 文件，分发前仍须核对实际 checkpoint 的许可、贡献者和项目/商店的分发方式；不能因为代码仓库许可证而推断商业分发权。
 - 非商业条款限制以商业利益或金钱报酬为主要目的的使用；归属、许可链接、免责声明、变更标识等依适用许可保留。转换 Core ML 是修改/转换，分发时应注明原作者 the-database、原模型链接、确切许可、所做转换与修改，并履行可能适用的 SA 条款；这是工程提示，不是法律意见。未解决时仅能把模型视为未验证/不具备分发条件。
 
 ## 模型输入输出和分块
@@ -41,7 +45,13 @@
 - `precision` 是 Core ML **中间计算精度**，不是输入/输出数据类型。Manga ESRGAN 上游要求 FP32，中间 FP16 曾在孤立边缘像素出现大误差；脚本拒绝 Manga FP16。彩色 FDAT 2× 上游采用 FP16 中间计算，但仅可作为候选，需分别测 FP32/FP16。FP32 不保证 ANE，速度/内存/画质取决于实际设备。
 - 上游的 Spandrel 转换明确以 iOS 16 为最低目标。应用仍可保留 iOS 15.2 普通阅读，但 AI 的模型加载/推理必须限制 iOS 16+ 并在不满足时明确不可用。macOS CPU 数值预测不等于 iOS GPU/ANE 验证。
 
-## 在 macOS 暂存转换（尚未跑通）
+## 真实转换工作流与预先确定的数值标准
+
+手动运行 `.github/workflows/validate-super-resolution.yml`，依次尝试 Manga 1200p FP32、彩色 FDAT FP32 和 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的私有 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
+
+在观察结果前固定工程数值阈值：FP32 最大绝对误差 `2/255`、平均绝对误差 `0.1/255`；彩色 FP16 分别为 `8/255`、`0.5/255`。这是转换误差的有限上界（相对 `[0,1]` 张量），**不是实际画质验收**。每个梯度、边线、噪声样本必须单独满足，出现非有限值或结构错误仍直接失败。不得因为某次失败而事后扩大阈值宣称通过；可改用更高计算精度候选并保留两份报告。整页/分块和真机门槛独立保留。
+
+## 在 macOS 暂存转换
 
 请先独立确认权重来源及许可；只获取实际需要的 checkpoint，不要将整个模型仓库、无关模型或读者漫画加入项目。将每个下载文件放独立空目录，安全检查归档及其中许可后只取所需文件；避免路径穿越/链接，不在下载或解压目录执行代码。使用受信任的 Python 环境，从另一个安全工作目录运行，所有输入使用绝对路径。脚本不提供不安全 pickle 回退：先将同一文件字节读入内存、核对调用者给出的 SHA 与上表锁定值及实测 SHA，再对 `.pth` 调用 `torch.load(..., weights_only=True, map_location="cpu")`；彩色使用 safetensors。PyTorch 2.6.0 修复了已知的 CVE-2025-32434，但 `weights_only` 和 safetensors 也不是运行不可信内容的完整沙箱；绝不能接受任意 hash 或关闭核验。已知 hash 来自第三方、不是作者签名，也不能替代信任及隔离。
 
