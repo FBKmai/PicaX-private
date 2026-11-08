@@ -8,6 +8,9 @@ nonisolated struct AppProxyHTTPResponse {
 }
 
 nonisolated enum AppProxyHTTPCodec {
+    // Internal per-request policy. Never send this field to the origin server.
+    static let maximumBodyHeaderName = "X-PicaX-Maximum-Response-Bytes"
+
     static func encodedRequest(
         _ request: URLRequest,
         preservedBody: Data?,
@@ -53,6 +56,7 @@ nonisolated enum AppProxyHTTPCodec {
             "transfer-encoding",
             "accept-encoding",
             "expect",
+            maximumBodyHeaderName.lowercased(),
             internalHeaderName.lowercased()
         ])
         var headerLines = [String]()
@@ -89,8 +93,13 @@ nonisolated enum AppProxyHTTPCodec {
 
     static func readResponse(
         from channel: AppProxyHTTPChannel,
-        requestMethod: String
+        requestMethod: String,
+        maximumBytes: Int? = nil
     ) throws -> AppProxyHTTPResponse {
+        guard maximumBytes.map({ $0 >= 0 }) ?? true else {
+            throw AppProxyError.invalidHTTPResponse("响应大小限制无效")
+        }
+        let bodyLimit = min(maximumBytes ?? maximumBodyLength, maximumBodyLength)
         let reader = AppProxyHTTPChannelReader(channel: channel)
         let headerData = try reader.readThrough(
             Data("\r\n\r\n".utf8),
@@ -152,7 +161,7 @@ nonisolated enum AppProxyHTTPCodec {
         } else if headers["transfer-encoding"]?
             .lowercased()
             .contains("chunked") == true {
-            body = try reader.readChunkedBody()
+            body = try reader.readChunkedBody(maximumLength: bodyLimit)
             headers["transfer-encoding"] = nil
             headers["content-length"] = String(body.count)
         } else if let contentLengthValue = headers["content-length"] {
@@ -162,13 +171,13 @@ nonisolated enum AppProxyHTTPCodec {
                     "Content-Length 无效"
                 )
             }
-            guard contentLength <= maximumBodyLength else {
+            guard contentLength <= bodyLimit else {
                 throw AppProxyError.responseTooLarge
             }
             body = try reader.readExactly(contentLength)
         } else {
             body = try reader.readToEnd(
-                maximumLength: maximumBodyLength
+                maximumLength: bodyLimit
             )
             headers["content-length"] = String(body.count)
         }

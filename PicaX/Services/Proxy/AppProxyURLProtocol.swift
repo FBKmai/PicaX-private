@@ -153,9 +153,19 @@ nonisolated final class AppProxyURLProtocol: URLProtocol, @unchecked Sendable {
                 internalHeaderName: AppProxyRouteRegistry.headerName
             )
             try channel.write(encodedRequest)
+            let maximumBytes: Int?
+            if let rawLimit = request.value(forHTTPHeaderField: AppProxyHTTPCodec.maximumBodyHeaderName) {
+                guard let limit = Int(rawLimit), limit >= 0 else {
+                    throw AppProxyError.invalidHTTPResponse("响应大小限制无效")
+                }
+                maximumBytes = limit
+            } else {
+                maximumBytes = nil
+            }
             let response = try AppProxyHTTPCodec.readResponse(
                 from: channel,
-                requestMethod: request.httpMethod ?? "GET"
+                requestMethod: request.httpMethod ?? "GET",
+                maximumBytes: maximumBytes
             )
             guard !isCancelled else { return }
             guard let httpResponse = HTTPURLResponse(

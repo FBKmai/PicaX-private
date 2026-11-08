@@ -58,7 +58,7 @@ nonisolated enum ReaderImageSourceLoader {
     static let maximumEncodedBytes = 64 * 1024 * 1024
 
     static func load(url: URL) async throws -> ReaderImageSource {
-        var data = try await ImageCacheService.data(for: url)
+        var data = try await sourceData(for: url)
         try Task.checkCancellation()
         do {
             return try await decodeOffMain(data: data, url: url)
@@ -66,10 +66,20 @@ nonisolated enum ReaderImageSourceLoader {
             // A resource or JM failure is not a corrupt network cache. Do not redownload it.
             guard case .invalidImage = error, url.picaxLocalFileURL == nil else { throw error }
             ImageCacheService.removeCachedImageData(for: url)
-            data = try await ImageCacheService.data(for: url, storesInCache: false)
+            data = try await sourceData(for: url, storesInCache: false)
             let source = try await decodeOffMain(data: data, url: url)
             ImageCacheService.storeDecodedImageData(data, for: url)
             return source
+        }
+    }
+
+    private static func sourceData(for url: URL, storesInCache: Bool = true) async throws -> Data {
+        do {
+            return try await ImageCacheService.data(
+                for: url, storesInCache: storesInCache, maximumBytes: maximumEncodedBytes
+            )
+        } catch ImageCacheReadError.sizeLimitExceeded {
+            throw ReaderImageSourceError.budgetExceeded
         }
     }
 
@@ -174,13 +184,9 @@ nonisolated enum ReaderImageSourceLoader {
         targetPixelWidth: Int?,
         enhancement: ReaderImageEnhancement
     ) -> Int {
-        let multiplier = enhancement.mode.usesUpscale ? enhancement.scale : 1
-        let demand = targetPixelWidth.map { Double(max($0, 1)) * multiplier } ?? Double(dimensions.width)
-        var width = min(Double(dimensions.width), demand, 8192)
-        width = min(width, 8192 * Double(dimensions.width) / Double(dimensions.height))
-        let pixels = width * width * Double(dimensions.height) / Double(dimensions.width)
-        if pixels > 16_000_000 { width *= (16_000_000 / pixels).squareRoot() }
-        return max(1, Int(width.rounded(.down)))
+        ReaderImageDisplayBudget.pixelWidth(
+            dimensions: dimensions, targetPixelWidth: targetPixelWidth, enhancement: enhancement
+        )
     }
 
 }

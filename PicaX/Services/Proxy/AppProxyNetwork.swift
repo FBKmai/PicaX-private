@@ -31,13 +31,36 @@ nonisolated final class AppProxyNetwork: @unchecked Sendable {
         AppNetworkSessionFactory.shared.session(for: try currentRoute(), purpose: purpose)
     }
 
-    func data(for request: URLRequest, purpose: AppNetworkPurpose = .api) async throws -> (Data, URLResponse) {
+    func data(
+        for request: URLRequest, purpose: AppNetworkPurpose = .api, maximumBytes: Int? = nil
+    ) async throws -> (Data, URLResponse) {
+        if let maximumBytes, maximumBytes < 0 { throw ImageCacheReadError.invalidMaximumBytes }
         var attemptedProfiles = Set<UUID>()
         while true {
             try Task.checkCancellation()
             let route = try currentRoute()
             let session = AppNetworkSessionFactory.shared.session(for: route, purpose: purpose)
-            let result = try await session.data(for: request)
+            let result: (Data, URLResponse)
+            if let maximumBytes {
+                var boundedRequest = request
+                if case .proxy = route {
+                    boundedRequest.setValue(String(maximumBytes), forHTTPHeaderField: AppProxyHTTPCodec.maximumBodyHeaderName)
+                }
+                do {
+                    result = try await BoundedImageDataReader.network(
+                        request: boundedRequest, session: session, maximumBytes: maximumBytes
+                    )
+                } catch {
+                    let nsError = error as NSError
+                    if nsError.domain == AppProxyTransportError.errorDomain,
+                       nsError.code == AppProxyTransportError.responseTooLargeCode {
+                        throw ImageCacheReadError.sizeLimitExceeded
+                    }
+                    throw error
+                }
+            } else {
+                result = try await session.data(for: request)
+            }
             guard ["GET", "HEAD"].contains((request.httpMethod ?? "GET").uppercased()),
                   (result.1 as? HTTPURLResponse)?.statusCode == 403,
                   case .proxy(.builtIn(let profile, _, _)) = route else { return result }

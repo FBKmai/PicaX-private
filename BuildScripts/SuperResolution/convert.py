@@ -369,16 +369,27 @@ def validate_tile_seams(np, torch, model, compiled, package, args):
         halo = OVERLAP * SCALE
         reference = full[0, :, halo:halo + height * SCALE, halo:halo + width * SCALE]
         assembled = np.empty((3, height * SCALE, width * SCALE), dtype=np.float32)
+        torch_assembled = np.empty_like(assembled)
+        tile_comparisons = []
         for x, y, tile_width, tile_height in tile_positions(width, height):
             sample = reflected_window(np, page, x - OVERLAP, y - OVERLAP, TILE_SIZE, TILE_SIZE)
             prediction = np.asarray(compiled.predict({"input": sample})["output"])
+            # Compare the exact same window before attributing a seam failure
+            # to Core ML conversion versus the model's limited tile context.
+            with torch.no_grad():
+                torch_tile = model(torch.from_numpy(sample)).detach().cpu().numpy()
+            tile_comparisons.append(error_metrics(
+                np, prediction, torch_tile, args.max_abs_error, args.max_mean_error))
             if (prediction.shape != (1, 3, TILE_SIZE * SCALE, TILE_SIZE * SCALE)
                     or prediction.dtype != np.float32 or not np.isfinite(prediction).all()
                     or np.min(prediction) < 0 or np.max(prediction) > 1):
                 raise ValueError("invalid Core ML tile output, including discarded halo")
             assembled[:, y * SCALE:(y + tile_height) * SCALE, x * SCALE:(x + tile_width) * SCALE] = (
                 prediction[0, :, halo:halo + tile_height * SCALE, halo:halo + tile_width * SCALE])
+            torch_assembled[:, y * SCALE:(y + tile_height) * SCALE, x * SCALE:(x + tile_width) * SCALE] = (
+                torch_tile[0, :, halo:halo + tile_height * SCALE, halo:halo + tile_width * SCALE])
         difference = np.abs(assembled.astype(np.float64) - reference.astype(np.float64))
+        torch_difference = np.abs(torch_assembled.astype(np.float64) - reference.astype(np.float64))
         seams = np.zeros((height * SCALE, width * SCALE), dtype=bool)
         # Inspect a 4-output-pixel band centered on every internal join.
         for x in range(core, width, core):
@@ -395,10 +406,23 @@ def validate_tile_seams(np, torch, model, compiled, package, args):
             "seamPixelCount": int(np.count_nonzero(seams)), "seamMeanAbsoluteError": seam_mean,
             "seamMaxAbsoluteError": float(np.max(seam_values)) if seam_values.size else None,
             "nonseamMeanAbsoluteError": float(np.mean(nonseam_values)) if nonseam_values.size else None,
+            "coreMLVsTorchSameTiles": {
+                "passed": all(item["passed"] for item in tile_comparisons),
+                "maxAbsoluteError": max(item["maxAbsoluteError"] for item in tile_comparisons),
+                "meanAbsoluteError": sum(item["meanAbsoluteError"] for item in tile_comparisons) / len(tile_comparisons),
+                "tileCount": len(tile_comparisons),
+            },
+            "torchTiledVsFull": {
+                "maxAbsoluteError": float(np.max(torch_difference)),
+                "meanAbsoluteError": float(np.mean(torch_difference)),
+                "seamMeanAbsoluteError": float(np.mean(torch_difference[:, seams])) if np.any(seams) else 0.0,
+            },
             "passed": maximum <= args.max_tile_abs_error and mean <= args.max_tile_mean_error
-                      and seam_mean <= args.max_seam_mean_error,
+                      and seam_mean <= args.max_seam_mean_error
+                      and all(item["passed"] for item in tile_comparisons),
         }
-        for suffix, value in (("input", page), ("torch-full", reference), ("coreml-tiled", assembled)):
+        for suffix, value in (("input", page), ("torch-full", reference),
+                              ("torch-tiled", torch_assembled), ("coreml-tiled", assembled)):
             pixels = np.floor(value.transpose(1, 2, 0) * 255 + 0.5).astype(np.uint8)
             Image.fromarray(pixels, "RGB").save(fixtures / f"{name}-{suffix}.png")
         print(f"Tile fixture {name}: {results[name]}", flush=True)

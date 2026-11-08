@@ -651,8 +651,8 @@ enum ReaderImageDecoder {
             decoded = try await decode(data: data, url: url, targetPixelWidth: targetPixelWidth, enhancement: resolvedEnhancement, priority: decodePriority)
         } catch where error.isTaskCancellation {
             throw error
-        } catch ReaderImageSourceError.budgetExceeded {
-            throw ReaderImageSourceError.budgetExceeded
+        } catch ReaderImageDisplayError.budgetExceeded {
+            throw ReaderImageDisplayError.budgetExceeded
         } catch {
             ImageCacheService.removeCachedImageData(for: url)
             data = try await ImageCacheService.data(for: url, storesInCache: false)
@@ -704,18 +704,19 @@ enum ReaderImageDecoder {
                 targetPixelWidth: targetPixelWidth,
                 enhancement: enhancement
             )
-            // JM reordering needs the original bitmap. Bound that allocation too,
-            // rather than decoding an arbitrarily large page before downsampling.
-            if JmImageScrambler.requiresReordering(url: url),
-               (dimensions.pixels > ReaderImageSourceLoader.maximumPixels ||
-                max(dimensions.width, dimensions.height) > ReaderImageSourceLoader.maximumSide) {
-                throw ReaderImageSourceError.budgetExceeded
+            let decodedImage: PicaXPlatformImage?
+            if JmImageScrambler.requiresReordering(url: url) {
+                try ReaderImageDisplayBudget.validateJM(
+                    dimensions: dimensions, encodedByteCount: data.count, targetPixelWidth: decodeWidth
+                )
+                // Reorder directly into the display-sized raster. AI's stricter
+                // full-source budget must not reject otherwise readable pages.
+                decodedImage = try JmImageScrambler.displayImage(
+                    data: data, url: url, targetPixelWidth: decodeWidth
+                )
+            } else {
+                decodedImage = downsampledImage(data: data, targetPixelWidth: decodeWidth)
             }
-            let decodedImage = JmImageScrambler.decodedImage(
-                data: data,
-                url: url,
-                targetPixelWidth: decodeWidth
-            ) ?? downsampledImage(data: data, targetPixelWidth: decodeWidth)
 
             guard let decodedImage else {
                 throw URLError(.cannotDecodeContentData)
@@ -763,9 +764,14 @@ enum ReaderImageDecoder {
 
         let sourceWidth = CGFloat(dimensions.width)
         let sourceHeight = CGFloat(dimensions.height)
-        let outputWidth = min(CGFloat(targetPixelWidth), sourceWidth)
+        let outputWidth = CGFloat(ReaderImageDisplayBudget.pixelWidth(
+            dimensions: dimensions, targetPixelWidth: targetPixelWidth, enhancement: .off
+        ))
         let scale = outputWidth / sourceWidth
-        let maxPixelSize = min(max(Int((sourceHeight * scale).rounded(.up)), Int(outputWidth.rounded(.up)), 1), 8192)
+        let maxPixelSize = min(
+            max(Int((sourceHeight * scale).rounded(.up)), Int(outputWidth.rounded(.up)), 1),
+            ReaderImageDisplayBudget.maximumLongSide
+        )
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceShouldCacheImmediately: true,
@@ -797,7 +803,7 @@ enum ReaderImageDecoder {
     }
 
     private nonisolated static func cacheKey(url: URL, targetPixelWidth: Int?, enhancement: ReaderImageEnhancement) -> String {
-        "display-v2#\(url.absoluteString)#\(targetPixelWidth ?? 0)#\(enhancement.cacheKeyFragment)"
+        "display-v3#\(url.absoluteString)#\(targetPixelWidth ?? 0)#\(enhancement.cacheKeyFragment)"
     }
 }
 
@@ -844,6 +850,74 @@ enum JmImageScrambler {
             throw ReaderImageSourceError.cannotUnscramble
         }
         return reordered
+    }
+
+    /// Bounded ordinary-display path. The strict AI snapshot path above remains
+    /// original-size and independently budgeted. Do not silently show scrambled
+    /// content when an expected reorder fails.
+    nonisolated static func displayImage(data: Data, url: URL, targetPixelWidth: Int) throws -> PicaXPlatformImage {
+        try Task.checkCancellation()
+        guard let info = imageInfo(from: url),
+              let count = segmentCount(epsID: info.epsID, pictureName: info.pictureName), count > 1,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue else {
+            throw DecodingError.invalidImage
+        }
+        let depth = (properties[kCGImagePropertyDepth] as? NSNumber)?.intValue ?? 8
+        guard depth > 0, depth <= 16 else { throw ReaderImageDisplayError.budgetExceeded }
+        let outputWidth = min(targetPixelWidth, width)
+        try ReaderImageDisplayBudget.validateJM(
+            dimensions: ReaderImageDimensions(width: width, height: height),
+            encodedByteCount: data.count, targetPixelWidth: outputWidth
+        )
+        guard let image = CGImageSourceCreateImageAtIndex(source, 0, [
+            kCGImageSourceShouldCache: true, kCGImageSourceShouldCacheImmediately: true
+        ] as CFDictionary) else { throw DecodingError.invalidImage }
+        guard let result = reorderedDisplayImage(
+            cgImage: image, segmentCount: count, targetPixelWidth: outputWidth
+        ) else {
+            try Task.checkCancellation()
+            throw DecodingError.cannotReorder
+        }
+        return PicaXPlatformImage.picaxImage(cgImage: result)
+    }
+
+    nonisolated static func reorderedDisplayImage(
+        cgImage: CGImage, segmentCount: Int, targetPixelWidth: Int
+    ) -> CGImage? {
+        let width = cgImage.width
+        let height = cgImage.height
+        guard width > 0, height > 0, segmentCount > 0,
+              targetPixelWidth > 0, targetPixelWidth <= width else { return nil }
+        let blockHeight = height / segmentCount
+        let remainder = height % segmentCount
+        guard blockHeight > 0 else { return nil }
+        let outputHeight = max(1, Int(ceil(Double(height) * Double(targetPixelWidth) / Double(width))))
+        guard let context = CGContext(
+            data: nil, width: targetPixelWidth, height: outputHeight,
+            bitsPerComponent: 8, bytesPerRow: targetPixelWidth * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = targetPixelWidth == width ? .none : .high
+        let scale = Double(outputHeight) / Double(height)
+        var destinationY = 0
+        for index in stride(from: segmentCount - 1, through: 0, by: -1) {
+            guard !Task.isCancelled else { return nil }
+            let sourceY = index * blockHeight
+            let currentHeight = blockHeight + (index == segmentCount - 1 ? remainder : 0)
+            guard let segment = cgImage.cropping(to: CGRect(
+                x: 0, y: CGFloat(sourceY), width: CGFloat(width), height: CGFloat(currentHeight)
+            )) else { return nil }
+            context.draw(segment, in: CGRect(
+                x: 0, y: Double(destinationY) * scale,
+                width: Double(targetPixelWidth), height: Double(currentHeight) * scale
+            ))
+            destinationY += currentHeight
+        }
+        return context.makeImage()
     }
 
     nonisolated static func decodedImage(data: Data, url: URL, targetPixelWidth: Int?) -> PicaXPlatformImage? {

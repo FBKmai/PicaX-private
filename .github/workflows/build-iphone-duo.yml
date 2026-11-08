@@ -69,7 +69,9 @@ jobs:
       - name: Test super-resolution tooling contracts without weights
         shell: bash
         run: |
+          set -euo pipefail
           python -I -B BuildScripts/SuperResolution/test_convert.py
+          python -I -B BuildScripts/SuperResolution/test_fetch_checkpoint.py
           python -I -B BuildScripts/test-super-resolution-bundle.py
 
       - name: Run iPhone Duo tests and package unsigned IPA

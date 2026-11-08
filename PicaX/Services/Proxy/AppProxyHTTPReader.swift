@@ -12,6 +12,9 @@ nonisolated final class AppProxyHTTPChannelReader {
         while true {
             if let range = buffer.range(of: delimiter) {
                 let end = range.upperBound
+                guard end <= maximumLength else {
+                    throw AppProxyError.invalidHTTPResponse("响应头超过大小限制")
+                }
                 let result = Data(buffer[..<end])
                 buffer.removeSubrange(..<end)
                 return result
@@ -43,7 +46,7 @@ nonisolated final class AppProxyHTTPChannelReader {
         return result
     }
 
-    func readChunkedBody() throws -> Data {
+    func readChunkedBody(maximumLength: Int = 128 * 1_024 * 1_024) throws -> Data {
         var result = Data()
         while true {
             let sizeLineData = try readThrough(
@@ -80,7 +83,7 @@ nonisolated final class AppProxyHTTPChannelReader {
                     }
                 }
             }
-            guard result.count <= 128 * 1_024 * 1_024 - chunkSize else {
+            guard chunkSize <= maximumLength - result.count else {
                 throw AppProxyError.responseTooLarge
             }
             result.append(try readExactly(chunkSize))
@@ -93,6 +96,7 @@ nonisolated final class AppProxyHTTPChannelReader {
     }
 
     func readToEnd(maximumLength: Int) throws -> Data {
+        guard buffer.count <= maximumLength else { throw AppProxyError.responseTooLarge }
         var result = buffer
         buffer.removeAll(keepingCapacity: true)
         while true {

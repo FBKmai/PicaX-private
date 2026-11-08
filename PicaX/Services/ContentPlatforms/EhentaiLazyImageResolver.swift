@@ -4,6 +4,11 @@ import Foundation
 actor EhentaiLazyImageResolver {
     static let shared = EhentaiLazyImageResolver()
     nonisolated static let scheme = "picax-ehentai-image"
+    private let session: URLSession?
+
+    init(session: URLSession? = nil) {
+        self.session = session
+    }
 
     private var contexts: [String: Context] = [:]
     private var readerLinksByURL: [String: [String]] = [:]
@@ -46,11 +51,16 @@ actor EhentaiLazyImageResolver {
         return (1...pageCount).map { Self.lazyImageURLString(key: key, page: $0) }
     }
 
-    func data(for url: URL) async throws -> Data {
+    func data(for url: URL, maximumBytes: Int? = nil) async throws -> Data {
         guard let request = Self.lazyImageRequest(from: url),
-              let context = contexts[request.key] else {
+              var context = contexts[request.key] else {
             throw ComicContentError.invalidResponse("E-Hentai 图片上下文已失效，请重新进入章节。")
         }
+        // Copy the context: concurrent ordinary/bounded readers must not change
+        // each other's policy. Also bound metadata and retry requests, not just
+        // the final image body.
+        context.maximumBytes = maximumBytes
+        try Task.checkCancellation()
         let resolvedImage = try await resolveImage(page: request.page, context: context)
         return try await imageData(resolvedImage, context: context)
     }
@@ -93,6 +103,8 @@ actor EhentaiLazyImageResolver {
                     readerLink: readerLink,
                     context: context
                 )
+            } catch where error.isTaskCancellation || error is ImageCacheReadError {
+                throw error
             } catch {
                 image = try await htmlImage(
                     page: page,
@@ -122,6 +134,8 @@ actor EhentaiLazyImageResolver {
         while true {
             do {
                 return try await downloadImageData(imageURLString: image.imageURLString, referer: image.readerLink, context: context)
+            } catch where error.isTaskCancellation || error is ImageCacheReadError {
+                throw error
             } catch {
                 retryCount += 1
                 guard retryCount < 4, let nl = image.nl else {
@@ -352,7 +366,7 @@ actor EhentaiLazyImageResolver {
         headers(for: url, context: context, referer: referer, acceptsImage: true).forEach {
             request.setValue($0.value, forHTTPHeaderField: $0.key)
         }
-        let (data, response) = try await dataResponseWithRetry(for: request)
+        let (data, response) = try await dataResponseWithRetry(for: request, maximumBytes: context.maximumBytes)
         if let statusCode = response?.statusCode, !(200..<300).contains(statusCode) {
             throw ComicContentError.server("HTTP \(statusCode)")
         }
@@ -378,7 +392,7 @@ actor EhentaiLazyImageResolver {
         requestHeaders["Content-Type"] = "application/json"
         requestHeaders.forEach { request.setValue($0.value, forHTTPHeaderField: $0.key) }
 
-        let (data, response) = try await dataResponseWithRetry(for: request)
+        let (data, response) = try await dataResponseWithRetry(for: request, maximumBytes: context.maximumBytes)
         if let statusCode = response?.statusCode, !(200..<300).contains(statusCode) {
             throw ComicContentError.server("HTTP \(statusCode)")
         }
@@ -399,7 +413,7 @@ actor EhentaiLazyImageResolver {
         headers(for: url, context: context, referer: referer, acceptsImage: false).forEach {
             request.setValue($0.value, forHTTPHeaderField: $0.key)
         }
-        let (data, response) = try await dataResponseWithRetry(for: request)
+        let (data, response) = try await dataResponseWithRetry(for: request, maximumBytes: context.maximumBytes)
         if let statusCode = response?.statusCode, !(200..<300).contains(statusCode) {
             throw ComicContentError.server("HTTP \(statusCode)")
         }
@@ -412,13 +426,27 @@ actor EhentaiLazyImageResolver {
         return text
     }
 
-    private func dataResponseWithRetry(for request: URLRequest) async throws -> (Data, HTTPURLResponse?) {
+    private func dataResponseWithRetry(
+        for request: URLRequest, maximumBytes: Int? = nil
+    ) async throws -> (Data, HTTPURLResponse?) {
         var lastError: Error?
         let attempts = AppNetworkSettings.retryAttempts
 
         for attempt in 0..<attempts {
             do {
-                let (data, response) = try await AppProxyNetwork.shared.data(for: request)
+                let result: (Data, URLResponse)
+                if let session {
+                    if let maximumBytes {
+                        result = try await BoundedImageDataReader.network(
+                            request: request, session: session, maximumBytes: maximumBytes
+                        )
+                    } else {
+                        result = try await session.data(for: request)
+                    }
+                } else {
+                    result = try await AppProxyNetwork.shared.data(for: request, maximumBytes: maximumBytes)
+                }
+                let (data, response) = result
                 let httpResponse = response as? HTTPURLResponse
                 if let statusCode = httpResponse?.statusCode,
                    shouldRetry(statusCode: statusCode),
@@ -427,7 +455,7 @@ actor EhentaiLazyImageResolver {
                     continue
                 }
                 return (data, httpResponse)
-            } catch where error.isTaskCancellation {
+            } catch where error.isTaskCancellation || error is ImageCacheReadError {
                 throw error
             } catch {
                 lastError = error
@@ -540,6 +568,7 @@ actor EhentaiLazyImageResolver {
         let apiURLString: String
         let headers: [String: String]
         let prefersOriginalImage: Bool
+        var maximumBytes: Int? = nil
     }
 
     private struct LazyImageRequest {

@@ -6,7 +6,7 @@
 
 截至 2026-11-08，已通过 [Actions 工程构建 #6](https://github.com/FBKmai/PicaX-private/actions/runs/42445750760)：Xcode 27.1 / iOS 27.1 SDK，145 项 iOS 模拟器测试及 20 项 Python 工具测试通过。未签名 IPA 的提交为 `6c558161a66e7374c2e8f77d6aef92e1a19d804c`，SHA-256 为 `4a629cab5951693e89a4115551369749b3344b3767baff7488cf807f3c327cf9`；已独立核对 ZIP CRC、构建提交和 SDK。该包的资源审计仍为 `engineering-build-no-models`，不是 AI 可用版，安装前需要签名。
 
-本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成首轮真实权重加载、Core ML 转换和 macOS CPU 预测（下文记录通过与失败的候选）；**拼接和真机画质/耗时/内存验收仍未完成**。新增的手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 转换和 macOS CPU 预测；**两种 FP32 候选的多块整页比较均失败，真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -14,7 +14,7 @@
 - 彩色：[IllustrationJaNai V3detail 2× FDAT M unshuffle release 3.0.0](https://github.com/the-database/MangaJaNai/releases/tag/3.0.0)，tag 对应提交 [`d2f8f92dc75303c557ca2d7a507913eff512ff32`](https://github.com/the-database/MangaJaNai/tree/d2f8f92dc75303c557ca2d7a507913eff512ff32)。V3detail 保留纹理、**不清除**半色调噪声，某些图可能生成过多纹理；不能预断效果胜出。[Spandrel 0.4.2 的 FDAT 架构](https://github.com/chaiNNer-org/spandrel/blob/724cca389f28c38e1050689d4862a452fd644484/libs/spandrel/spandrel/architectures/FDAT/__init__.py)声明 `img_range=1` 并检测 unshuffle。
 - 配置参考及下表的**逐个权重文件** SHA-256 来自独立第三方转换器 [`known_models.yaml`，提交 `68e3f51517e04433164c09d8505a409e26477905`](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/known_models.yaml)，不是原作者签名的校验文件。对应的 [converter.py](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/converter.py)、[model_loader.py](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/model_loader.py)、[SPECS.md](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/SPECS.md) 和 [requirements-janai.txt](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/requirements-janai.txt) 给出架构/形状/精度。转换器代码许可证是 Apache-2.0，**不是模型权重许可证**；本项目脚本独立实现该路径，不运行下载的转换器。
 - Spandrel [v0.4.2 tag `724cca389f28c38e1050689d4862a452fd644484`](https://github.com/chaiNNer-org/spandrel/tree/724cca389f28c38e1050689d4862a452fd644484) 的 [`MAIN_REGISTRY`](https://github.com/chaiNNer-org/spandrel/blob/724cca389f28c38e1050689d4862a452fd644484/libs/spandrel/spandrel/__helpers/main_registry.py) 已注册 ESRGAN 和 FDAT，不需 `spandrel_extra_arches` 或 release 里的旧 FDAT 补丁。另已只读检查与依赖锁文件 SHA-256 一致的 PyPI 0.4.2 wheel，确认脚本使用的顶层导出及 `SizeRequirements.check(width, height)` 存在；未安装或执行该 wheel，这只是静态接口核对，不证明真实转换可运行。
-- `BuildScripts/SuperResolution/requirements-macos-arm64-py311.txt` 锁定 macOS arm64、CPython 3.11.9 的直接和传递 Python 依赖及 PyPI wheel SHA-256；核心版本为 PyTorch 2.6.0、torchvision 0.21.0、coremltools 8.3.0、Spandrel 0.4.2、NumPy 1.26.4、safetensors 0.4.5。为避免 PyTorch ≤2.5.1 的 weights-only RCE 漏洞 CVE-2025-32434，本锁定版本有意偏离上游推荐的 PyTorch 2.5.1/torchvision 0.20.1。coremltools 8.3 的已测试上限仅为 PyTorch 2.5.0，会对 2.6.0 发出版本警告；此组合的转换兼容性尚未验证，必须在 macOS 进行实测，若不兼容则阻塞而非退回有漏洞版本。此环境尚未在 macOS 安装/验证；换架构或版本需要单独锁定并重新验证。工具链及 macOS/Xcode 版本会影响产物，不承诺不同机器逐字节相同。
+- `BuildScripts/SuperResolution/requirements-macos-arm64-py311.txt` 锁定 macOS arm64、CPython 3.11.9 的直接和传递 Python 依赖及 PyPI wheel SHA-256；核心版本为 PyTorch 2.6.0、torchvision 0.21.0、coremltools 8.3.0、Spandrel 0.4.2、NumPy 1.26.4、safetensors 0.4.5。为避免 PyTorch ≤2.5.1 的 weights-only RCE 漏洞 CVE-2025-32434，本锁定版本有意偏离上游推荐的 PyTorch 2.5.1/torchvision 0.20.1。coremltools 8.3 的已测试上限仅为 PyTorch 2.5.0，会对 2.6.0 发出版本警告；此组合的转换兼容性尚未验证，必须在 macOS 进行实测，若不兼容则阻塞而非退回有漏洞版本。在 macOS 的首轮实测中，该固定组合已成功完成两种架构的加载、转换和 CPU 预测；版本警告仍需保留，不能推断其他模型/compute unit 兼容。换架构或版本需要单独锁定并重新验证。工具链及 macOS/Xcode 版本会影响产物，不承诺不同机器逐字节相同。
 
 | 模型文件名 | 第三方转换器公布的 checkpoint SHA-256 |
 |---|---|
@@ -41,7 +41,7 @@
 
 - 契约为固定 `MLMultiArray` 而不是图像特征：输入名 `input`、形状 `[1,3,128,128]`，输出名 `output`、形状 `[1,3,256,256]`，NCHW RGB、`float32` I/O、范围 `[0,1]`。脚本按上游包装 1 通道权重（RGB 求平均后复制至 3 通道），并在网络输出 clamp；具体检测到的通道/架构会记录在报告。透明度、方向和色域仍须应用独立处理和验证。
 - 上游候选配置均为 `input-size: 128`、`shrink-size: 20`。这里 descriptor 的 `overlap = 20` **表示每侧裁掉的输入像素数**；不是相邻 tile 的总重叠。有效核心为 `128 - 2*20 = 88` 输入像素，邻接 tile 的输入重叠为 `40`；输出每边裁 `20*2 = 40` 像素、有效核心 `176×176`。页的最外边界使用 reflect padding（不重复边界像素），然后对有效核心按 2× 拼接。尤其需要验证小于 padding、奇数尺寸、页角和 1 像素等边界输入，不能假定任意系统的 reflect API 都具备相同行为。
-- 这是上游候选配置，**不是已证实的无缝或真机画质结果**。模型尤其是注意力模型的整图结果可能与分块结果不同。需对非均匀合成页比较整图与多块拼接的接缝及非接缝误差，并检查实际漫画图像、页面边界和 device compute unit；尚未运行这些验证。
+- 这是上游候选配置，**不是已证实的无缝或真机画质结果**。模型尤其是注意力模型的整图结果可能与分块结果不同。2026-11-08 已完成合成页接缝/非接缝及极小页检查：单块小页通过，但两个 FP32 候选的多块页均失败（见下表），因此仍禁止批准或打包。真实漫画、色域/透明/方向及 device compute unit 验证仍待完成。
 - `precision` 是 Core ML **中间计算精度**，不是输入/输出数据类型。Manga ESRGAN 上游要求 FP32，中间 FP16 曾在孤立边缘像素出现大误差；脚本拒绝 Manga FP16。彩色 FDAT 2× 上游采用 FP16 中间计算，但仅可作为候选，需分别测 FP32/FP16。FP32 不保证 ANE，速度/内存/画质取决于实际设备。
 - 上游的 Spandrel 转换明确以 iOS 16 为最低目标。应用仍可保留 iOS 15.2 普通阅读，但 AI 的模型加载/推理必须限制 iOS 16+ 并在不满足时明确不可用。macOS CPU 数值预测不等于 iOS GPU/ANE 验证。
 
@@ -50,6 +50,15 @@
 首次数值运行 [42447624740](https://github.com/FBKmai/PicaX-private/actions/runs/42447624740) 已完成真实权重加载、转换及 macOS CPU 预测：Manga 1200p FP32 的三样本最大绝对误差最高为 `0.0003440976`；彩色 FDAT FP32 为 `0.00000292063`，均通过预设转换阈值。彩色 FDAT FP16 的噪声样本平均绝对误差为 `0.0023595911`，超过 `0.5/255 ≈ 0.0019607843`，因此该候选失败（整个工作流也如实失败），不修改阈值强行通过。候选包仍为 `validated: false`；首次运行未验证接缝。
 
 更新后的 `.github/workflows/validate-super-resolution.yml` 只对通过的 Manga 1200p FP32 和彩色 FDAT FP32 继续分块检查，不重新启用已拒绝的 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的私有 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
+
+第二轮真实分块运行 [42448585608](https://github.com/FBKmai/PicaX-private/actions/runs/42448585608) **失败**；小页、1×1、单行和单列均通过，但 216×344 多块合成页的结果如下（归一化 RGB 绝对误差）：
+
+| FP32 候选 | 整页最大误差（上限 0.05） | 整页平均（上限 0.005） | 接缝区平均（上限 0.0075） | 结果 |
+|---|---:|---:|---:|---|
+| Manga 1200p ESRGAN | 0.37331814 | 0.01057981 | 0.02652843 | 拒绝 |
+| Illustration V3detail FDAT | 0.16620493 | 0.00960159 | 0.00938205 | 拒绝 |
+
+不能由这些结果单独断言是 Core ML 转换错误或单一接缝实现错误。后续报告同时比较 **PyTorch 同窗口分块与整页**、**Core ML 分块与 PyTorch 同窗口分块**，分别定位有限上下文/窗口对齐和转换误差；保留两条基准及 PNG。不扩大上述门槛，也不因小页通过而批准整页模型。修复模型分块策略并重做相同门槛之后，才可进入许可/资源集成和真机验证。
 
 在观察结果前固定工程数值阈值：FP32 最大绝对误差 `2/255`、平均绝对误差 `0.1/255`；彩色 FP16 分别为 `8/255`、`0.5/255`。这是转换误差的有限上界（相对 `[0,1]` 张量），**不是实际画质验收**。每个梯度、边线、噪声样本必须单独满足，出现非有限值或结构错误仍直接失败。不得因为某次失败而事后扩大阈值宣称通过；可改用更高计算精度候选并保留两份报告。整页/分块和真机门槛独立保留。
 
@@ -115,6 +124,8 @@ MAX_HEIGHT=  # 操作者选择，不能为空
 - 阅读器 → 画质增强 → **原图对比 / 本页 AI 试处理**；不必先开启传统锐化。支持原图、传统滤镜和手动黑白/彩色 AI；双指缩放、单指移动、拖动分割线，两侧共用源坐标。`1:1 原图像素` 以屏幕物理像素对齐原图像素，右侧 AI 同位置对应 2× 输出。原图读取、输入和输出像素及实际模型/计算精度均明确展示。
 - 仅前台显式运行当前页，离开对比页或 App 进入非活跃状态时取消；Core ML 单块预测不能强制中断，会在当前块结束后检查取消。取消/失败/超限均不是 AI 成功，原图不覆盖，预设变更不复用旧结果。
 - 当前源图对比最多 1200 万像素、单边 16384、编码数据 64 MiB，并检查解码副本预算；AI 另有更保守的输出和图像工作预算，可能跳过仍可普通阅读的较大页面。推理单 worker，128 输入 tile / 每侧裁 20；输出为临时独立目录内无损 PNG，不进入原下载枚举、导出和备份，离开时清理。暂不承诺重启恢复。
+- 原图对比的 64 MiB 编码上限在本地/便携下载文件、磁盘缓存及 HTTP 流累积时执行；有界请求不与无上限或不同上限的请求合并。EH 的 HTML/API/图片/重试沿用同一上限并保留鉴权与 Referer，取消或超限不重试。代理不绕行直连：其 HTTP codec 在 Content-Length、chunked 和 EOF 路径先实施每次请求的 body 限额（内部限额头不发送到源站，重定向仍携带策略），上层再限制返回数据；不能只依赖 URLSession 在代理完整缓冲之后检查。超限不删除合法缓存/原文件，不当作损坏重新下载。该限额是返回编码数据的上界，不是整个进程/系统缓冲区的峰值内存保证。
+- 普通阅读采用独立的显示预算（最多约 2400 万 RGBA 像素、长边 65536），不因 AI 的源图上限而拒绝本可降采样显示的长页。JM 仍需解码原始位图来重排，先估算源解码和显示副本（256 MiB 工作预算），只生成显示尺寸的重排结果；极端页仍明确跳过，不回退显示乱序图片。此估算不替代 Instruments 实测。
 - 工程版不包含模型时，先验证源图链路、传统模式、可信对比、缺模型/取消等状态；这不代表已验证 AI 画质。保留 iOS 15.2 普通阅读，候选模型推理需要 iOS 16+。
 
 纯逻辑自检（无需 PyTorch/Core ML，不能代替上述门槛）：

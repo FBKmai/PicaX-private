@@ -70,8 +70,58 @@ final class ReaderImageSourceTests: XCTestCase {
             targetPixelWidth: 1200,
             enhancement: ReaderImageEnhancement(mode: .strong, strength: 0.5, scale: 2)
         )
-        XCTAssertLessThanOrEqual(width * 100, 8192)
+        XCTAssertLessThanOrEqual(width * 100, ReaderImageDisplayBudget.maximumLongSide)
+        XCTAssertLessThanOrEqual(Double(width * width * 100), ReaderImageDisplayBudget.maximumPixels)
+        // Ordinary reading must not inherit AI's 8192px display truncation.
+        XCTAssertGreaterThan(width * 100, 8192)
         XCTAssertGreaterThan(width, 0)
+    }
+
+    func testSourceLoadRejectsOversizeEncodingBeforeAttemptingDecode() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("oversize.bin")
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(ReaderImageSourceLoader.maximumEncodedBytes + 1))
+        try handle.close()
+        do {
+            _ = try await ReaderImageSourceLoader.load(url: url)
+            XCTFail("The source loader must enforce the limit on its read, not just on decode")
+        } catch ReaderImageSourceError.budgetExceeded {}
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        XCTAssertEqual((attributes[.size] as? NSNumber)?.intValue, ReaderImageSourceLoader.maximumEncodedBytes + 1)
+    }
+
+    func testJMDisplayBudgetIsIndependentOfStrictAISourceBudget() throws {
+        let size = ReaderImageDimensions(width: 2000, height: 10_000)
+        XCTAssertThrowsError(try ReaderImageSourceLoader.validate(dimensions: size))
+        XCTAssertNoThrow(try ReaderImageDisplayBudget.validateJM(
+            dimensions: size, encodedByteCount: 1_000_000, targetPixelWidth: 800
+        ))
+        XCTAssertThrowsError(try ReaderImageDisplayBudget.validateJM(
+            dimensions: ReaderImageDimensions(width: 6000, height: 10_000),
+            encodedByteCount: 1_000_000, targetPixelWidth: 800
+        ))
+    }
+
+    func testJMDisplayReorderMatchesOriginalIncludingRemainder() throws {
+        let context = context(width: 17, height: 103)
+        for row in 0..<103 {
+            context.setFillColor(red: CGFloat(row) / 103, green: CGFloat(row % 11) / 11, blue: 0.3, alpha: 1)
+            context.fill(CGRect(x: 0, y: CGFloat(row), width: 17, height: 1))
+        }
+        let data = try png(XCTUnwrap(context.makeImage()))
+        let url = try XCTUnwrap(URL(string: "https://example.invalid/photos/250000/00001.jpg"))
+        let expected = try XCTUnwrap(JmImageScrambler.sourceImage(data: data, url: url))
+        let actual = try XCTUnwrap(JmImageScrambler.displayImage(data: data, url: url, targetPixelWidth: 17).picaxCGImage)
+        XCTAssertEqual(actual.width, 17)
+        XCTAssertEqual(actual.height, 103)
+        XCTAssertEqual(rgba(actual), rgba(expected))
+        let smaller = try XCTUnwrap(JmImageScrambler.displayImage(data: data, url: url, targetPixelWidth: 8).picaxCGImage)
+        XCTAssertEqual(smaller.width, 8)
+        XCTAssertEqual(smaller.height, 49)
     }
 
     func testEXIFOrientationNormalizesDimensionsAndImage() throws {

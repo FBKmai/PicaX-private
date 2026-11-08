@@ -2,6 +2,20 @@ import CryptoKit
 import Foundation
 import ImageIO
 
+nonisolated enum ImageCacheReadError: LocalizedError, Equatable {
+    case invalidMaximumBytes
+    case sizeLimitExceeded
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidMaximumBytes:
+            "图片读取上限不能为负数。"
+        case .sizeLimitExceeded:
+            "图片编码数据超过读取上限。"
+        }
+    }
+}
+
 struct ImageCacheUsage: Equatable, Sendable {
     let memoryBytes: Int
     let diskBytes: Int
@@ -76,25 +90,52 @@ enum ImageCacheService {
         return formatter.string(fromByteCount: bytes)
     }
 
-    nonisolated static func data(for url: URL, storesInCache: Bool = true) async throws -> Data {
+    nonisolated static func data(
+        for url: URL,
+        storesInCache: Bool = true,
+        maximumBytes: Int? = nil
+    ) async throws -> Data {
+        if let maximumBytes {
+            guard maximumBytes >= 0 else { throw ImageCacheReadError.invalidMaximumBytes }
+            try Task.checkCancellation()
+        }
         if let fileURL = url.picaxLocalFileURL {
+            if let maximumBytes {
+                return try await boundedLocalFileData(for: fileURL, maximumBytes: maximumBytes)
+            }
             return try await localFileData(for: fileURL)
         }
-        let key = "\(url.absoluteString)#cache=\(storesInCache)"
+        // A bounded waiter must never join an unbounded request, or one with
+        // a different limit: the shared operation itself has to honor its limit.
+        let key = requestCoalescingKey(for: url, storesInCache: storesInCache, maximumBytes: maximumBytes)
         return try await requestCoalescer.value(for: key) {
-            try await loadRemoteData(for: url, storesInCache: storesInCache)
+            try await loadRemoteData(for: url, storesInCache: storesInCache, maximumBytes: maximumBytes)
         }
+    }
+
+    nonisolated static func requestCoalescingKey(for url: URL, storesInCache: Bool, maximumBytes: Int?) -> String {
+        let address = url.absoluteString
+        let limitKey = maximumBytes.map { String($0) } ?? "unbounded"
+        return "\(address.utf8.count):\(address)#cache=\(storesInCache)#maximumBytes=\(limitKey)"
     }
 
     private nonisolated static func loadRemoteData(
         for url: URL,
-        storesInCache: Bool
+        storesInCache: Bool,
+        maximumBytes: Int?
     ) async throws -> Data {
-        if EhentaiLazyImageResolver.isLazyImageURL(url) {
-            if storesInCache, let cachedData = await cachedImageData(for: url) {
+        if storesInCache {
+            if let maximumBytes {
+                if let cachedData = try await boundedCachedImageData(for: url, maximumBytes: maximumBytes) {
+                    return cachedData
+                }
+            } else if let cachedData = await cachedImageData(for: url) {
                 return cachedData
             }
-            let data = try await EhentaiLazyImageResolver.shared.data(for: url)
+        }
+
+        if EhentaiLazyImageResolver.isLazyImageURL(url) {
+            let data = try await EhentaiLazyImageResolver.shared.data(for: url, maximumBytes: maximumBytes)
             guard isDecodableImageData(data) else {
                 throw URLError(.cannotDecodeContentData)
             }
@@ -108,11 +149,14 @@ enum ImageCacheService {
             throw URLError(.unsupportedURL)
         }
 
-        if storesInCache, let cachedData = await cachedImageData(for: url) {
-            return cachedData
+        let result: (Data, URLResponse)
+        if let maximumBytes {
+            result = try await boundedUncachedData(for: url, maximumBytes: maximumBytes)
+        } else {
+            result = try await uncachedData(for: url)
         }
-
-        let (data, response) = try await uncachedData(for: url)
+        let (data, response) = result
+        if maximumBytes != nil { try Task.checkCancellation() }
         if let httpResponse = response as? HTTPURLResponse,
            !(200...299).contains(httpResponse.statusCode) {
             throw URLError(.badServerResponse)
@@ -120,9 +164,11 @@ enum ImageCacheService {
         guard isDecodableImageData(data) else {
             throw URLError(.cannotDecodeContentData)
         }
+        if maximumBytes != nil { try Task.checkCancellation() }
         if storesInCache {
             await storeImageData(data, for: url)
         }
+        if maximumBytes != nil { try Task.checkCancellation() }
         return data
     }
 
@@ -169,16 +215,51 @@ enum ImageCacheService {
         }
     }
 
+    private nonisolated static func boundedUncachedData(
+        for url: URL,
+        maximumBytes: Int
+    ) async throws -> (Data, URLResponse) {
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        return try await AppProxyNetwork.shared.data(for: request, purpose: .image, maximumBytes: maximumBytes)
+    }
+
     private nonisolated static func localFileData(for fileURL: URL) async throws -> Data {
         try await Task.detached(priority: .utility) {
             try Data(contentsOf: fileURL)
         }.value
     }
 
+    private nonisolated static func boundedLocalFileData(for fileURL: URL, maximumBytes: Int) async throws -> Data {
+        let task = Task.detached(priority: .utility) {
+            try BoundedImageDataReader.file(at: fileURL, maximumBytes: maximumBytes)
+        }
+        return try await withTaskCancellationHandler {
+            let data = try await task.value
+            try Task.checkCancellation()
+            return data
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
     private nonisolated static func cachedImageData(for url: URL) async -> Data? {
         await Task.detached(priority: .utility) {
             diskCachedImageData(for: url)
         }.value
+    }
+
+    private nonisolated static func boundedCachedImageData(for url: URL, maximumBytes: Int) async throws -> Data? {
+        let task = Task.detached(priority: .utility) {
+            try diskBoundedCachedImageData(for: url, maximumBytes: maximumBytes)
+        }
+        return try await withTaskCancellationHandler {
+            let data = try await task.value
+            try Task.checkCancellation()
+            return data
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     private nonisolated static func storeImageData(_ data: Data, for url: URL) async {
@@ -204,6 +285,39 @@ enum ImageCacheService {
             return nil
         }
 
+        touchCacheFileLocked(fileURL)
+        return data
+    }
+
+    private nonisolated static func diskBoundedCachedImageData(for url: URL, maximumBytes: Int) throws -> Data? {
+        guard url.picaxLocalFileURL == nil, url.picaxSupportsURLCache else { return nil }
+        let fileURL = cacheFileURL(for: url)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+
+        let data: Data
+        do {
+            data = try BoundedImageDataReader.file(at: fileURL, maximumBytes: maximumBytes)
+        } catch ImageCacheReadError.sizeLimitExceeded {
+            // A valid large cache entry is not corrupt, and retrying the network
+            // would not make this particular bounded read safe.
+            throw ImageCacheReadError.sizeLimitExceeded
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            try Task.checkCancellation()
+            withDiskCacheLock {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            return nil
+        }
+        try Task.checkCancellation()
+        guard isDecodableImageData(data) else {
+            try Task.checkCancellation()
+            withDiskCacheLock {
+                try? FileManager.default.removeItem(at: fileURL)
+            }
+            return nil
+        }
         touchCacheFileLocked(fileURL)
         return data
     }
@@ -301,5 +415,77 @@ enum ImageCacheService {
         let url: URL
         let byteCount: Int64
         let modificationDate: Date
+    }
+}
+
+/// Only the returned Data is accumulated; neither a file's size nor an HTTP
+/// Content-Length is trusted. The next byte beyond the limit is a sentinel and
+/// is never appended to the result.
+nonisolated enum BoundedImageDataReader {
+    private static let chunkSize = 16 * 1024
+
+    static func file(at url: URL, maximumBytes: Int) throws -> Data {
+        guard maximumBytes >= 0 else { throw ImageCacheReadError.invalidMaximumBytes }
+        try Task.checkCancellation()
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var result = Data()
+        var remaining = maximumBytes
+        while true {
+            try Task.checkCancellation()
+            // When close to the limit, read at most one byte beyond it so an
+            // exactly-sized file still succeeds and a growing file cannot race
+            // a preliminary metadata check.
+            let count = remaining >= chunkSize ? chunkSize : remaining + 1
+            let chunk = try handle.read(upToCount: count) ?? Data()
+            guard !chunk.isEmpty else { return result }
+            guard chunk.count <= remaining else { throw ImageCacheReadError.sizeLimitExceeded }
+            result.append(chunk)
+            remaining -= chunk.count
+        }
+    }
+
+    static func network(
+        request: URLRequest,
+        session: URLSession,
+        maximumBytes: Int
+    ) async throws -> (Data, URLResponse) {
+        guard maximumBytes >= 0 else { throw ImageCacheReadError.invalidMaximumBytes }
+        do {
+            try Task.checkCancellation()
+            let (bytes, response) = try await session.bytes(for: request)
+            let task = bytes.task
+            defer { task.cancel() }
+            return try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                // A failed HTTP response is handled by the caller; there is no
+                // reason to collect its (potentially unbounded) error body.
+                if let response = response as? HTTPURLResponse,
+                   !(200...299).contains(response.statusCode) {
+                    return (Data(), response)
+                }
+                var result = Data()
+                var buffer = [UInt8]()
+                buffer.reserveCapacity(min(chunkSize, maximumBytes))
+                var remaining = maximumBytes
+                for try await byte in bytes {
+                    guard remaining > 0 else { throw ImageCacheReadError.sizeLimitExceeded }
+                    buffer.append(byte)
+                    remaining -= 1
+                    if buffer.count == chunkSize {
+                        try Task.checkCancellation()
+                        result.append(contentsOf: buffer)
+                        buffer.removeAll(keepingCapacity: true)
+                    }
+                }
+                try Task.checkCancellation()
+                result.append(contentsOf: buffer)
+                return (result, response)
+            } onCancel: {
+                task.cancel()
+            }
+        } catch where error.isTaskCancellation || Task.isCancelled {
+            throw CancellationError()
+        }
     }
 }

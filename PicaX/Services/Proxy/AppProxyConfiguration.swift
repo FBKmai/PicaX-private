@@ -204,10 +204,17 @@ nonisolated enum AppProxyError: LocalizedError {
 
 nonisolated struct AppProxyTransportError: LocalizedError, CustomNSError {
     static let errorDomain = "work.picax.app-proxy"
+    static let responseTooLargeCode = 2
 
     let message: String
+    let errorCode: Int
 
     init(_ error: Error) {
+        if case AppProxyError.responseTooLarge = error {
+            errorCode = Self.responseTooLargeCode
+        } else {
+            errorCode = 1
+        }
         if let description = (error as? LocalizedError)?.errorDescription,
            !description.isEmpty {
             message = description
@@ -217,7 +224,6 @@ nonisolated struct AppProxyTransportError: LocalizedError, CustomNSError {
     }
 
     var errorDescription: String? { message }
-    var errorCode: Int { 1 }
     var errorUserInfo: [String: Any] {
         [NSLocalizedDescriptionKey: message]
     }
