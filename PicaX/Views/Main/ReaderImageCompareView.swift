@@ -163,9 +163,11 @@ struct ReaderImageCompareView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = ReaderImageCompareModel()
     @State private var mode: ReaderComparisonMode = .ai
-    @State private var preset: SuperResolutionPreset = .manga
+    @State private var preset: SuperResolutionPreset = .color
     @State private var inferenceMode: SuperResolutionInferenceMode = .automatic
-    @State private var computeUnit: SuperResolutionComputeUnit = .all
+    // The user's iPhone Duo produced visual artifacts with CPU+GPU. CPU-only
+    // is the only path observed to work, so it is the safe default.
+    @State private var computeUnit: SuperResolutionComputeUnit = .cpuOnly
     @State private var showsOriginal = false
 
     var body: some View {
@@ -252,6 +254,11 @@ struct ReaderImageCompareView: View {
                     }
                     .pickerStyle(.menu)
                     .disabled(model.isProcessing)
+                }
+                if computeUnit != .cpuOnly {
+                    Text("你在 iPhone Duo 上实测 CPU+GPU/全部会出现画面异常；仅 CPU 是已确认可用的路径，切换到其他计算单元请自行核对输出。")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
                 }
                 HStack {
                     Picker("推理模式", selection: $inferenceMode) {

@@ -186,7 +186,9 @@ nonisolated final class SuperResolutionService: @unchecked Sendable {
         source: ReaderImageSource,
         preset: SuperResolutionPreset,
         mode: SuperResolutionInferenceMode = .automatic,
-        computeUnit: SuperResolutionComputeUnit = .all,
+        // iPhone Duo produced artifacts with CPU+GPU; callers must opt in to
+        // anything except the validated CPU-only path.
+        computeUnit: SuperResolutionComputeUnit = .cpuOnly,
         onProgress: @escaping @Sendable (Double) -> Void
     ) async throws -> SuperResolutionResult {
         let token = SuperResolutionCancellation(job: SuperResolutionJob(
@@ -901,7 +903,7 @@ nonisolated struct SuperResolutionJob: @unchecked Sendable {
         source: ReaderImageSource,
         preset: SuperResolutionPreset,
         mode: SuperResolutionInferenceMode = .automatic,
-        computeUnit: SuperResolutionComputeUnit = .all,
+        computeUnit: SuperResolutionComputeUnit = .cpuOnly,
         onProgress: @escaping @Sendable (Double) -> Void
     ) {
         self.source = source

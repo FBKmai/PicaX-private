@@ -11,7 +11,9 @@ struct ReaderImageCompareRequest: Identifiable {
 struct ReaderImageEnhancementPanel: View {
     let targetPixelWidth: Int?
     let canCompare: Bool
+    let canBatchRender: Bool
     let onCompare: () -> Void
+    let onBatchRender: () -> Void
     let onClose: () -> Void
 
     @AppStorage(ReaderSettingsKey.imageEnhancementMode) private var enhancementMode = ImageEnhancementMode.off.rawValue
@@ -82,7 +84,14 @@ struct ReaderImageEnhancementPanel: View {
             .buttonStyle(.borderedProminent)
             .disabled(!canCompare)
 
-            Text("传统模式不是 AI。AI 需在对比页手动选择黑白或彩色模型并开始，不随翻页自动运行，也不叠加这里的锐化。")
+            Button(action: onBatchRender) {
+                Label("整本 2× 批量渲染（仅 CPU）", systemImage: "square.stack.3d.down.right")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .disabled(!canBatchRender)
+
+            Text("传统模式不是 AI。AI 需在对比页手动选择黑白或彩色模型并开始，不随翻页自动运行，也不叠加这里的锐化。整本批量会逐页串行处理、保持前台，结果写入文件 App，不覆盖下载原图；CPU+GPU 在你设备上实测有画面异常，批量固定仅 CPU。")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.65))
         }

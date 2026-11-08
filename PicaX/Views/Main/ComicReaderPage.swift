@@ -113,6 +113,9 @@ struct ComicReaderPage: View {
     @State private var showsBurnAfterReadingConfirmation = false
     @State private var showsImageEnhancementPanel = false
     @State private var imageCompareRequest: ReaderImageCompareRequest?
+#if os(iOS)
+    @State private var batchRenderRequest: ReaderBatchRenderRequest?
+#endif
     @State private var readingDurationSessionStart: Date?
     @State private var didShowInitialToast = false
     @Namespace private var navigationTransitionNamespace
@@ -226,6 +229,13 @@ struct ComicReaderPage: View {
             .readerImageComparePresentation(request: $imageCompareRequest) { width in
                 readerTargetPixelWidth(for: width)
             }
+#if os(iOS)
+            .fullScreenCover(item: $batchRenderRequest) { request in
+                ReaderBatchRenderView(request: request) {
+                    batchRenderRequest = nil
+                }
+            }
+#endif
             .alert("开启“阅后即焚”？", isPresented: $showsBurnAfterReadingConfirmation) {
                 Button("开启", role: .destructive) {
                     deletesLocalDownloadOnExit?.wrappedValue = true
@@ -328,7 +338,9 @@ struct ComicReaderPage: View {
                         ReaderImageEnhancementPanel(
                             targetPixelWidth: readerTargetPixelWidth(for: geometry.size.width),
                             canCompare: canCompareCurrentImage,
+                            canBatchRender: canBatchRenderWholeBook,
                             onCompare: presentImageComparison,
+                            onBatchRender: presentBatchRender,
                             onClose: {
                                 withAnimation(.easeInOut(duration: 0.18)) {
                                     showsImageEnhancementPanel = false
@@ -2167,6 +2179,39 @@ struct ComicReaderPage: View {
             return false
         }
         return true
+    }
+
+    private var canBatchRenderWholeBook: Bool {
+#if os(iOS)
+        canCompareCurrentImage && !detail.chapters.isEmpty
+#else
+        false
+#endif
+    }
+
+    private func presentBatchRender() {
+#if os(iOS)
+        guard !usesWholeBookContinuousReading else {
+            showReaderToast("整卷连续阅读暂不支持整本批量渲染")
+            return
+        }
+        guard canBatchRenderWholeBook else {
+            showReaderToast("图片尚未加载完成")
+            return
+        }
+        let account = platformAccounts.account(for: detail.item.platform)
+        let readerModel = viewModel
+        showsImageEnhancementPanel = false
+        batchRenderRequest = ReaderBatchRenderRequest(
+            bookID: detail.item.readingHistoryID,
+            bookTitle: detail.item.title,
+            chapters: detail.chapters,
+            initialChapterIndex: readerModel.currentChapterIndex,
+            loadChapterImages: { index in
+                try await readerModel.chapterImages(index: index, account: account)
+            }
+        )
+#endif
     }
 
     private func presentImageComparison() {

@@ -47,6 +47,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>NSFaceIDUsageDescription</key>
 	<string>使用 Face ID 验证身份以解锁 PicaX 并保护漫画内容。</string>
 	<key>NSSupportsLiveActivities</key>
