@@ -26,7 +26,11 @@ final class AutoSuperResolutionBackgroundCoordinator {
         ) { task in
             let box = AutoSuperResolutionSendableBox(value: task)
             Task { @MainActor in
-                Self.shared.handle(box.value)
+                guard let processingTask = box.value as? BGProcessingTask else {
+                    box.value.setTaskCompleted(success: false)
+                    return
+                }
+                Self.shared.handle(processingTask)
             }
         }
     }
