@@ -58,11 +58,88 @@
 | Manga 1200p ESRGAN | 0.37331814 | 0.01057981 | 0.02652843 | 拒绝 |
 | Illustration V3detail FDAT | 0.16620493 | 0.00960159 | 0.00938205 | 拒绝 |
 
-不能由这些结果单独断言是 Core ML 转换错误或单一接缝实现错误。后续报告同时比较 **PyTorch 同窗口分块与整页**、**Core ML 分块与 PyTorch 同窗口分块**，分别定位有限上下文/窗口对齐和转换误差；保留两条基准及 PNG。不扩大上述门槛，也不因小页通过而批准整页模型。修复模型分块策略并重做相同门槛之后，才可进入许可/资源集成和真机验证。
+不能由第二轮结果单独断言是 Core ML 转换错误或单一接缝实现错误。第三轮同窗口诊断 [42453781175](https://github.com/FBKmai/PicaX-private/actions/runs/42453781175) 已完成：12 个相同窗口的 Core ML/PyTorch 最大差异分别为黑白 `0.0000127554`、彩色 `0.0000012815`，均通过转换门槛；**PyTorch 自身分块相对整页的误差几乎与 Core ML 相同**（黑白最大 `0.37331855`、接缝平均 `0.02652844`；彩色最大 `0.16620499`、接缝平均 `0.00938206`）。因此这些合成样本中的主要偏差来自当前 128/20 分块上下文/窗口策略，而非 Core ML 数值转换；这不是所有输入或 compute unit 的全面结论。
+
+后续报告保留 **PyTorch 同窗口分块与整页**、**Core ML 分块与 PyTorch 同窗口分块** 两条基准及 PNG。不扩大上述门槛，也不因小页通过而批准整页模型。修复模型分块策略并重做相同门槛之后，才可进入许可/资源集成和真机验证。
 
 在观察结果前固定工程数值阈值：FP32 最大绝对误差 `2/255`、平均绝对误差 `0.1/255`；彩色 FP16 分别为 `8/255`、`0.5/255`。这是转换误差的有限上界（相对 `[0,1]` 张量），**不是实际画质验收**。每个梯度、边线、噪声样本必须单独满足，出现非有限值或结构错误仍直接失败。不得因为某次失败而事后扩大阈值宣称通过；可改用更高计算精度候选并保留两份报告。整页/分块和真机门槛独立保留。
 
 分块测试在观察结果前另定有限上界：整页最大绝对误差 `0.05`、平均 `0.005`，每个内接缝两侧共 4 个输出像素宽区域的平均误差 `0.0075`。用合成的非均匀多块页（216×344）、奇数小页、1×1、单行及单列，比较带 reflect 外延的 PyTorch 整页与真实 Core ML 128 tile / 每侧裁 20 的拼接结果；逐个记录接缝/非接缝误差，保留输入、整页基准和拼接 PNG。这个门槛意在发现实现错误或显著上下文差异，不代表肉眼无缝或漫画画质已验收；未通过仍不得启用。
+
+## 整页（Full Page）单次推理路径
+
+第三轮诊断表明，当前 128/20 分块相对整页的偏差主要来自有限上下文，而不是 Core ML 转换数值。因此新增独立的整页路径：对**原始整页**只调用一次 `MLModel.prediction`，不切块、不拼接，输出裁剪为原页的精确 2×。它只使用上文锁定的两个真实模型（MangaJaNai V1 ESRGAN / IllustrationJaNai V3detail FDAT），不使用传统锐化替代；原分块路径、测试和历史均保留，二者绝不互相冒充。
+
+- **模型契约**：输入名 `input`、NCHW RGB、`float32`、范围 `[0,1]`，形状 `[1,3,H,W]`；输出名 `output`、`float32`，形状 `[1,3,2H,2W]`。H/W 为动态轴，但受模型转换时声明的 shape 约束限制。
+- **补齐方式**：只在右侧和底部做与分块路径同语义的 reflect padding（周期 `(len-1)*2`，不重复边缘像素），对齐到 16 像素、最小边长 64、最大边长 2048、最多 2,000,000 输入像素。例如 1000×1500 → 1008×1504，999×1501 → 1008×1504；推理后只保留原页 2× 区域，输出严格为 2000×3000 / 1998×3002。补齐到对齐边界不等于改变页面尺寸，也不会把填充像素写入结果。
+- **一次调用**：应用创建一个 `[1,3,H_pad,W_pad]` 的 `MLMultiArray`，填满后再调用一次 `prediction`。输出按 `MLMultiArray` 实际 strides 读取，先检查整个补齐画布的有限性，再裁剪到原页 2×；不会以 tile 结果拼接冒充整页。取消只在 Core ML 调用返回后检查，未完成/已取消的任务不会写 PNG 或报告成功。
+- **资源与输出**：整页路径串行执行，同一时刻不运行多个整页。无损 PNG 写在应用自建的临时试处理目录，不覆盖下载原图；结果 PNG 与估算内存会随对比结果显示。该估算不是 Instruments 峰值。
+
+### descriptor 扩展（向后兼容）
+
+分块专用旧 descriptor 没有 `fullPage` 字段，解码为 `nil`，行为不变。整页 descriptor 增加可选的 `fullPage` 对象，例如：
+
+```json
+"fullPage": {
+  "validated": false,
+  "shapeMode": "range",
+  "alignment": 16,
+  "minimumWidth": 64,
+  "minimumHeight": 64,
+  "maximumWidth": 2048,
+  "maximumHeight": 2048,
+  "maximumPixels": 2000000,
+  "estimatedWorkingBytesPerPixel": 2048
+}
+```
+
+`shapeMode` 为 `range` 时仅接受声明的动态范围；为 `enumerated` 时必须同时提供对齐、去重且落在上下限内的 `enumeratedSizes`（每个 `[width,height]`），应用选择能覆盖原页的最小面积形状。`estimatedWorkingBytesPerPixel` 是保守规划系数（黑白 2048、彩色 1024），不是实测值。`validated` 只有在数值、尺寸和真机等人工门槛完成后才可由人修改；转换脚本始终写 `false`，不会因数值通过自动批准。
+
+`fullPage` 存在但 `validated=false` 时，显式“整页”模式明确失败，不偷偷改走分块；“自动”模式可使用分块，但结果和日志必须显示实际模式及回退原因。整页尺寸超出声明范围、enumerated 列表无覆盖形状、或预算超限时，同样明确报错/回退，不伪造成功。
+
+### 转换与隔离验证
+
+整页转换由 `convert.py --full-page` 执行：`torch.export` 使用动态空间轴（ESRGAN 的派生维度为 2×，FDAT 对齐要求为 16×），优先导出 `RangeDim` flexible ML Program；若 flexible 转换失败，则记录原始错误并在固定对齐尺寸集合上改用 `EnumeratedShapes` fallback。转换前先在 128×192、256×384 和示例尺寸比较 exported program 与 eager 输出，再做一次 256×384 的 CPU_ONLY Core ML 与 PyTorch 整页比较（应用同款右侧/底部补齐与裁剪）。该比较使用预先固定的 FP32 阈值：最大绝对误差 `2/255 ≈ 0.00784313725490196`、平均绝对误差 `0.1/255 ≈ 0.000392156862745098`；**不得事后放宽**。非有限值、形状/类型错误或超出阈值都使转换失败，不生成可打包的“通过”结果。
+
+单次 256×384 冒烟不等于整页验证。独立命令按以下尺寸逐个运行：256×384、512×768、768×1152、1000×1500、999×1501。每个尺寸先生成 PyTorch eager 整页参考；每个 Core ML 预测在**独立子进程**中执行，带墙钟超时和地址空间上限（默认 1500 s / 12 GiB；0 表示不设限），记录加载/预测耗时、进程峰值 RSS、最大/平均/P99 误差、形状/类型/有限性和失败原因。一个进程 OOM 或超时不会终止其他尺寸或 compute unit 的实验。CPU_ONLY 是每个尺寸的必需数值门槛；`.all`/`.cpuAndGPU` 只在 256×384 与 1000×1500 追加采样，用于记录实际设备/后端表现。报告、输入和两侧 PNG 保留为 Actions 证据；`cpuOnly` 失败即工作流失败，GPU/ANE 的差异也不会被隐藏。
+
+手动运行示例（在 macOS、已按锁定文件安装依赖并取得已核验权重后；输出目录必须已存在且为空）：
+
+```sh
+python -I BuildScripts/SuperResolution/convert.py \
+  --model manga --manga-height 1200 --minimum-page-height 1200 --maximum-page-height 1200 \
+  --weight /absolute/path/2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth \
+  --expected-sha256 43b784f674bdbf89886a62a64cd5f8d8df92caf4d861bdf4d47dad249ede0267 \
+  --precision float32 --output-dir /absolute/empty/output \
+  --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098 \
+  --full-page --full-page-alignment 16 --full-page-max-side 2048 \
+  --full-page-max-pixels 2000000 --full-page-timeout 1500 --full-page-memory-mb 12288
+
+python -B BuildScripts/SuperResolution/validate_full_page.py validate \
+  --model manga \
+  --weight /absolute/path/2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth \
+  --expected-sha256 43b784f674bdbf89886a62a64cd5f8d8df92caf4d861bdf4d47dad249ede0267 \
+  --package /absolute/empty/output/MangaJaNai_V1_1200p_2x_float32.mlpackage \
+  --resource-name MangaJaNai_V1_1200p_2x_float32 \
+  --output-dir /absolute/empty/output \
+  --size 256x384 --size 512x768 --size 768x1152 --size 1000x1500 --size 999x1501 \
+  --alignment 16 --max-side 2048 --max-pixels 2000000 \
+  --timeout 1500 --memory-mb 12288 --units cpuOnly,cpuAndGPU,all \
+  --all-units-at 256x384 --all-units-at 1000x1500 \
+  --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098
+```
+
+`.github/workflows/validate-super-resolution-full-page.yml` 在 `iphone-duo-ios27` 分支相关文件推送或手动触发时，对黑白和彩色两个模型分别执行上述转换/隔离验证，并上传未批准的 `.mlpackage`、JSON 报告及 PNG。它只提供 macOS arm64 的工程证据，**不是 iPhone Duo 验收，也不是画质验收**。
+
+### 应用内模式、预算和计算单元
+
+- 对比页新增“整页（单次推理）/ 分块（128）/ 自动（整页优先）”选择，以及“全部（系统选择）/ CPU + GPU / 仅 CPU”计算单元选择。结果显示请求模式、实际模式、实际模型/版本/精度、输入/输出尺寸、补齐后的输入、耗时和回退原因；不能把分块结果标成整页。
+- 整页规划预算单独计算：`sourceRaster = max(bytesPerRow × height, pagePixels × 4)`；`inputBytes = alignedPixels × 12`（3 × FP32）；`workingBytes = alignedPixels × estimatedWorkingBytesPerPixel`；`outputBytes = pagePixels × 16`（2× RGBA）；`estimate = sourceRaster + inputBytes + workingBytes + outputBytes × 4 + 64 MiB + 128 MiB`。估算超过 4 GiB 或物理内存的一半即拒绝；临时存储另要求 `outputBytes × 2 + 32 MiB`。这些是保守规划值，不是实测峰值，也不包括所有 Core ML/系统分配。
+- `.all` 只表示交给系统选择，**不保证使用 Neural Engine**。必须如实记录 `cpuAndGPU`/`.all` 的失败、回退、耗时和峰值；CPU_ONLY 才是指定数值门槛。macOS CI 成功不能推断 iPhone Duo 的成功。
+
+### 尚未完成的验收
+
+本轮实现尚未在 iPhone Duo 真机上运行。仍需在目标设备上测量实际峰值内存、各 compute unit 的耗时/稳定性、OOM 行为，并用有代表性的黑白文字、网点、彩色纹理页面做视觉对比；长条、极端比例、奇数尺寸和极小页仍需逐项确认。未获得这些证据前，不得宣称“真机整页可用”或“画质已通过”。
 
 ## 在 macOS 暂存转换
 
@@ -113,7 +190,7 @@ MAX_HEIGHT=  # 操作者选择，不能为空
 
 1. 审核每个实际 checkpoint 的许可及来源；解决 V1 的 SA/非 SA 冲突，确认目标分发/授权，保留完整归属和变更说明。核实及记录每个权重 hash；Manga 相关的所有许可未确认前禁止打包。
 2. 在固定 macOS 工具链实际转换并核对报告：所有 eager/trace 与 CPU Core ML 比较通过预先选择的阈值；包的 hash 与报告对应。各档 range 正确、互不重叠，只有样本所需档位；在没有匹配/经过批准的范围时跳过，不从未安装的档位推断已安装模型。FP16/FP32 彩色候选应分目录比较，最终 bundle 只放一个经批准的彩色 descriptor，避免候选歧义。
-3. 完成非均匀合成整页与分块的误差/接缝比较、边角/奇数页/小页测试，以及 RGB/灰度/透明/方向/色域测试。不能仅凭 CPU 数值或输出尺寸宣称真机画质通过。
+3. 完成非均匀合成整页与分块的误差/接缝比较、边角/奇数页/小页测试，以及 RGB/灰度/透明/方向/色域测试。整页路径还需在要求的每个尺寸上用 CPU_ONLY 与同一补齐输入的 PyTorch 整页结果比较，并在追加样本上记录 GPU/`.all` 的真实行为；不能仅凭 CPU 数值或输出尺寸宣称真机画质通过。
 4. 只有完成上述许可与工程核验并经人工审核、保留证据后，才能人工更新 descriptor 的确切许可和 `validated`，将模型和对应 `*.superresolution.json` 作为应用资源加入 Xcode，用于后续真机试处理。`validated` 仅声明工程和许可门槛已通过，**不等于用户已确认实际阅读画质提升**。当前描述文件仅接受确切的 `CC-BY-NC-4.0` 或 `CC-BY-NC-SA-4.0`；这只是声明检查，不独立证明实际权重授权。资源基名只使用 ASCII 字母、数字、下划线或连字符，特征名固定 `input`/`output`，来源必须是含有效主机名的 HTTPS URL。iPhone 包内的 descriptor 和对应 `.mlmodelc` 必须作为主应用顶层资源，不能仅放在嵌套文件夹或其他 bundle 内。每个模型 ID、资源名唯一，黑白闭区间不得重叠，彩色只启用一个候选；彩色通常不填高度范围，若填写也必须是完整、为正且有序的上下界。必须在 macOS 核实项目最低部署 iOS 15.2 与模型最低 iOS 16 的资源编译兼容性；必要时将经相应工具链编译的 `.mlmodelc` 作为资源集成，不能为通过构建擅自提高整个 App 的最低系统版本。该脚本不执行集成、不修改 Xcode 工程、不运行远程构建。任何步骤未通过则继续显示不可用/原图，原图不可覆盖。
 5. `BuildScripts/verify-super-resolution-bundle.py` 会在 iPhone 打包前审计已编译资源和描述契约，并将 `SuperResolutionModels.json` 随构建产物提供。没有模型时明确标记 `engineering-build-no-models`，这类 IPA 只是工程验证版，**不是已完成 AI 画质验证的交付物**。存在未验证、许可未解决、缺少编译资源或选择有歧义的描述时阻止打包。资源审计不能替代数值、真机、签名或独立许可验证。
 
@@ -123,7 +200,7 @@ MAX_HEIGHT=  # 操作者选择，不能为空
 
 - 阅读器 → 画质增强 → **原图对比 / 本页 AI 试处理**；不必先开启传统锐化。支持原图、传统滤镜和手动黑白/彩色 AI；双指缩放、单指移动、拖动分割线，两侧共用源坐标。`1:1 原图像素` 以屏幕物理像素对齐原图像素，右侧 AI 同位置对应 2× 输出。原图读取、输入和输出像素及实际模型/计算精度均明确展示。
 - 仅前台显式运行当前页，离开对比页或 App 进入非活跃状态时取消；Core ML 单块预测不能强制中断，会在当前块结束后检查取消。取消/失败/超限均不是 AI 成功，原图不覆盖，预设变更不复用旧结果。
-- 当前源图对比最多 1200 万像素、单边 16384、编码数据 64 MiB，并检查解码副本预算；AI 另有更保守的输出和图像工作预算，可能跳过仍可普通阅读的较大页面。推理单 worker，128 输入 tile / 每侧裁 20；输出为临时独立目录内无损 PNG，不进入原下载枚举、导出和备份，离开时清理。暂不承诺重启恢复。
+- 当前源图对比最多 1200 万像素、单边 16384、编码数据 64 MiB，并检查解码副本预算；AI 另有更保守的输出和图像工作预算，可能跳过仍可普通阅读的较大页面。推理单 worker；整页模式为一次动态尺寸预测，分块模式保留 128 输入 tile / 每侧裁 20；输出为临时独立目录内无损 PNG，不进入原下载枚举、导出和备份，离开时清理。暂不承诺重启恢复。
 - 原图对比的 64 MiB 编码上限在本地/便携下载文件、磁盘缓存及 HTTP 流累积时执行；有界请求不与无上限或不同上限的请求合并。EH 的 HTML/API/图片/重试沿用同一上限并保留鉴权与 Referer，取消或超限不重试。代理不绕行直连：其 HTTP codec 在 Content-Length、chunked 和 EOF 路径先实施每次请求的 body 限额（内部限额头不发送到源站，重定向仍携带策略），上层再限制返回数据；不能只依赖 URLSession 在代理完整缓冲之后检查。超限不删除合法缓存/原文件，不当作损坏重新下载。该限额是返回编码数据的上界，不是整个进程/系统缓冲区的峰值内存保证。
 - 普通阅读采用独立的显示预算（最多约 2400 万 RGBA 像素、长边 65536），不因 AI 的源图上限而拒绝本可降采样显示的长页。JM 仍需解码原始位图来重排，先估算源解码和显示副本（256 MiB 工作预算），只生成显示尺寸的重排结果；极端页仍明确跳过，不回退显示乱序图片。此估算不替代 Instruments 实测。
 - 工程版不包含模型时，先验证源图链路、传统模式、可信对比、缺模型/取消等状态；这不代表已验证 AI 画质。保留 iOS 15.2 普通阅读，候选模型推理需要 iOS 16+。

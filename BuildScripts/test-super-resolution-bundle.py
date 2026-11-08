@@ -130,6 +130,46 @@ class BundleAuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             audit.audit_bundle(self.app)
 
+    def full_page(self, **changes):
+        capability = dict(validated=True, shapeMode="range", alignment=16,
+                          minimumWidth=64, minimumHeight=64, maximumWidth=2048,
+                          maximumHeight=2048, maximumPixels=2_000_000,
+                          estimatedWorkingBytesPerPixel=2048)
+        capability.update(changes)
+        return capability
+
+    def test_tiled_only_descriptor_remains_backward_compatible(self):
+        self.write_model()
+        self.assertEqual(len(audit.audit_bundle(self.app)["models"]), 1)
+
+    def test_valid_range_and_enumerated_full_page_descriptors(self):
+        self.write_model(fullPage=self.full_page())
+        self.assertEqual(len(audit.audit_bundle(self.app)["models"]), 1)
+        self.write_model(fullPage=self.full_page(
+            shapeMode="enumerated", enumeratedSizes=[[256, 384], [1008, 1504]]))
+        self.assertEqual(len(audit.audit_bundle(self.app)["models"]), 1)
+
+    def test_invalid_full_page_descriptors_are_rejected(self):
+        cases = (
+            {"validated": "yes"}, {"shapeMode": "fixed"}, {"alignment": 12},
+            {"alignment": 0}, {"minimumWidth": 0}, {"maximumWidth": 32},
+            {"maximumPixels": 100}, {"estimatedWorkingBytesPerPixel": True},
+            {"shapeMode": "enumerated"},
+            {"shapeMode": "enumerated", "enumeratedSizes": [[1000, 1500]]},
+            {"shapeMode": "enumerated", "enumeratedSizes": [[256, 384], [256, 384]]},
+            {"shapeMode": "enumerated", "enumeratedSizes": [[4096, 64]]},
+            {"shapeMode": "enumerated", "enumeratedSizes": [[256]]},
+            {"shapeMode": "enumerated", "enumeratedSizes": [[256.0, 384]]},
+            {"shapeMode": "range", "enumeratedSizes": [[256, 384]]},
+        )
+        for changes in cases:
+            self.write_model(fullPage=self.full_page(**changes))
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                audit.audit_bundle(self.app)
+        self.write_model(fullPage=[])
+        with self.assertRaises(ValueError):
+            audit.audit_bundle(self.app)
+
 
 if __name__ == "__main__":
     unittest.main()

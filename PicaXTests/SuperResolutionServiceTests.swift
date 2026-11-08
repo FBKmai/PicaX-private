@@ -19,7 +19,8 @@ final class SuperResolutionServiceTests: XCTestCase {
         inputName: String = "input",
         tileSize: Int = 128,
         overlap: Int = 20,
-        scale: Int = 2
+        scale: Int = 2,
+        fullPage: SuperResolutionFullPageCapability? = nil
     ) -> SuperResolutionModel {
         SuperResolutionModel(
             id: id, preset: preset, displayName: "Test model", version: "1",
@@ -27,7 +28,29 @@ final class SuperResolutionServiceTests: XCTestCase {
             weightSHA256: hash, inputName: inputName, outputName: "output",
             tileSize: tileSize, overlap: overlap, scale: scale,
             minimumPageHeight: minimum, maximumPageHeight: maximum,
-            precision: precision, validated: validated
+            precision: precision, validated: validated, fullPage: fullPage
+        )
+    }
+
+    private func fullPageCapability(
+        validated: Bool = true,
+        shapeMode: SuperResolutionFullPageCapability.ShapeMode = .range,
+        alignment: Int = 16,
+        minimumWidth: Int = 64,
+        minimumHeight: Int = 64,
+        maximumWidth: Int = 2_048,
+        maximumHeight: Int = 2_048,
+        maximumPixels: Int = 2_000_000,
+        workingBytesPerPixel: Int = 2_048,
+        enumeratedSizes: [[Int]]? = nil
+    ) -> SuperResolutionFullPageCapability {
+        SuperResolutionFullPageCapability(
+            validated: validated, shapeMode: shapeMode, alignment: alignment,
+            minimumWidth: minimumWidth, minimumHeight: minimumHeight,
+            maximumWidth: maximumWidth, maximumHeight: maximumHeight,
+            maximumPixels: maximumPixels,
+            estimatedWorkingBytesPerPixel: workingBytesPerPixel,
+            enumeratedSizes: enumeratedSizes
         )
     }
 
@@ -90,6 +113,128 @@ final class SuperResolutionServiceTests: XCTestCase {
         assertFailure(.missingMangaHeightRange, try descriptor(maximum: nil).validate())
         assertFailure(.invalidMangaHeightRange, try descriptor(minimum: 200, maximum: 199).validate())
         assertFailure(.invalidMangaHeightRange, try descriptor(minimum: 0).validate())
+    }
+
+    func testFullPageMetadataDecodesAndStaysOptional() throws {
+        let legacy = """
+        {"id":"color","preset":"color","displayName":"Color","version":"1",
+         "resourceName":"color","sourceURL":"https://example.com/model","license":"CC-BY-NC-4.0",
+         "weightSHA256":"\(String(repeating: "a", count: 64))","inputName":"input","outputName":"output",
+         "tileSize":128,"overlap":20,"scale":2,"precision":"float32","validated":true}
+        """
+        let legacyModel = try JSONDecoder().decode(SuperResolutionModel.self, from: Data(legacy.utf8))
+        XCTAssertNil(legacyModel.fullPage)
+        XCTAssertNoThrow(try legacyModel.validate())
+
+        let modern = """
+        {"id":"color","preset":"color","displayName":"Color","version":"1",
+         "resourceName":"color","sourceURL":"https://example.com/model","license":"CC-BY-NC-4.0",
+         "weightSHA256":"\(String(repeating: "a", count: 64))","inputName":"input","outputName":"output",
+         "tileSize":128,"overlap":20,"scale":2,"precision":"float32","validated":true,
+         "fullPage":{"validated":true,"shapeMode":"enumerated","alignment":16,
+           "minimumWidth":64,"minimumHeight":64,"maximumWidth":2048,"maximumHeight":2048,
+           "maximumPixels":2000000,"estimatedWorkingBytesPerPixel":1024,
+           "enumeratedSizes":[[256,384],[1008,1504]]}}
+        """
+        let modernModel = try JSONDecoder().decode(SuperResolutionModel.self, from: Data(modern.utf8))
+        XCTAssertEqual(modernModel.fullPage?.shapeMode, .enumerated)
+        XCTAssertEqual(modernModel.fullPage?.enumeratedSizes, [[256, 384], [1008, 1504]])
+        XCTAssertNoThrow(try modernModel.validate())
+    }
+
+    func testFullPageCapabilityValidation() {
+        XCTAssertNoThrow(try descriptor(fullPage: fullPageCapability()).validate())
+        XCTAssertNoThrow(try descriptor(fullPage: fullPageCapability(
+            shapeMode: .enumerated, enumeratedSizes: [[256, 384], [1008, 1504]])).validate())
+        let invalid = [
+            fullPageCapability(alignment: 12),
+            fullPageCapability(alignment: 0),
+            fullPageCapability(minimumWidth: 0),
+            fullPageCapability(maximumWidth: 32),
+            fullPageCapability(maximumHeight: 32),
+            fullPageCapability(maximumPixels: 100),
+            fullPageCapability(workingBytesPerPixel: 0),
+            fullPageCapability(workingBytesPerPixel: 65_537),
+            fullPageCapability(shapeMode: .enumerated),
+            fullPageCapability(shapeMode: .enumerated, enumeratedSizes: [[1000, 1500]]),
+            fullPageCapability(shapeMode: .enumerated, enumeratedSizes: [[256, 384], [256, 384]]),
+            fullPageCapability(shapeMode: .enumerated, enumeratedSizes: [[4096, 64]]),
+            fullPageCapability(shapeMode: .enumerated, enumeratedSizes: [[256]]),
+            fullPageCapability(shapeMode: .range, enumeratedSizes: [[256, 384]])
+        ]
+        for capability in invalid {
+            assertFailure(.invalidDescriptor, try descriptor(fullPage: capability).validate())
+        }
+    }
+
+    func testFullPageInputDimensionsPadOrChooseAnEnumeratedShape() throws {
+        let range = fullPageCapability()
+        XCTAssertEqual(try range.inputDimensions(width: 1000, height: 1500).width, 1008)
+        XCTAssertEqual(try range.inputDimensions(width: 1000, height: 1500).height, 1504)
+        XCTAssertEqual(try range.inputDimensions(width: 10, height: 20).width, 64)
+        XCTAssertEqual(try range.inputDimensions(width: 10, height: 20).height, 64)
+        assertFailure(.fullPagePageUnsupported, try range.inputDimensions(width: 2_049, height: 500))
+        assertFailure(.fullPagePageUnsupported, try range.inputDimensions(width: 2_000, height: 1_100))
+
+        let enumerated = fullPageCapability(
+            shapeMode: .enumerated,
+            enumeratedSizes: [[256, 384], [512, 768], [1008, 1504]])
+        XCTAssertEqual(try enumerated.inputDimensions(width: 100, height: 100).width, 256)
+        XCTAssertEqual(try enumerated.inputDimensions(width: 100, height: 100).height, 384)
+        XCTAssertEqual(try enumerated.inputDimensions(width: 999, height: 1501).width, 1008)
+        XCTAssertEqual(try enumerated.inputDimensions(width: 999, height: 1501).height, 1504)
+        assertFailure(.fullPagePageUnsupported, try enumerated.inputDimensions(width: 1_100, height: 1_600))
+    }
+
+    func testAutomaticModeDisclosesTiledFallbackAndNeverMislabelsIt() throws {
+        let tiledOnly = descriptor(fullPage: nil)
+        XCTAssertEqual(try SuperResolutionModelSelection.resolveMode(
+            requested: .tiled, model: tiledOnly, width: 1_000, height: 1_500).actual, .tiled)
+        assertFailure(.fullPageUnavailable, try SuperResolutionModelSelection.resolveMode(
+            requested: .fullPage, model: tiledOnly, width: 1_000, height: 1_500))
+
+        let unverified = descriptor(fullPage: fullPageCapability(validated: false))
+        assertFailure(.fullPageUnavailable, try SuperResolutionModelSelection.resolveMode(
+            requested: .fullPage, model: unverified, width: 1_000, height: 1_500))
+        let automaticUnverified = try SuperResolutionModelSelection.resolveMode(
+            requested: .automatic, model: unverified, width: 1_000, height: 1_500)
+        XCTAssertEqual(automaticUnverified.actual, .tiled)
+        XCTAssertNotNil(automaticUnverified.fallbackReason)
+
+        let verified = descriptor(fullPage: fullPageCapability())
+        XCTAssertEqual(try SuperResolutionModelSelection.resolveMode(
+            requested: .fullPage, model: verified, width: 1_000, height: 1_500).actual, .fullPage)
+        assertFailure(.fullPagePageUnsupported, try SuperResolutionModelSelection.resolveMode(
+            requested: .fullPage, model: verified, width: 2_049, height: 2_049))
+        let automatic = try SuperResolutionModelSelection.resolveMode(
+            requested: .automatic, model: verified, width: 1_000, height: 1_500)
+        XCTAssertEqual(automatic.actual, .fullPage)
+        XCTAssertNil(automatic.fallbackReason)
+        let automaticTooLarge = try SuperResolutionModelSelection.resolveMode(
+            requested: .automatic, model: verified, width: 3_000, height: 3_000)
+        XCTAssertEqual(automaticTooLarge.actual, .tiled)
+        XCTAssertNotNil(automaticTooLarge.fallbackReason)
+    }
+
+    func testFullPageBudgetAccountsForWorkingSetAndStorage() throws {
+        let capability = fullPageCapability()
+        let budget = try SuperResolutionFullPageBudget.make(
+            width: 100, height: 200, sourceBytesPerRow: 400,
+            capability: capability, physicalMemory: 8 * 1024 * 1024 * 1024)
+        XCTAssertEqual(budget.inputWidth, 112)
+        XCTAssertEqual(budget.inputHeight, 208)
+        XCTAssertEqual(budget.outputWidth, 200)
+        XCTAssertEqual(budget.outputHeight, 400)
+        XCTAssertEqual(budget.inputBytes, 279_552)
+        XCTAssertEqual(budget.outputBytes, 320_000)
+        XCTAssertEqual(budget.estimatedPeakBytes, 250_676_352)
+        XCTAssertEqual(budget.requiredFreeBytes, 34_194_432)
+        assertFailure(.budgetExceeded, try SuperResolutionFullPageBudget.make(
+            width: 100, height: 200, sourceBytesPerRow: 400,
+            capability: capability, physicalMemory: 256 * 1024 * 1024))
+        assertFailure(.invalidInput, try SuperResolutionFullPageBudget.make(
+            width: 0, height: 200, sourceBytesPerRow: 400,
+            capability: capability, physicalMemory: 8 * 1024 * 1024 * 1024))
     }
 
     func testMangaSelectionUsesInclusiveOriginalHeightAndRejectsAmbiguity() throws {
@@ -308,6 +453,64 @@ final class SuperResolutionServiceTests: XCTestCase {
         }
     }
 
+    func testFullPageInputFillsReflectedRGBThroughStrides() throws {
+        let rowStride = 10
+        let channelStride = rowStride * 4
+        let array = try stridedArray(
+            shape: [1, 3, 4, 4], strides: [channelStride * 3, channelStride, rowStride, 2])
+        let pixels: [UInt8] = [
+            1, 2, 3, 255, 10, 11, 12, 255,
+            100, 101, 102, 255, 110, 111, 112, 255
+        ]
+        try pixels.withUnsafeBufferPointer { buffer in
+            try SuperResolutionService.fillFullPageInputArray(
+                array, pageWidth: 2, pageHeight: 2,
+                paddedWidth: 4, paddedHeight: 4, input: buffer.baseAddress!)
+        }
+        let values = array.dataPointer.assumingMemoryBound(to: Float32.self)
+        func value(_ channel: Int, _ y: Int, _ x: Int) -> Float32 {
+            values[channel * channelStride + y * rowStride + x * 2]
+        }
+        // x=3 and y=3 reflect to 1; x=2 reflects to 0.
+        XCTAssertEqual(value(0, 3, 2), 100.0 / 255, accuracy: 0.00001)
+        XCTAssertEqual(value(1, 3, 2), 101.0 / 255, accuracy: 0.00001)
+        XCTAssertEqual(value(2, 3, 2), 102.0 / 255, accuracy: 0.00001)
+        XCTAssertEqual(value(0, 0, 3), 10.0 / 255, accuracy: 0.00001)
+        XCTAssertEqual(value(2, 1, 1), 112.0 / 255, accuracy: 0.00001)
+        XCTAssertEqual(value(0, 1, 1), 110.0 / 255, accuracy: 0.00001)
+    }
+
+    func testFullPageOutputCropsPaddingAndChecksDiscardedPixels() throws {
+        let rowStride = 20
+        let channelStride = rowStride * 8
+        let array = try stridedArray(
+            shape: [1, 3, 8, 8], strides: [channelStride * 3, channelStride, rowStride, 2])
+        let values = array.dataPointer.assumingMemoryBound(to: Float32.self)
+        values[0] = -0.1
+        values[channelStride] = 0.5
+        values[2 * channelStride] = 1.1
+        let source = 4 * rowStride + 5 * 2 // padded-only coordinate (x=5, y=4)
+        let outputWidth = 4
+        var output = [UInt8](repeating: 7, count: outputWidth * 4 * 4)
+        try output.withUnsafeMutableBufferPointer { buffer in
+            try SuperResolutionService.copyFullPageOutput(
+                array, pageWidth: 2, pageHeight: 2,
+                paddedWidth: 4, paddedHeight: 4, output: buffer.baseAddress!)
+        }
+        XCTAssertEqual(Array(output[0..<4]), [0, 128, 255, 255])
+        // The crop keeps only the top-left 4×4 of the 8×8 padded output.
+        XCTAssertEqual(output[3], 255)
+        XCTAssertEqual(output[(1 * outputWidth + 1) * 4 + 3], 255)
+        values[source] = .nan
+        XCTAssertThrowsError(try output.withUnsafeMutableBufferPointer { buffer in
+            try SuperResolutionService.copyFullPageOutput(
+                array, pageWidth: 2, pageHeight: 2,
+                paddedWidth: 4, paddedHeight: 4, output: buffer.baseAddress!)
+        }) { error in
+            XCTAssertEqual(error as? SuperResolutionError, .nonFiniteOutput)
+        }
+    }
+
     func testArrayShapeAndDataTypeAreChecked() throws {
         let wrongType = try MLMultiArray(shape: [1, 3, 128, 128], dataType: .double)
         assertFailure(.modelDescriptionMismatch, try SuperResolutionService.strides(wrongType, shape: [1, 3, 128, 128]))
@@ -373,7 +576,9 @@ final class SuperResolutionServiceTests: XCTestCase {
         let result = SuperResolutionResult(
             image: image, model: descriptor(preset: .color, minimum: nil, maximum: nil),
             sourceFingerprint: "test", elapsedSeconds: 0, estimatedPeakBytes: 0,
-            outputURL: url, outputByteCount: 1
+            outputURL: url, outputByteCount: 1,
+            requestedMode: .automatic, actualMode: .tiled, computeUnit: .all,
+            fallbackReason: nil, paddedInputWidth: nil, paddedInputHeight: nil
         )
         do {
             let _: SuperResolutionResult = try await withCheckedThrowingContinuation { continuation in

@@ -15,6 +15,59 @@ from urllib.parse import urlsplit
 LICENSES = {"CC-BY-NC-4.0", "CC-BY-NC-SA-4.0"}
 
 
+def audit_full_page(model, name):
+    """Optional full-page capability stays backward compatible with tiled-only models."""
+    capability = model.get("fullPage")
+    if capability is None:
+        return
+    if not isinstance(capability, dict):
+        raise ValueError(f"fullPage must be an object: {name}")
+    if type(capability.get("validated")) is not bool:
+        raise ValueError(f"fullPage.validated must be a boolean: {name}")
+    mode = capability.get("shapeMode")
+    if mode not in {"range", "enumerated"}:
+        raise ValueError(f"fullPage.shapeMode must be range or enumerated: {name}")
+    alignment = capability.get("alignment")
+    if type(alignment) is not int or alignment < 1 or alignment & (alignment - 1):
+        raise ValueError(f"fullPage.alignment must be a power of two: {name}")
+    bounds = []
+    for key, minimum in (("minimumWidth", 1), ("minimumHeight", 1),
+                         ("maximumWidth", 1), ("maximumHeight", 1),
+                         ("maximumPixels", 1), ("estimatedWorkingBytesPerPixel", 1)):
+        value = capability.get(key)
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"fullPage.{key} must be a positive integer: {name}")
+        bounds.append(value)
+    minimum_width, minimum_height, maximum_width, maximum_height, maximum_pixels, _ = bounds
+    if maximum_width < minimum_width or maximum_height < minimum_height:
+        raise ValueError(f"fullPage maximum bounds must not be below the minimum: {name}")
+    if maximum_pixels < minimum_width * minimum_height:
+        raise ValueError(f"fullPage.maximumPixels is below the minimum page: {name}")
+    if mode == "enumerated":
+        sizes = capability.get("enumeratedSizes")
+        if not isinstance(sizes, list) or not sizes:
+            raise ValueError(f"fullPage.enumeratedSizes must be a non-empty list: {name}")
+        seen = set()
+        for pair in sizes:
+            if (not isinstance(pair, list) or len(pair) != 2
+                    or not all(type(value) is int for value in pair)):
+                raise ValueError(f"fullPage.enumeratedSizes entries must be [width, height]: {name}")
+            width, height = pair
+            if width < minimum_width or height < minimum_height:
+                raise ValueError(f"fullPage enumerated size is below the minimum: {name}")
+            if width > maximum_width or height > maximum_height:
+                raise ValueError(f"fullPage enumerated size exceeds the side limit: {name}")
+            if width % alignment or height % alignment:
+                raise ValueError(f"fullPage enumerated size is not aligned: {name}")
+            if width * height > maximum_pixels:
+                raise ValueError(f"fullPage enumerated size exceeds the pixel limit: {name}")
+            if (width, height) in seen:
+                raise ValueError(f"fullPage enumerated size is duplicated: {name}")
+            seen.add((width, height))
+    elif "enumeratedSizes" in capability:
+        raise ValueError(f"range mode must not declare enumerated sizes: {name}")
+
+
 def audit_bundle(app):
     app = Path(app).resolve()
     if not app.is_dir():
@@ -60,6 +113,7 @@ def audit_bundle(app):
             raise ValueError(f"Unexpected preset: {path.name}")
         if model.get("precision") not in {"float32", "float16"} or (preset == "manga" and model["precision"] != "float32"):
             raise ValueError(f"Unsupported precision: {path.name}")
+        audit_full_page(model, path.name)
         for field in ("version", "displayName", "sourceURL"):
             if not isinstance(model.get(field), str) or not model[field].strip():
                 raise ValueError(f"Missing {field}: {path.name}")

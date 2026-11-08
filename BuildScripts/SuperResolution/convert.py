@@ -16,9 +16,21 @@ import re
 import sys
 from pathlib import Path
 
+MODULE_DIRECTORY = Path(__file__).resolve().parent
+# GitHub Actions runs this file with -I, which removes the script directory from
+# sys.path. The conversion scripts themselves are trusted repository code.
+if str(MODULE_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(MODULE_DIRECTORY))
+
 TILE_SIZE = 128
 OVERLAP = 20  # INPUT pixels removed from EACH edge, not total tile overlap.
 SCALE = 2
+FULL_PAGE_ALIGNMENT = 16
+FULL_PAGE_MINIMUM = 64
+FULL_PAGE_MAXIMUM = 2048
+FULL_PAGE_MAX_PIXELS = 2_000_000
+FULL_PAGE_SIZES = ((256, 384), (512, 768), (768, 1152), (1000, 1500), (999, 1501))
+FULL_PAGE_WORKING_BYTES_PER_PIXEL = {"manga": 2048, "color": 1024}
 CONVERTER_REVISION = "68e3f51517e04433164c09d8505a409e26477905"
 CONVERTER_SOURCE = (
     "https://github.com/imxieyi/waifu2x-ios-model-converter/blob/"
@@ -60,6 +72,13 @@ def nonnegative_float(value):
     return value
 
 
+def nonnegative_int(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return value
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, choices=["manga", "color"])
@@ -83,12 +102,33 @@ def parse_args(argv=None):
     parser.add_argument("--max-tile-abs-error", type=nonnegative_float)
     parser.add_argument("--max-tile-mean-error", type=nonnegative_float)
     parser.add_argument("--max-seam-mean-error", type=nonnegative_float)
+    parser.add_argument("--full-page", action="store_true",
+                        help="Export a dynamic-size model and validate full-page Core ML inference")
+    parser.add_argument("--full-page-alignment", type=positive_int, default=FULL_PAGE_ALIGNMENT,
+                        help="Spatial alignment required by the full-page model")
+    parser.add_argument("--full-page-max-side", type=positive_int, default=FULL_PAGE_MAXIMUM)
+    parser.add_argument("--full-page-max-pixels", type=positive_int, default=FULL_PAGE_MAX_PIXELS)
+    parser.add_argument("--full-page-timeout", type=positive_int, default=1800,
+                        help="Per-worker timeout in seconds for isolated full-page trials")
+    parser.add_argument("--full-page-memory-mb", type=nonnegative_int, default=12288,
+                        help="Per-worker RLIMIT_AS budget in MiB; 0 disables the limit")
     args = parser.parse_args(argv)
     tile_limits = (args.max_tile_abs_error, args.max_tile_mean_error, args.max_seam_mean_error)
     if args.validate_tiles != all(value is not None for value in tile_limits):
         parser.error("--validate-tiles requires all three explicit tile/seam limits")
     if not args.validate_tiles and any(value is not None for value in tile_limits):
         parser.error("tile/seam limits require --validate-tiles")
+    if args.full_page:
+        if args.validate_tiles:
+            parser.error("--full-page and --validate-tiles are separate conversion experiments")
+        if args.precision != "float32":
+            parser.error("full-page validation is limited to the verified float32 candidates")
+        if args.full_page_alignment < 1 or args.full_page_alignment & (args.full_page_alignment - 1):
+            parser.error("full-page alignment must be a positive power of two")
+        if args.full_page_max_side < FULL_PAGE_MINIMUM:
+            parser.error("full-page maximum side must not be smaller than the minimum input size")
+        if args.full_page_max_pixels < FULL_PAGE_MINIMUM * FULL_PAGE_MINIMUM:
+            parser.error("full-page maximum pixels is smaller than the minimum input")
     if args.model == "manga":
         if args.manga_height is None or args.minimum_page_height is None or args.maximum_page_height is None:
             parser.error("manga requires --manga-height and explicit minimum/maximum page heights")
@@ -124,8 +164,8 @@ def model_info(args):
     }
 
 
-def make_descriptor(args, info):
-    return {
+def make_descriptor(args, info, full_page_validated=False, full_page_shape=None):
+    descriptor = {
         "id": info["id"], "preset": args.model, "displayName": info["display"],
         "version": info["version"], "resourceName": info["resource"],
         "sourceURL": info["source"], "license": info["license"],
@@ -135,6 +175,24 @@ def make_descriptor(args, info):
         "maximumPageHeight": args.maximum_page_height,
         "precision": args.precision, "validated": False,
     }
+    if args.full_page:
+        capability = {
+            "validated": bool(full_page_validated),
+            "shapeMode": "range",
+            "alignment": args.full_page_alignment,
+            "minimumWidth": FULL_PAGE_MINIMUM,
+            "minimumHeight": FULL_PAGE_MINIMUM,
+            "maximumWidth": args.full_page_max_side,
+            "maximumHeight": args.full_page_max_side,
+            "maximumPixels": args.full_page_max_pixels,
+            "estimatedWorkingBytesPerPixel": FULL_PAGE_WORKING_BYTES_PER_PIXEL[args.model],
+        }
+        if full_page_shape and full_page_shape.get("shapeMode") == "enumerated":
+            capability["shapeMode"] = "enumerated"
+            capability["enumeratedSizes"] = [
+                list(size) for size in full_page_shape.get("enumeratedSizes", [])]
+        descriptor["fullPage"] = capability
+    return descriptor
 
 
 def ranges_overlap(first_min, first_max, second_min, second_max):
@@ -475,6 +533,13 @@ def run_conversion(args, info, weight_data, package, report):
 
     torch.set_num_threads(1)
     model = RGBWrapper(detected.model.float().cpu().eval(), detected.input_channels == 1).eval()
+    if args.full_page:
+        import full_page
+        report.update(full_page.convert_full_page(
+            np=np, torch=torch, ct=ct, model=model, architecture=info["architecture"],
+            args=args, package=package, package_hasher=package_sha256,
+            fallback_sizes=FULL_PAGE_SIZES))
+        return
     samples = synthetic_inputs(np)
     reference = {}
     with torch.no_grad():
@@ -533,6 +598,9 @@ def main(argv=None):
         report = {
             "status": "started", "validated": False, "numericComparisonPassed": False,
             "tileSeamValidation": "NOT RUN: full-page versus tiled and real-device visual tests required",
+            "fullPageValidation": ("NOT RUN: isolated full-page validation required"
+                                   if args.full_page else
+                                   "NOT APPLICABLE: this is a tiled conversion"),
             "licenseReview": "PENDING: check actual archive and intended distribution; see documentation",
             "model": info["id"], "weightSHA256": info["hash"], "checkpointFile": info["filename"],
             "checkpointHashSource": CONVERTER_SOURCE, "upstreamConverterRevision": CONVERTER_REVISION,
@@ -553,7 +621,10 @@ def main(argv=None):
         # A descriptor is emitted only if a saved package passed the structural
         # checks. Its validation flag remains false even when numbers pass.
         if package.is_dir() and "packageSHA256" in report:
-            write_json(descriptor_path, make_descriptor(args, info))
+            conversion = report.get("fullPageConversion")
+            write_json(descriptor_path, make_descriptor(
+                args, info,
+                full_page_shape=conversion if isinstance(conversion, dict) else None))
         write_json(report_path, report)
         print(f"Report: {report_path}")
         if report["status"] == "failed":

@@ -12,6 +12,11 @@ spec = importlib.util.spec_from_file_location("picax_sr_convert", Path(__file__)
 convert = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(convert)
 
+full_page_spec = importlib.util.spec_from_file_location(
+    "picax_sr_full_page", Path(__file__).with_name("full_page.py"))
+full_page = importlib.util.module_from_spec(full_page_spec)
+full_page_spec.loader.exec_module(full_page)
+
 
 class ConversionLogicTests(unittest.TestCase):
     def arguments(self, *extra):
@@ -146,6 +151,69 @@ class ConversionLogicTests(unittest.TestCase):
                 self.assertEqual(convert.check_paths(path, root / "other")[0], path.resolve())
             finally:
                 convert.__file__ = original
+
+    def test_full_page_descriptor_declares_limits_and_stays_unvalidated(self):
+        args = convert.parse_args(self.arguments("--full-page"))
+        descriptor = convert.make_descriptor(args, convert.model_info(args))
+        capability = descriptor["fullPage"]
+        self.assertEqual(capability["shapeMode"], "range")
+        self.assertEqual(capability["alignment"], 16)
+        self.assertEqual((capability["minimumWidth"], capability["minimumHeight"]), (64, 64))
+        self.assertEqual((capability["maximumWidth"], capability["maximumHeight"]), (2048, 2048))
+        self.assertEqual(capability["maximumPixels"], 2_000_000)
+        self.assertEqual(capability["estimatedWorkingBytesPerPixel"], 2048)
+        self.assertFalse(capability["validated"])
+        self.assertFalse(descriptor["validated"])
+        self.assertNotIn("enumeratedSizes", capability)
+        self.assertNotIn("fullPage", convert.make_descriptor(
+            convert.parse_args(self.arguments()), convert.model_info(args)))
+
+    def test_full_page_descriptor_records_enumerated_fallback(self):
+        args = convert.parse_args(self.arguments("--full-page"))
+        descriptor = convert.make_descriptor(
+            args, convert.model_info(args),
+            full_page_shape={"shapeMode": "enumerated",
+                             "enumeratedSizes": [(256, 384), (1008, 1504)]})
+        self.assertEqual(descriptor["fullPage"]["shapeMode"], "enumerated")
+        self.assertEqual(descriptor["fullPage"]["enumeratedSizes"], [[256, 384], [1008, 1504]])
+        self.assertFalse(descriptor["fullPage"]["validated"])
+
+    def test_full_page_rejects_unverified_combinations(self):
+        cases = (["--full-page", "--precision", "float16"],
+                 ["--full-page", "--full-page-alignment", "12"],
+                 ["--full-page", "--full-page-max-side", "32"],
+                 ["--full-page", "--full-page-max-pixels", "100"],
+                 ["--full-page", "--full-page-memory-mb", "-1"],
+                 ["--full-page", "--validate-tiles", "--max-tile-abs-error", "0.05",
+                  "--max-tile-mean-error", "0.005", "--max-seam-mean-error", "0.0075"])
+        for extra in cases:
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                convert.parse_args(self.arguments(*extra))
+        self.assertEqual(convert.parse_args(
+            self.arguments("--full-page", "--full-page-memory-mb", "0")).full_page_memory_mb, 0)
+
+    def test_full_page_alignment_and_padding_helpers(self):
+        self.assertEqual(full_page.align_up(1000, 16), 1008)
+        self.assertEqual(full_page.align_up(1024, 16), 1024)
+        self.assertEqual(full_page.padded_dimensions(1000, 1500, 16, 2048, 2_000_000),
+                         (1008, 1504))
+        self.assertEqual(full_page.padded_dimensions(999, 1501, 16, 2048, 2_000_000),
+                         (1008, 1504))
+        with self.assertRaises(ValueError):
+            full_page.padded_dimensions(2048, 2048, 16, 2048, 2_000_000)
+        with self.assertRaises(ValueError):
+            full_page.padded_dimensions(2049, 64, 16, 2048, 2_000_000)
+        for bad in (0, -1, True, None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                full_page.align_up(bad, 16)
+        self.assertEqual(
+            full_page.aligned_fallback_sizes(
+                [(256, 384), (999, 1501), (999, 1501), (1000, 1500)],
+                16, 2048, 2_000_000),
+            [(256, 384), (1008, 1504)])
+        for coordinate in range(-50, 50):
+            self.assertEqual(full_page.reflected(coordinate, 7),
+                             convert.reflected(coordinate, 7))
 
 
 if __name__ == "__main__":

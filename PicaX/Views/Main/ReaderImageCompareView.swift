@@ -71,18 +71,22 @@ private final class ReaderImageCompareModel: ObservableObject {
         }
     }
 
-    func start(preset: SuperResolutionPreset) {
+    func start(
+        preset: SuperResolutionPreset,
+        mode: SuperResolutionInferenceMode,
+        computeUnit: SuperResolutionComputeUnit
+    ) {
         guard let source, !isProcessing else { return }
         clearResult()
         let id = UUID()
         trialID = id
         progress = 0
         isProcessing = true
-        trialMessage = "正在核对模型与页级预算…"
+        trialMessage = "正在核对模型、推理模式与页级预算…"
         trialTask = Task { [weak self] in
             do {
                 let result = try await SuperResolutionService.shared.process(
-                    source: source, preset: preset
+                    source: source, preset: preset, mode: mode, computeUnit: computeUnit
                 ) { [weak self] value in
                     Task { @MainActor [weak self] in
                         guard let self, self.trialID == id, self.isProcessing else { return }
@@ -114,7 +118,7 @@ private final class ReaderImageCompareModel: ObservableObject {
     func cancel() {
         guard isProcessing else { return }
         trialTask?.cancel()
-        trialMessage = "取消中；将在当前推理块结束后停止…"
+        trialMessage = "取消中；当前 Core ML 推理调用返回后停止并清理，未完成不会标记为成功。"
     }
 
     func changePreset() {
@@ -124,7 +128,7 @@ private final class ReaderImageCompareModel: ObservableObject {
         isProcessing = false
         progress = 0
         clearResult()
-        trialMessage = "预设已更换；尚未处理，不使用上一预设结果。"
+        trialMessage = "预设或推理选项已更换；尚未处理，不使用上一结果。"
     }
 
     func release() {
@@ -160,6 +164,8 @@ struct ReaderImageCompareView: View {
     @StateObject private var model = ReaderImageCompareModel()
     @State private var mode: ReaderComparisonMode = .ai
     @State private var preset: SuperResolutionPreset = .manga
+    @State private var inferenceMode: SuperResolutionInferenceMode = .automatic
+    @State private var computeUnit: SuperResolutionComputeUnit = .all
     @State private var showsOriginal = false
 
     var body: some View {
@@ -205,6 +211,8 @@ struct ReaderImageCompareView: View {
         .foregroundStyle(.white)
         .task(id: request.id) { await model.load(request: request, pixelWidth: targetPixelWidth) }
         .onChange(of: preset) { _ in model.changePreset() }
+        .onChange(of: inferenceMode) { _ in model.changePreset() }
+        .onChange(of: computeUnit) { _ in model.changePreset() }
         .onChange(of: scenePhase) { phase in if phase != .active { model.cancel() } }
         .onDisappear { model.release() }
     }
@@ -237,21 +245,45 @@ struct ReaderImageCompareView: View {
                     .pickerStyle(.menu)
                     .disabled(model.isProcessing)
                     Spacer()
+                    Picker("计算单元", selection: $computeUnit) {
+                        ForEach(SuperResolutionComputeUnit.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(model.isProcessing)
+                }
+                HStack {
+                    Picker("推理模式", selection: $inferenceMode) {
+                        ForEach(SuperResolutionInferenceMode.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .disabled(model.isProcessing)
+                    Spacer()
                     if model.isProcessing {
                         Button("取消") { model.cancel() }
                     } else {
-                        Button("本页 2× 试处理") { model.start(preset: preset) }
-                            .disabled(model.source == nil || model.isLoading || scenePhase != .active)
+                        Button("本页 2× 试处理") {
+                            model.start(preset: preset, mode: inferenceMode, computeUnit: computeUnit)
+                        }
+                        .disabled(model.source == nil || model.isLoading || scenePhase != .active)
                     }
                 }
                 if model.isProcessing { ProgressView(value: model.progress) }
                 Text(model.trialMessage).font(.caption).textSelection(.enabled)
                 if let result = model.aiResult {
-                    Text("输入 \(model.source?.dimensions.label ?? "—") → 输出 \(result.image.width) × \(result.image.height) px\n\(result.model.displayName) · \(result.model.version) · \(result.model.precision)\n耗时 \(String(format: "%.2f", result.elapsedSeconds)) s · PNG \(bytes(result.outputByteCount)) · 内存预算估算 \(bytes(result.estimatedPeakBytes))（非实测峰值）")
+                    Text("输入 \(model.source?.dimensions.label ?? "—") → 输出 \(result.image.width) × \(result.image.height) px\n\(result.model.displayName) · \(result.model.version) · \(result.model.precision)\n实际模式 \(result.actualMode.title)（请求 \(result.requestedMode.title)） · 计算单元 \(result.computeUnit.title)\n\(modeDetail(result))\n耗时 \(String(format: "%.2f", result.elapsedSeconds)) s · PNG \(bytes(result.outputByteCount)) · 内存预算估算 \(bytes(result.estimatedPeakBytes))（非实测峰值）")
                         .font(.caption2)
                         .textSelection(.enabled)
+                    if let fallback = result.fallbackReason {
+                        Text("回退说明：\(fallback)")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                    }
                 } else {
-                    Text("只运行随包提供且已验证的 Core ML 模型；缺失/未验证会明确失败，不用滤镜替代。模型结果不叠锐化。")
+                    Text("只运行随包提供且已验证的 Core ML 模型；缺失/未验证会明确失败，不用滤镜替代。整页模式为一次模型调用，分块模式保留 128×128 实验路径。")
                         .font(.caption2)
                         .foregroundStyle(.white.opacity(0.65))
                 }
@@ -277,8 +309,17 @@ struct ReaderImageCompareView: View {
         switch mode {
         case .original: "原图"
         case .traditional: model.traditionalImage == nil ? "原图（传统未改变）" : "传统插值 / 锐化"
-        case .ai: model.aiResult == nil ? "原图（AI 尚未完成）" : "AI 2×"
+        case .ai:
+            guard let result = model.aiResult else { return "原图（AI 尚未完成）" }
+            return "AI 2× · \(result.actualMode == .fullPage ? "整页" : "分块")"
         }
+    }
+
+    private func modeDetail(_ result: SuperResolutionResult) -> String {
+        if let width = result.paddedInputWidth, let height = result.paddedInputHeight {
+            return "整页输入 \(width) × \(height) px：反射补齐后单次 Core ML 推理，再裁剪回原页 2×"
+        }
+        return "分块输入 128 × 128 px：保留实验性重叠/拼接路径"
     }
 
     private var traditionalSummary: String {
