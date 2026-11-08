@@ -4,9 +4,9 @@
 
 首轮只支持用户**显式前台**试处理当前页或少量页面，不做整章、后台任务或自动逐页运行；原图必须保留。本仓库**没有随代码提供这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**。因此未自行取得合规权重并完成转换、验证、资源集成之前，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。
 
-截至 2026-11-08，已通过 [Actions 工程构建 #6](https://github.com/FBKmai/PicaX-private/actions/runs/42445750760)：Xcode 27.1 / iOS 27.1 SDK，145 项 iOS 模拟器测试及 20 项 Python 工具测试通过。未签名 IPA 的提交为 `6c558161a66e7374c2e8f77d6aef92e1a19d804c`，SHA-256 为 `4a629cab5951693e89a4115551369749b3344b3767baff7488cf807f3c327cf9`；已独立核对 ZIP CRC、构建提交和 SDK。该包的资源审计仍为 `engineering-build-no-models`，不是 AI 可用版，安装前需要签名。
+截至 2026-11-08，最新构建为 [Actions run #42462504310](https://github.com/FBKmai/PicaX-private/actions/runs/42462504310)（commit `13d1d0813b176f864de98c8044c7fa5b201a99c8`）：Xcode 27.1 / iOS 27.1 SDK，175 项 iOS 模拟器测试及 18 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-15` 的 SHA-256 为 `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`；其资源审计仍为 `engineering-build-no-models`，不包含两个 `.mlpackage`，安装后 AI 功能仍会显示模型缺失。上一版构建 #6 的旧记录不再代表当前代码。
 
-本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 转换和 macOS CPU 预测；**两种 FP32 候选的多块整页比较均失败，真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格），但 iPhone Duo 真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -134,6 +134,43 @@ python -B BuildScripts/SuperResolution/validate_full_page.py validate \
 ```
 
 `.github/workflows/validate-super-resolution-full-page.yml` 在 `iphone-duo-ios27` 分支相关文件推送或手动触发时，对黑白和彩色两个模型分别执行上述转换/隔离验证，并上传未批准的 `.mlpackage`、JSON 报告及 PNG。它只提供 macOS arm64 的工程证据，**不是 iPhone Duo 验收，也不是画质验收**。
+
+### 2026-11-08 整页 Core ML 工程证据
+
+[run 42461503524](https://github.com/FBKmai/PicaX-private/actions/runs/42461503524)（commit `ae2641b`，macOS arm64 / Xcode 27.1）的两个 job 均成功，`requiredPassed` 与 `informationalPassed` 均为 true。转换结果为 flexible `RangeDim`：输入声明 `1×3×64–2048×64–2048`，输出 feature spec 为空（`unspecified`），实际输出尺寸由下表每个尺寸的预测证明；没有使用 enumerated fallback。package SHA-256 含转换器写入的调试映射，不同 run 不保证相同。
+
+| 模型 | 权重 SHA-256 | 本次 package SHA-256 | 256×384 CPU_ONLY max / mean / P99 |
+| --- | --- | --- | --- |
+| MangaJaNai V1 ESRGAN 2× FP32 | `43b784f674bdbf89886a62a64cd5f8d8df92caf4d861bdf4d47dad249ede0267` | `26f60f041dd0ed39896bb3ffce5d9b7d5f23821a11d19406e6d548d4e6687529` | 1.371e-05 / 7.099e-07 / 3.219e-06 |
+| IllustrationJaNai V3detail FDAT M 2× FP32 | `8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0` | `94f6697f579a45e18fd9247b59e0fe236a52506b3e20807799747438a0b75b13` | 1.192e-06 / 1.307e-07 / 4.768e-07 |
+
+阈值保持预定的 max `0.00784313725490196` / mean `0.000392156862745098`，未放宽。每个尺寸先由独立 Torch 进程生成参考，再在独立 Core ML 进程运行；峰值 RSS 是该 worker 的 `ru_maxrss`，不是整机峰值，也不包含所有系统/Core ML 分配。
+
+MangaJaNai V1（ESRGAN 2×，缩放后输出为原页 2×）：
+
+| 页面 | 补齐输入 | Torch 参考 (s) | CPU_ONLY max | mean | P99 | CPU_ONLY 预测 (s) | CPU_ONLY 峰值 RSS (MiB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 256×384 | 256×384 | 24.0 | 1.371e-05 | 7.099e-07 | 3.219e-06 | 2.9 | 626.7 |
+| 512×768 | 512×768 | 129.0 | 1.365e-05 | 7.220e-07 | 3.278e-06 | 12.7 | 1259.3 |
+| 768×1152 | 768×1152 | 732.6 | 1.359e-05 | 7.261e-07 | 3.278e-06 | 29.2 | 2319.8 |
+| 1000×1500 | 1008×1504 | 1254.0 | 1.520e-05 | 7.275e-07 | 3.278e-06 | 31.0 | 3743.6 |
+| 999×1501 | 1008×1504 | 1062.8 | 1.591e-05 | 7.261e-07 | 3.293e-06 | 27.6 | 3743.8 |
+
+IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输入边长为 16 的倍数）：
+
+| 页面 | 补齐输入 | Torch 参考 (s) | CPU_ONLY max | mean | P99 | CPU_ONLY 预测 (s) | CPU_ONLY 峰值 RSS (MiB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 256×384 | 256×384 | 3.8 | 1.192e-06 | 1.307e-07 | 4.768e-07 | 1.8 | 816.6 |
+| 512×768 | 512×768 | 20.0 | 5.066e-06 | 3.512e-07 | 1.609e-06 | 7.6 | 1521.1 |
+| 768×1152 | 768×1152 | 55.8 | 1.621e-05 | 1.030e-06 | 4.351e-06 | 16.4 | 2758.3 |
+| 1000×1500 | 1008×1504 | 120.5 | 3.412e-05 | 2.305e-06 | 9.656e-06 | 30.4 | 3959.6 |
+| 999×1501 | 1008×1504 | 106.5 | 3.543e-05 | 2.374e-06 | 9.865e-06 | 28.2 | 4100.4 |
+
+在 256×384 与 1000×1500 追加的 `cpuAndGPU` / `.all` 采样也全部 passed，且误差数值与同一尺寸的 `cpuOnly` **完全相同**（例如黑白 1000×1500 三者 max 均为 1.520e-05；彩色 1000×1500 三者 max 均为 3.412e-05）。macOS 上这不证明使用 ANE，也不能推断 iPhone Duo 的后端选择或性能。
+
+内存保护：父进程每 0.5 s 采样 worker RSS 并在超过 12 GiB 时杀死；本 run 未触发。worker 内尽力设置 `RLIMIT_AS` 在 macOS runner 上返回 `applied: false`（`ValueError: current limit exceeds maximum limit`），报告如实记录，因此该 run 的实际强制保护是父进程 watchdog，而不是 worker 内的地址空间限制。
+
+视觉证据：artifact 保留每个尺寸的 input / torch / coreml PNG。下载 run 42461503524 产物后本地比较 256×384 与 1000×1500 的 Torch 与 CPU_ONLY PNG（512×768、2000×3000），逐像素 uint8 最大差为 1；黑白非零像素比例约 0.00017、彩色约 0.0006，缩略图目视一致。它们使用合成校准图，不是真实漫画页画质验收，也不能替代 iPhone Duo 真机测试。
 
 ### 应用内模式、预算和计算单元
 
