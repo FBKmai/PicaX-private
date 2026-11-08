@@ -57,8 +57,9 @@ jobs:
             echo '- Fixed macOS arm64 / CPython 3.11.9 environment; hash-locked dependencies.'
             echo '- No upload to Releases, no app resource integration, no validated flag changes.'
             echo '- Preselected float32 limits: max 2/255, mean 0.1/255.'
-            echo '- Preselected color float16 limits: max 8/255, mean 0.5/255.'
-            echo '- These are numerical conversion limits, not visual-quality acceptance.'
+            echo '- Color float16 was rejected in validation run 42447624740; it is not retried or bundled.'
+            echo '- Preselected tiled/full limits: max 0.05, mean 0.005, seam mean 0.0075 (normalized RGB).'
+            echo '- These are numerical engineering limits, not visual-quality acceptance.'
             echo '- Manga candidate matches only source height 1200; no invented wider range.'
             echo '- Licensing, full-page/tiled seams and real-device acceptance remain separate gates.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -85,7 +86,9 @@ jobs:
             --weight "$RUNNER_TEMP/picax-manga-weights/2x_MangaJaNai_1200p_V1_ESRGAN_70k.pth" \
             --expected-sha256 43b784f674bdbf89886a62a64cd5f8d8df92caf4d861bdf4d47dad249ede0267 \
             --precision float32 --output-dir "$RUNNER_TEMP/picax-sr-reports/manga-float32" \
-            --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098
+            --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098 \
+            --validate-tiles --max-tile-abs-error 0.05 --max-tile-mean-error 0.005 \
+            --max-seam-mean-error 0.0075
 
       - name: Fetch and hash selected color checkpoint
         id: color
@@ -110,20 +113,9 @@ jobs:
             --weight "$RUNNER_TEMP/picax-color-weights/2x_IllustrationJaNai_V3detail_FDAT_M_unshuffle_40k_fp16.safetensors" \
             --expected-sha256 8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0 \
             --precision float32 --output-dir "$RUNNER_TEMP/picax-sr-reports/color-float32" \
-            --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098
-
-      - name: Convert color float16 and compare CPU predictions
-        if: ${{ !cancelled() && steps.color.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/picax-sr-venv/bin/python" -I \
-            "$GITHUB_WORKSPACE/BuildScripts/SuperResolution/convert.py" \
-            --model color \
-            --weight "$RUNNER_TEMP/picax-color-weights/2x_IllustrationJaNai_V3detail_FDAT_M_unshuffle_40k_fp16.safetensors" \
-            --expected-sha256 8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0 \
-            --precision float16 --output-dir "$RUNNER_TEMP/picax-sr-reports/color-float16" \
-            --max-abs-error 0.03137254901960784 --max-mean-error 0.00196078431372549
+            --max-abs-error 0.00784313725490196 --max-mean-error 0.000392156862745098 \
+            --validate-tiles --max-tile-abs-error 0.05 --max-tile-mean-error 0.005 \
+            --max-seam-mean-error 0.0075
 
       - name: Upload unapproved model packages and numerical evidence
         if: ${{ always() }}

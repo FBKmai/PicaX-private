@@ -78,7 +78,17 @@ def parse_args(argv=None):
                         help="Preselected maximum allowed absolute error per sample")
     parser.add_argument("--max-mean-error", type=nonnegative_float, required=True,
                         help="Preselected maximum allowed mean absolute error per sample")
+    parser.add_argument("--validate-tiles", action="store_true",
+                        help="Also compare full-page Torch with real Core ML tiled predictions")
+    parser.add_argument("--max-tile-abs-error", type=nonnegative_float)
+    parser.add_argument("--max-tile-mean-error", type=nonnegative_float)
+    parser.add_argument("--max-seam-mean-error", type=nonnegative_float)
     args = parser.parse_args(argv)
+    tile_limits = (args.max_tile_abs_error, args.max_tile_mean_error, args.max_seam_mean_error)
+    if args.validate_tiles != all(value is not None for value in tile_limits):
+        parser.error("--validate-tiles requires all three explicit tile/seam limits")
+    if not args.validate_tiles and any(value is not None for value in tile_limits):
+        parser.error("tile/seam limits require --validate-tiles")
     if args.model == "manga":
         if args.manga_height is None or args.minimum_page_height is None or args.maximum_page_height is None:
             parser.error("manga requires --manga-height and explicit minimum/maximum page heights")
@@ -296,6 +306,109 @@ def check_coreml_spec(ct, model):
             raise ValueError(f"{name} must be float32 with fixed shape {shape}")
 
 
+def reflected(coordinate, length):
+    """Exactly the app's reflect mapping, including length=1 and far padding."""
+    if length <= 0:
+        raise ValueError("reflection requires a positive dimension")
+    if length == 1:
+        return 0
+    position = coordinate % ((length - 1) * 2)
+    return position if position < length else (length - 1) * 2 - position
+
+
+def tile_positions(width, height):
+    if width <= 0 or height <= 0:
+        raise ValueError("page dimensions must be positive")
+    core = TILE_SIZE - OVERLAP * 2
+    return [(x, y, min(core, width - x), min(core, height - y))
+            for y in range(0, height, core) for x in range(0, width, core)]
+
+
+def reflected_window(np, image, x, y, width, height):
+    page_height, page_width = image.shape[1:]
+    xs = [reflected(x + offset, page_width) for offset in range(width)]
+    ys = [reflected(y + offset, page_height) for offset in range(height)]
+    return np.ascontiguousarray(image[:, ys, :][:, :, xs][None], dtype=np.float32)
+
+
+def calibration_page(np, width, height):
+    y, x = np.indices((height, width), dtype=np.float32)
+    rng = np.random.default_rng(20261108)
+    image = np.stack((x / max(width - 1, 1), y / max(height - 1, 1),
+                      (x + y) / max(width + height - 2, 1)))
+    image = image * 0.8 + rng.random(image.shape, dtype=np.float32) * 0.2
+    lines = ((x + 2 * y) % 17 == 0) | ((x % 13 == 0) & (y > height / 3))
+    image[:, lines] = 0.05
+    dots = ((x % 5 == 0) & (y % 5 == 0) & (x > width / 2))
+    image[:, dots] = 0
+    image[:, (x < 2) | (y < 2)] = 0.9
+    return np.ascontiguousarray(image, dtype=np.float32)
+
+
+def validate_tile_seams(np, torch, model, compiled, package, args):
+    from PIL import Image
+    results = {}
+    fixtures = package.parent / "tile-fixtures"
+    fixtures.mkdir(exist_ok=False)
+    core = TILE_SIZE - OVERLAP * 2
+    cases = {"multitile": (216, 344), "odd_small": (35, 49),
+             "one_pixel": (1, 1), "one_column": (1, 19), "one_row": (31, 1)}
+    for name, (width, height) in cases.items():
+        page = calibration_page(np, width, height)
+        # Round the full reference canvas to 128: this accommodates the
+        # architectures' unshuffle/window divisibility without resizing pixels.
+        padded_width = math.ceil((width + OVERLAP * 2) / TILE_SIZE) * TILE_SIZE
+        padded_height = math.ceil((height + OVERLAP * 2) / TILE_SIZE) * TILE_SIZE
+        full_input = reflected_window(np, page, -OVERLAP, -OVERLAP, padded_width, padded_height)
+        with torch.no_grad():
+            full = model(torch.from_numpy(full_input)).detach().cpu().numpy()
+        if (full.shape != (1, 3, padded_height * SCALE, padded_width * SCALE)
+                or full.dtype != np.float32 or not np.isfinite(full).all()
+                or np.min(full) < 0 or np.max(full) > 1):
+            raise ValueError("invalid full-page reference output")
+        halo = OVERLAP * SCALE
+        reference = full[0, :, halo:halo + height * SCALE, halo:halo + width * SCALE]
+        assembled = np.empty((3, height * SCALE, width * SCALE), dtype=np.float32)
+        for x, y, tile_width, tile_height in tile_positions(width, height):
+            sample = reflected_window(np, page, x - OVERLAP, y - OVERLAP, TILE_SIZE, TILE_SIZE)
+            prediction = np.asarray(compiled.predict({"input": sample})["output"])
+            if (prediction.shape != (1, 3, TILE_SIZE * SCALE, TILE_SIZE * SCALE)
+                    or prediction.dtype != np.float32 or not np.isfinite(prediction).all()
+                    or np.min(prediction) < 0 or np.max(prediction) > 1):
+                raise ValueError("invalid Core ML tile output, including discarded halo")
+            assembled[:, y * SCALE:(y + tile_height) * SCALE, x * SCALE:(x + tile_width) * SCALE] = (
+                prediction[0, :, halo:halo + tile_height * SCALE, halo:halo + tile_width * SCALE])
+        difference = np.abs(assembled.astype(np.float64) - reference.astype(np.float64))
+        seams = np.zeros((height * SCALE, width * SCALE), dtype=bool)
+        # Inspect a 4-output-pixel band centered on every internal join.
+        for x in range(core, width, core):
+            seams[:, x * SCALE - 2:x * SCALE + 2] = True
+        for y in range(core, height, core):
+            seams[y * SCALE - 2:y * SCALE + 2, :] = True
+        seam_values, nonseam_values = difference[:, seams], difference[:, ~seams]
+        maximum, mean = float(np.max(difference)), float(np.mean(difference))
+        seam_mean = float(np.mean(seam_values)) if seam_values.size else 0.0
+        results[name] = {
+            "sourceDimensions": [width, height], "tileCount": len(tile_positions(width, height)),
+            "maxAbsoluteError": maximum, "meanAbsoluteError": mean,
+            "p99AbsoluteError": float(np.percentile(difference, 99)),
+            "seamPixelCount": int(np.count_nonzero(seams)), "seamMeanAbsoluteError": seam_mean,
+            "seamMaxAbsoluteError": float(np.max(seam_values)) if seam_values.size else None,
+            "nonseamMeanAbsoluteError": float(np.mean(nonseam_values)) if nonseam_values.size else None,
+            "passed": maximum <= args.max_tile_abs_error and mean <= args.max_tile_mean_error
+                      and seam_mean <= args.max_seam_mean_error,
+        }
+        for suffix, value in (("input", page), ("torch-full", reference), ("coreml-tiled", assembled)):
+            pixels = np.floor(value.transpose(1, 2, 0) * 255 + 0.5).astype(np.uint8)
+            Image.fromarray(pixels, "RGB").save(fixtures / f"{name}-{suffix}.png")
+        print(f"Tile fixture {name}: {results[name]}", flush=True)
+    return {"passed": all(item["passed"] for item in results.values()), "samples": results,
+            "thresholds": {"maxAbsoluteError": args.max_tile_abs_error,
+                           "maxMeanAbsoluteError": args.max_tile_mean_error,
+                           "maxSeamMeanAbsoluteError": args.max_seam_mean_error},
+            "scope": "synthetic CPU engineering evidence, not real-device or visual-quality acceptance"}
+
+
 def run_conversion(args, info, weight_data, package, report):
     import numpy as np
     import torch
@@ -373,6 +486,10 @@ def run_conversion(args, info, weight_data, package, report):
         item["passed"] for item in report["coreMLCpuVsTorch"].values())
     if not report["numericComparisonPassed"]:
         raise ValueError("Core ML CPU output exceeds the supplied numerical limits")
+    if args.validate_tiles:
+        report["tileSeamValidation"] = validate_tile_seams(np, torch, model, compiled, package, args)
+        if not report["tileSeamValidation"]["passed"]:
+            raise ValueError("full-page versus tiled output exceeds the preselected tile/seam limits")
 
 
 def main(argv=None):

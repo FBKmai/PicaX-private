@@ -100,6 +100,35 @@ class ConversionLogicTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 convert.write_json(report, {"validated": True})
 
+    def test_reflection_matches_app_for_small_and_far_coordinates(self):
+        self.assertEqual([convert.reflected(x, 3) for x in range(-5, 8)],
+                         [1, 0, 1, 2, 1, 0, 1, 2, 1, 0, 1, 2, 1])
+        self.assertTrue(all(convert.reflected(x, 1) == 0 for x in range(-100, 100)))
+        with self.assertRaises(ValueError):
+            convert.reflected(0, 0)
+
+    def test_tiles_cover_odd_edges_exactly_once(self):
+        width, height = 177, 89
+        coverage = [[0] * width for _ in range(height)]
+        tiles = convert.tile_positions(width, height)
+        self.assertEqual(len(tiles), 6)
+        self.assertIn((176, 88, 1, 1), tiles)
+        for x, y, tile_width, tile_height in tiles:
+            for row in range(y, y + tile_height):
+                for column in range(x, x + tile_width):
+                    coverage[row][column] += 1
+        self.assertTrue(all(value == 1 for row in coverage for value in row))
+        self.assertEqual(convert.tile_positions(1, 1), [(0, 0, 1, 1)])
+
+    def test_tile_validation_requires_explicit_complete_limits(self):
+        limits = ["--max-tile-abs-error", "0.05", "--max-tile-mean-error", "0.005",
+                  "--max-seam-mean-error", "0.0075"]
+        args = convert.parse_args(self.arguments("--validate-tiles", *limits))
+        self.assertTrue(args.validate_tiles)
+        for extra in (["--validate-tiles"], limits, ["--max-tile-mean-error", "0.005"]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                convert.parse_args(self.arguments(*extra))
+
     def test_output_must_not_overlap_weights(self):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temp:
             root = Path(temp)

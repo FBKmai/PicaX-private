@@ -6,7 +6,7 @@
 
 截至 2026-11-08，已通过 [Actions 工程构建 #6](https://github.com/FBKmai/PicaX-private/actions/runs/42445750760)：Xcode 27.1 / iOS 27.1 SDK，145 项 iOS 模拟器测试及 20 项 Python 工具测试通过。未签名 IPA 的提交为 `6c558161a66e7374c2e8f77d6aef92e1a19d804c`，SHA-256 为 `4a629cab5951693e89a4115551369749b3344b3767baff7488cf807f3c327cf9`；已独立核对 ZIP CRC、构建提交和 SDK。该包的资源审计仍为 `engineering-build-no-models`，不是 AI 可用版，安装前需要签名。
 
-本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；**尚未完成真实权重加载、Core ML 转换、macOS 预测、拼接或真机画质/耗时/内存验证**。新增的手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成首轮真实权重加载、Core ML 转换和 macOS CPU 预测（下文记录通过与失败的候选）；**拼接和真机画质/耗时/内存验收仍未完成**。新增的手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -47,9 +47,13 @@
 
 ## 真实转换工作流与预先确定的数值标准
 
-手动运行 `.github/workflows/validate-super-resolution.yml`，依次尝试 Manga 1200p FP32、彩色 FDAT FP32 和 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的私有 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
+首次数值运行 [42447624740](https://github.com/FBKmai/PicaX-private/actions/runs/42447624740) 已完成真实权重加载、转换及 macOS CPU 预测：Manga 1200p FP32 的三样本最大绝对误差最高为 `0.0003440976`；彩色 FDAT FP32 为 `0.00000292063`，均通过预设转换阈值。彩色 FDAT FP16 的噪声样本平均绝对误差为 `0.0023595911`，超过 `0.5/255 ≈ 0.0019607843`，因此该候选失败（整个工作流也如实失败），不修改阈值强行通过。候选包仍为 `validated: false`；首次运行未验证接缝。
+
+更新后的 `.github/workflows/validate-super-resolution.yml` 只对通过的 Manga 1200p FP32 和彩色 FDAT FP32 继续分块检查，不重新启用已拒绝的 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的私有 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
 
 在观察结果前固定工程数值阈值：FP32 最大绝对误差 `2/255`、平均绝对误差 `0.1/255`；彩色 FP16 分别为 `8/255`、`0.5/255`。这是转换误差的有限上界（相对 `[0,1]` 张量），**不是实际画质验收**。每个梯度、边线、噪声样本必须单独满足，出现非有限值或结构错误仍直接失败。不得因为某次失败而事后扩大阈值宣称通过；可改用更高计算精度候选并保留两份报告。整页/分块和真机门槛独立保留。
+
+分块测试在观察结果前另定有限上界：整页最大绝对误差 `0.05`、平均 `0.005`，每个内接缝两侧共 4 个输出像素宽区域的平均误差 `0.0075`。用合成的非均匀多块页（216×344）、奇数小页、1×1、单行及单列，比较带 reflect 外延的 PyTorch 整页与真实 Core ML 128 tile / 每侧裁 20 的拼接结果；逐个记录接缝/非接缝误差，保留输入、整页基准和拼接 PNG。这个门槛意在发现实现错误或显著上下文差异，不代表肉眼无缝或漫画画质已验收；未通过仍不得启用。
 
 ## 在 macOS 暂存转换
 
