@@ -4,7 +4,7 @@
 
 首轮只支持用户**显式前台**试处理当前页或少量页面，不做整章、后台任务或自动逐页运行；原图必须保留。本仓库**不提交这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**，因此默认的 push 构建没有模型，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。另有一个手动、仅限个人非商业使用的彩色模型打包入口：工作流从已验证的 Actions artifact 下载彩色 `.mlpackage`，核对权重/包 hash 后，仅在该次构建的独立副本中把 `validated` 置为 true；黑白模型仍不打包（许可冲突未解决）。
 
-截至 2026-11-08，最新构建为 [Actions run #42462504310](https://github.com/FBKmai/PicaX-private/actions/runs/42462504310)（commit `13d1d0813b176f864de98c8044c7fa5b201a99c8`）：Xcode 27.1 / iOS 27.1 SDK，175 项 iOS 模拟器测试及 18 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-15` 的 SHA-256 为 `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`；其资源审计仍为 `engineering-build-no-models`，不包含两个 `.mlpackage`，安装后 AI 功能仍会显示模型缺失。上一版构建 #6 的旧记录不再代表当前代码。
+截至 2026-11-08，最新含彩色模型构建为 [Actions run #42469448640](https://github.com/FBKmai/PicaX-private/actions/runs/42469448640)（commit `7aa72f9257b0`）：Xcode 27.1 / iOS 27.1 SDK，175 项 iOS 模拟器测试及 48 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-17-color` 的 SHA-256 为 `5b1f4c037ee031bfdfbc6beb4c94e5f1703b0f9492db451141c8faa85d26eb60`（30,901,756 字节），资源审计为 `validated-models-declared`；顶层包含彩色 `IllustrationJaNai_V3detail_FDAT_M_2x_float32.mlmodelc`、已批准的 descriptor 和 `SuperResolutionAttribution.txt`，不包含黑白模型。该 IPA 仍未在 iPhone Duo 真机验证，安装后 AI 功能是否可用取决于真机加载/内存表现。此前的无模型工程构建 #15（SHA `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`，审计 `engineering-build-no-models`）保留为对照；默认 push 构建仍不打包模型。
 
 本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格），但 iPhone Duo 真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物始终为未批准状态，不会自动进入 IPA 或修改原 artifact 的 `validated`。个人打包入口只在目标构建目录的副本上批准彩色模型，见“个人非商业彩色模型的打包入口”。任何对外分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
@@ -208,6 +208,8 @@ IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输
 3. 只在 `build/SuperResolutionBundle/` 的副本中写入 `validated: true`、`fullPage.validated: true` 和 `bundleApproval`（记录 run/artifact/package SHA）；原 artifact 不变；
 4. 在构建后用 `xcrun coremlc compile ... --deployment-target 16.0 --platform ios` 编译 `.mlpackage`，把 `.mlmodelc`、descriptor 和归属说明放到 `.app` 顶层；不改动 Xcode 工程，也不提高 App 的 iOS 15.2 最低版本；
 5. 运行资源审计；成功时状态为 `validated-models-declared`，IPA artifact 名称带 `-color` 后缀。
+
+2026-11-08 已实际产出 [run #42469448640](https://github.com/FBKmai/PicaX-private/actions/runs/42469448640)：artifact `PicaX-iPhoneDuo-unsigned-17-color`，IPA SHA-256 `5b1f4c037ee031bfdfbc6beb4c94e5f1703b0f9492db451141c8faa85d26eb60`，30,901,756 字节；编译后的 `.mlmodelc` 为 `MLModelType_mlProgram`、specification 7、iOS 16.0 availability、输入 `1×3×64..2048×64..2048`、输出动态、存储精度 Float32；模型文件合计 16,545,893 字节。资源审计通过，但这只是 macOS 构建/打包证据。
 
 命令行等价触发（需要本机 `gh` 已登录且有 `actions: read`）：
 
