@@ -1,3 +1,4 @@
+import CoreImage
 import CryptoKit
 import Foundation
 import ImageIO
@@ -886,7 +887,23 @@ enum JmImageScrambler {
             try Task.checkCancellation()
             throw DecodingError.cannotReorder
         }
-        return PicaXPlatformImage.picaxImage(cgImage: result)
+        // ImageIO hands back raw pixels; apply the EXIF transform exactly like
+        // the strict source path so a rotated JM page is not shown sideways.
+        guard let normalized = orientationNormalized(result, orientation: orientation) else {
+            throw DecodingError.invalidImage
+        }
+        return PicaXPlatformImage.picaxImage(cgImage: normalized)
+    }
+
+    nonisolated static func orientationNormalized(
+        _ image: CGImage, orientation: Int32
+    ) -> CGImage? {
+        guard orientation != 1 else { return image }
+        let oriented = CIImage(cgImage: image).oriented(forExifOrientation: orientation)
+        return CIContext(options: [.cacheIntermediates: false]).createCGImage(
+            oriented, from: oriented.extent, format: .RGBA8,
+            colorSpace: CGColorSpace(name: CGColorSpace.sRGB)
+        )
     }
 
     nonisolated static func reorderedDisplayImage(
