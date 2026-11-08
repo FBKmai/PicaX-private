@@ -345,7 +345,12 @@ final class SuperResolutionServiceTests: XCTestCase {
                 token.register(continuation)
                 XCTAssertNotNil(token.begin())
                 token.cancel()
-                XCTAssertThrowsError(try token.check()) { XCTAssertTrue($0 is CancellationError) }
+                do {
+                    try token.check()
+                    XCTFail("running cancellation must be observable by the worker")
+                } catch {
+                    XCTAssertTrue(error is CancellationError)
+                }
                 token.complete(.failure(SuperResolutionError.inferenceFailed))
             }
             XCTFail("cancelled running work must not return a result")
