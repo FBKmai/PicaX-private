@@ -369,7 +369,7 @@ nonisolated enum ReaderBatchRenderStore {
             throw ReaderBatchRenderError.archiveFailed
         }
         let outputURL = container.appendingPathComponent(
-            safeFileName(archiveName), isDirectory: false)
+            safeFileName(archiveName, maximumLength: 200), isDirectory: false)
         do {
             try StoredZipArchive.makeArchive(entries: [], fileEntries: entries, at: outputURL)
             return outputURL
