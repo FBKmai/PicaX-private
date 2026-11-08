@@ -101,6 +101,8 @@
 
 整页转换由 `convert.py --full-page` 执行：`torch.export` 使用动态空间轴（ESRGAN 的派生维度为 2×，FDAT 对齐要求为 16×），优先导出 `RangeDim` flexible ML Program；若 flexible 转换失败，则记录原始错误并在固定对齐尺寸集合上改用 `EnumeratedShapes` fallback。转换前先在 128×192、256×384 和示例尺寸比较 exported program 与 eager 输出，再做一次 256×384 的 CPU_ONLY Core ML 与 PyTorch 整页比较（应用同款右侧/底部补齐与裁剪）。该比较使用预先固定的 FP32 阈值：最大绝对误差 `2/255 ≈ 0.00784313725490196`、平均绝对误差 `0.1/255 ≈ 0.000392156862745098`；**不得事后放宽**。非有限值、形状/类型错误或超出阈值都使转换失败，不生成可打包的“通过”结果。
 
+FDAT 的窗口注意力在 forward 中用动态 SymInt 计算 `% window` 的补齐分支，coremltools 8.3 无法降低该 `operator.mod` 节点。整页契约要求每条边补齐到 alignment 的倍数，因此当 `alignment` 是 `PixelUnshuffle 倍数 × window`（本模型为 2×8=16）的整数倍时，这些分支对合法输入恒为空。转换器在导出前将 `check_img_size` 与 `FastSpatialWindowAttention.forward` 替换为等价的免补齐形式，并在 128×192、256×384、示例尺寸逐一比较替换前后的 eager 输出（报告字段 `exportGraphSpecialization.originalVsSpecialized`，最大误差上限 `1e-6`）；比较失败即中止转换。该替换只在转换进程内、导出前生效，不改变权重、分块路径或数值阈值；报告同时记录 `inputMultiple`、window 和对齐要求。若 alignment 不满足整除要求，转换显式失败，不导出未经验证的图。
+
 单次 256×384 冒烟不等于整页验证。独立命令按以下尺寸逐个运行：256×384、512×768、768×1152、1000×1500、999×1501。每个尺寸先生成 PyTorch eager 整页参考；每个 Core ML 预测在**独立子进程**中执行，带墙钟超时和地址空间上限（默认 1500 s / 12 GiB；0 表示不设限），记录加载/预测耗时、进程峰值 RSS、最大/平均/P99 误差、形状/类型/有限性和失败原因。一个进程 OOM 或超时不会终止其他尺寸或 compute unit 的实验。CPU_ONLY 是每个尺寸的必需数值门槛；`.all`/`.cpuAndGPU` 只在 256×384 与 1000×1500 追加采样，用于记录实际设备/后端表现。报告、输入和两侧 PNG 保留为 Actions 证据；`cpuOnly` 失败即工作流失败，GPU/ANE 的差异也不会被隐藏。
 
 手动运行示例（在 macOS、已按锁定文件安装依赖并取得已核验权重后；输出目录必须已存在且为空）：

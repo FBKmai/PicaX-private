@@ -14,6 +14,7 @@ import math
 import platform
 import re
 import sys
+import traceback
 from pathlib import Path
 
 MODULE_DIRECTORY = Path(__file__).resolve().parent
@@ -612,12 +613,14 @@ def main(argv=None):
             "thresholds": {"maxAbsoluteError": args.max_abs_error, "maxMeanAbsoluteError": args.max_mean_error},
             "torchTraceVsEager": {}, "coreMLCpuVsTorch": {},
         }
+        failure_traceback = ""
         try:
             run_conversion(args, info, data, package, report)
             report["status"] = "numeric_comparison_passed_other_gates_pending"
         except Exception as exc:
             report["status"] = "failed"
             report["error"] = f"{type(exc).__name__}: {exc}"
+            failure_traceback = traceback.format_exc()
         # A descriptor is emitted only if a saved package passed the structural
         # checks. Its validation flag remains false even when numbers pass.
         if package.is_dir() and "packageSHA256" in report:
@@ -629,6 +632,7 @@ def main(argv=None):
         print(f"Report: {report_path}")
         if report["status"] == "failed":
             print(report["error"], file=sys.stderr)
+            print(failure_traceback, file=sys.stderr)
             return 1
         print("Numerical comparison passed; descriptor remains UNVALIDATED. See the report and documentation.")
         return 0

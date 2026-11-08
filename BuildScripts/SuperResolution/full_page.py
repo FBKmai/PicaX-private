@@ -225,8 +225,13 @@ def _shape_description(ct, array):
     flexibility = array.WhichOneof("ShapeFlexibility")
     description = {"shape": list(array.shape), "flexibility": flexibility}
     if flexibility == "shapeRange":
+        # Core ML's range bounds are scalar uint64/int64 fields, unlike the
+        # repeated shape; wrapping them keeps one JSON shape for both bounds.
+        def bound(value):
+            return [int(value)]
+
         description["shapeRange"] = [
-            {"lowerBound": list(size.lowerBound), "upperBound": list(size.upperBound)}
+            {"lowerBound": bound(size.lowerBound), "upperBound": bound(size.upperBound)}
             for size in array.shapeRange.sizeRanges]
     elif flexibility == "enumeratedShapes":
         description["enumeratedShapes"] = [
@@ -283,6 +288,122 @@ def check_full_page_spec(ct, model, alignment, maximum_side, report):
     return descriptions
 
 
+def _attention_requirement(model):
+    """Describe FDAT's internal padding requirement, or None for other models."""
+    inner = getattr(model, "model", None)
+    if inner is None or not hasattr(inner, "check_img_size"):
+        return None
+    windows = sorted({int(module.ws) for module in inner.modules()
+                      if type(module).__name__ == "FastSpatialWindowAttention"})
+    if not windows:
+        return None
+    padding = int(getattr(inner, "pad", 0) or 0)
+    requirement = 1
+    for window in windows:
+        # PixelUnshuffle(padding) first divides the page, then each attention
+        # block requires a whole number of windows in the feature map.
+        requirement = math.lcm(requirement, (padding or 1) * window)
+    return {"inputMultiple": requirement, "padding": padding, "windows": windows}
+
+
+def _attention_forward_without_padding(torch):
+    """FDAT's FastSpatialWindowAttention.forward with the pad branch removed.
+
+    The branch is provably a no-op when the feature map is a whole number of
+    windows, which ``_attention_requirement`` verifies for the export contract.
+    """
+    functional = torch.nn.functional
+
+    def forward(self, x, height, width):
+        batch, length, channels = x.shape
+        x = (
+            x.view(batch, height // self.ws, self.ws, width // self.ws, self.ws, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .contiguous()
+            .view(-1, self.ws * self.ws, channels)
+        )
+        qkv = (
+            self.qkv(x)
+            .view(-1, self.ws * self.ws, 3, self.nh, channels // self.nh)
+            .permute(2, 0, 3, 1, 4)
+        )
+        query, key, value = qkv.unbind(0)
+        attention = (query * self.scale @ key.transpose(-2, -1)) + self.bias
+        x = (
+            (functional.softmax(attention, dim=-1) @ value)
+            .transpose(1, 2)
+            .reshape(-1, self.ws * self.ws, channels)
+        )
+        x = (
+            self.proj(x)
+            .view(batch, height // self.ws, width // self.ws, self.ws, self.ws, channels)
+            .permute(0, 1, 3, 2, 4, 5)
+            .contiguous()
+            .view(batch, height, width, channels)
+        )
+        return x.view(batch, length, channels)
+
+    return forward
+
+
+def specialize_aligned_export(torch, np, model, architecture, alignment, sizes):
+    """Remove FDAT's symbolic ``% window`` padding before ``torch.export``.
+
+    coremltools 8.3 cannot lower the resulting ``operator.mod`` node, and the
+    branch is unnecessary because the full-page contract pads every page to a
+    multiple of the alignment.  Both the original and specialized eager models
+    are compared at every export size so a wrong assumption fails loudly.
+    """
+    if architecture != "FDAT":
+        return None
+    structure = _attention_requirement(model)
+    if structure is None:
+        raise FullPageValidationError(
+            "FDAT export specialization did not find the pinned "
+            "FastSpatialWindowAttention modules; refusing an unverified export")
+    required = structure["inputMultiple"]
+    if alignment % required:
+        raise FullPageValidationError(
+            f"FDAT needs input dimensions divisible by {required} for a padding-free "
+            f"dynamic export, but the alignment is {alignment}")
+    import types
+
+    with torch.no_grad():
+        expected = [
+            model(seeded_input(np, torch, width, height)).detach().cpu().numpy()
+            for width, height in sizes
+        ]
+    inner = model.model
+    if hasattr(inner, "check_img_size"):
+        inner.check_img_size = types.MethodType(lambda self, x, h, w: x, inner)
+    forward = _attention_forward_without_padding(torch)
+    patched = 0
+    for module in inner.modules():
+        if type(module).__name__ == "FastSpatialWindowAttention":
+            module.forward = types.MethodType(forward, module)
+            patched += 1
+    results = {}
+    with torch.no_grad():
+        for (width, height), reference in zip(sizes, expected):
+            actual = model(
+                seeded_input(np, torch, width, height)).detach().cpu().numpy()
+            results[f"{width}x{height}"] = compare_outputs(
+                np, actual, reference, max_abs=1e-6, max_mean=1e-7)
+    if not all(item["passed"] for item in results.values()):
+        raise FullPageValidationError(
+            "removing FDAT's aligned padding branches changed its output")
+    return {
+        "architecture": architecture,
+        "reason": "FDAT computes window padding with symbolic modulo, which coremltools "
+                  "8.3 cannot lower; the full-page input contract makes the branch empty",
+        "inputMultiple": required,
+        "padding": structure["padding"],
+        "windows": structure["windows"],
+        "patchedAttentionModules": patched,
+        "originalVsSpecialized": results,
+    }
+
+
 def _export_aten(torch, model, example, dynamic_shapes):
     """Return an ATEN/EDGE ExportedProgram for coremltools 8.3.
 
@@ -309,6 +430,14 @@ def _export_aten(torch, model, example, dynamic_shapes):
     return program
 
 
+def export_example(maximum_side):
+    """The seeded export example, clamped to the configured side limit."""
+    width, height = FULL_PAGE_EXAMPLE
+    if width > maximum_side or height > maximum_side:
+        width = height = maximum_side
+    return width, height
+
+
 def export_dynamic(torch, np, model, architecture, alignment, maximum_side):
     """Export a model whose spatial axes are constrained by the alignment."""
     from torch.export import Dim
@@ -322,10 +451,7 @@ def export_dynamic(torch, np, model, architecture, alignment, maximum_side):
                         max=maximum_side // multiplier)
     width_symbol = Dim("width", min=FULL_PAGE_MINIMUM // multiplier,
                        max=maximum_side // multiplier)
-    example_width, example_height = FULL_PAGE_EXAMPLE
-    if example_width > maximum_side or example_height > maximum_side:
-        example_width = maximum_side
-        example_height = maximum_side
+    example_width, example_height = export_example(maximum_side)
     example = seeded_input(np, torch, example_width, example_height)
     program = _export_aten(torch, model, example, ({2: multiplier * height_symbol,
                                                    3: multiplier * width_symbol},))
@@ -421,6 +547,15 @@ def convert_full_page(np, torch, ct, model, architecture, args, package, package
         "shapeMode": None,
         "fallbackReason": None,
     }}
+    example = export_example(args.full_page_max_side)
+    verification_sizes = [(128, 192), (256, 384)]
+    if example not in verification_sizes:
+        verification_sizes.append(example)
+    report["fullPageConversion"].update({
+        "exportGraphSpecialization": specialize_aligned_export(
+            torch, np, model, architecture, args.full_page_alignment,
+            verification_sizes),
+    })
     program, multiplier, example, constraints = export_dynamic(
         torch, np, model, architecture, args.full_page_alignment, args.full_page_max_side)
     report["fullPageConversion"].update({
@@ -429,8 +564,7 @@ def convert_full_page(np, torch, ct, model, architecture, args, package, package
         "exampleSize": list(example),
         "exportRangeConstraints": constraints,
         "exportVsEager": verify_export(
-            torch, np, program, model,
-            [(128, 192), (256, 384), example]),
+            torch, np, program, model, verification_sizes),
     })
     converted = None
     conversion_error = None

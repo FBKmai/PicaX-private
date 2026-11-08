@@ -307,8 +307,10 @@ struct ReaderImageCompareView: View {
 
     private var resultLabel: String {
         switch mode {
-        case .original: "原图"
-        case .traditional: model.traditionalImage == nil ? "原图（传统未改变）" : "传统插值 / 锐化"
+        case .original:
+            return "原图"
+        case .traditional:
+            return model.traditionalImage == nil ? "原图（传统未改变）" : "传统插值 / 锐化"
         case .ai:
             guard let result = model.aiResult else { return "原图（AI 尚未完成）" }
             return "AI 2× · \(result.actualMode == .fullPage ? "整页" : "分块")"

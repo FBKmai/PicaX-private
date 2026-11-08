@@ -215,6 +215,46 @@ class ConversionLogicTests(unittest.TestCase):
             self.assertEqual(full_page.reflected(coordinate, 7),
                              convert.reflected(coordinate, 7))
 
+    def test_full_page_shape_description_reads_scalar_range_bounds(self):
+        class Size:
+            lowerBound = 64
+            upperBound = 2048
+
+        class ShapeRange:
+            sizeRanges = [Size(), Size(), Size(), Size()]
+
+        class Array:
+            shape = [1, 3, 64, 64]
+            shapeRange = ShapeRange()
+
+            @staticmethod
+            def WhichOneof(_name):
+                return "shapeRange"
+
+        description = full_page._shape_description(None, Array())
+        self.assertEqual(description["flexibility"], "shapeRange")
+        self.assertEqual(description["shapeRange"][0],
+                         {"lowerBound": [64], "upperBound": [2048]})
+
+    def test_fdat_attention_requirement_follows_unshuffle_and_window(self):
+        Attention = type("FastSpatialWindowAttention", (), {"ws": 8})
+
+        class Inner:
+            pad = 2
+            check_img_size = staticmethod(lambda x, h, w: x)
+
+            def modules(self):
+                return [self, Attention()]
+
+        class Model:
+            model = Inner()
+
+        self.assertEqual(full_page._attention_requirement(Model()), {
+            "inputMultiple": 16, "padding": 2, "windows": [8]})
+
+        Inner.pad = 0
+        self.assertEqual(full_page._attention_requirement(Model())["inputMultiple"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()
