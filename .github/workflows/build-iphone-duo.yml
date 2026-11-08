@@ -13,9 +13,22 @@ on:
         options:
           - "27.1"
           - "27.2"
+      bundle_color_model:
+        description: Bundle the validated color full-page model (personal noncommercial build)
+        type: boolean
+        default: false
+      model_run_id:
+        description: Validation run containing the color artifact
+        type: string
+        default: "42461503524"
+      model_artifact:
+        description: Color validation artifact name
+        type: string
+        default: "PicaX-full-page-color-unapproved-5"
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: iphone-duo-${{ github.ref }}
@@ -72,16 +85,59 @@ jobs:
           set -euo pipefail
           python -I -B BuildScripts/SuperResolution/test_convert.py
           python -I -B BuildScripts/SuperResolution/test_fetch_checkpoint.py
+          python -I -B BuildScripts/SuperResolution/test_stage_bundle_model.py
           python -I -B BuildScripts/test-super-resolution-bundle.py
+
+      - name: Stage validated color full-page model
+        if: inputs.bundle_color_model == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_RUN_ID: ${{ inputs.model_run_id }}
+          MODEL_ARTIFACT: ${{ inputs.model_artifact }}
+          MODEL_DOWNLOAD: ${{ runner.temp }}/picax-color-model
+          MODEL_STAGE: ${{ github.workspace }}/build/SuperResolutionBundle
+        run: |
+          set -euo pipefail
+          if [[ ! "$MODEL_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::model_run_id must be numeric."
+            exit 1
+          fi
+          if [[ ! "$MODEL_ARTIFACT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::model_artifact contains unsupported characters."
+            exit 1
+          fi
+          rm -rf "$MODEL_DOWNLOAD" "$MODEL_STAGE"
+          mkdir -p "$MODEL_DOWNLOAD"
+          gh run download "$MODEL_RUN_ID" --name "$MODEL_ARTIFACT" --dir "$MODEL_DOWNLOAD"
+          python -I -B BuildScripts/SuperResolution/stage_bundle_model.py \
+            --artifact-dir "$MODEL_DOWNLOAD" \
+            --output-dir "$MODEL_STAGE" \
+            --preset color \
+            --expected-weight-sha256 8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0 \
+            --expected-package-sha256 94f6697f579a45e18fd9247b59e0fe236a52506b3e20807799747438a0b75b13 \
+            --validation-run-id "$MODEL_RUN_ID" \
+            --artifact-name "$MODEL_ARTIFACT"
+          {
+            echo ""
+            echo "## Color full-page model staged"
+            echo "- Validation run: ${MODEL_RUN_ID}"
+            echo "- Artifact: ${MODEL_ARTIFACT}"
+            echo "- License: CC-BY-NC-4.0 (personal noncommercial use only)"
+            echo "- Numeric validation: macOS Core ML CPU-only at all five mandated sizes;"
+            echo "  cpuAndGPU and all at 256x384 and 1000x1500. iPhone Duo is still unverified."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run iPhone Duo tests and package unsigned IPA
         shell: bash
+        env:
+          SUPER_RESOLUTION_BUNDLE_DIR: ${{ inputs.bundle_color_model == true && format('{0}/build/SuperResolutionBundle', github.workspace) || '' }}
         run: bash BuildScripts/build-iphone-unsigned.sh
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: PicaX-iPhoneDuo-unsigned-${{ github.run_number }}
+          name: PicaX-iPhoneDuo-unsigned-${{ github.run_number }}${{ inputs.bundle_color_model == true && '-color' || '' }}
           path: |
             build/iPhoneDuo/PicaX-iPhoneDuo-unsigned.ipa
             build/iPhoneDuo/ReleaseNotes.json

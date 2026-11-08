@@ -2,11 +2,11 @@
 
 ## 当前状态和边界
 
-首轮只支持用户**显式前台**试处理当前页或少量页面，不做整章、后台任务或自动逐页运行；原图必须保留。本仓库**没有随代码提供这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**。因此未自行取得合规权重并完成转换、验证、资源集成之前，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。
+首轮只支持用户**显式前台**试处理当前页或少量页面，不做整章、后台任务或自动逐页运行；原图必须保留。本仓库**不提交这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**，因此默认的 push 构建没有模型，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。另有一个手动、仅限个人非商业使用的彩色模型打包入口：工作流从已验证的 Actions artifact 下载彩色 `.mlpackage`，核对权重/包 hash 后，仅在该次构建的独立副本中把 `validated` 置为 true；黑白模型仍不打包（许可冲突未解决）。
 
 截至 2026-11-08，最新构建为 [Actions run #42462504310](https://github.com/FBKmai/PicaX-private/actions/runs/42462504310)（commit `13d1d0813b176f864de98c8044c7fa5b201a99c8`）：Xcode 27.1 / iOS 27.1 SDK，175 项 iOS 模拟器测试及 18 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-15` 的 SHA-256 为 `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`；其资源审计仍为 `engineering-build-no-models`，不包含两个 `.mlpackage`，安装后 AI 功能仍会显示模型缺失。上一版构建 #6 的旧记录不再代表当前代码。
 
-本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格），但 iPhone Duo 真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物一律保持未批准，不会自动进入 IPA 或修改 `validated`。任何资源分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格），但 iPhone Duo 真机画质/耗时/内存验收仍未完成**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物始终为未批准状态，不会自动进入 IPA 或修改原 artifact 的 `validated`。个人打包入口只在目标构建目录的副本上批准彩色模型，见“个人非商业彩色模型的打包入口”。任何对外分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -182,6 +182,56 @@ IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输
 
 本轮实现尚未在 iPhone Duo 真机上运行。仍需在目标设备上测量实际峰值内存、各 compute unit 的耗时/稳定性、OOM 行为，并用有代表性的黑白文字、网点、彩色纹理页面做视觉对比；长条、极端比例、奇数尺寸和极小页仍需逐项确认。未获得这些证据前，不得宣称“真机整页可用”或“画质已通过”。
 
+## 个人非商业彩色模型的打包入口
+
+这一入口只面向“自己签名、自己安装、非商业使用”，不改变默认构建策略，也不表示模型已通过 iPhone Duo 验收。权重不进入 git；工作流每次从 Actions artifact 重新取得并核对。
+
+**前置条件**
+
+- 彩色模型：IllustrationJaNai V3detail FDAT M 2×，权重 SHA-256 `8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0`，package SHA-256 `94f6697f579a45e18fd9247b59e0fe236a52506b3e20807799747438a0b75b13`，来自 run [42461503524](https://github.com/FBKmai/PicaX-private/actions/runs/42461503524) 的 artifact `PicaX-full-page-color-unapproved-5`（保留 14 天；过期后需重新运行验证或改填新的 run/artifact）。
+- 许可：上游 the-database / [MangaJaNai 3.0.0](https://github.com/the-database/MangaJaNai/releases/tag/3.0.0)，[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)。只允许个人非商业使用；不得公开分发、出售或用于商业目的，不得暗示原作者背书。Core ML 转换属于修改/转换，打包的 `SuperResolutionAttribution.txt` 会记录原作者、来源、许可链接及转换/图优化改动。
+- 黑白模型不在此入口内：MangaJaNai V1 1.0.0 的 CC BY-NC-SA 4.0 与后续 CC BY-NC 4.0 冲突尚未解决。
+
+**触发方式**
+
+在 GitHub Actions 手动运行 `Build iPhone Duo unsigned IPA`，分支选 `iphone-duo-ios27`，设置：
+
+- `bundle_color_model` = true
+- `model_run_id` = `42461503524`（或包含同一 artifact 的新 run）
+- `model_artifact` = `PicaX-full-page-color-unapproved-5`
+- `xcode_version` 默认 `27.1`
+
+工作流会：
+
+1. 用 `gh run download` 下载指定 artifact；
+2. 运行 `BuildScripts/SuperResolution/stage_bundle_model.py`，核对 descriptor 的 preset/license/precision/geometry/fullPage 契约、权重 SHA 和 package SHA，拒绝已批准、嵌套或多份 descriptor，以及不匹配的包；
+3. 只在 `build/SuperResolutionBundle/` 的副本中写入 `validated: true`、`fullPage.validated: true` 和 `bundleApproval`（记录 run/artifact/package SHA）；原 artifact 不变；
+4. 在构建后用 `xcrun coremlc compile ... --deployment-target 16.0 --platform ios` 编译 `.mlpackage`，把 `.mlmodelc`、descriptor 和归属说明放到 `.app` 顶层；不改动 Xcode 工程，也不提高 App 的 iOS 15.2 最低版本；
+5. 运行资源审计；成功时状态为 `validated-models-declared`，IPA artifact 名称带 `-color` 后缀。
+
+命令行等价触发（需要本机 `gh` 已登录且有 `actions: read`）：
+
+```sh
+gh workflow run build-iphone-duo.yml --ref iphone-duo-ios27 \
+  -f bundle_color_model=true \
+  -f model_run_id=42461503524 \
+  -f model_artifact=PicaX-full-page-color-unapproved-5
+```
+
+**签名和安装**
+
+Actions 产物是**未签名 IPA**，不能直接安装。下载 artifact（例如 `PicaX-iPhoneDuo-unsigned-<run>-color`），解压得到 `PicaX-iPhoneDuo-unsigned.ipa`，再用你自己的证书/描述文件通过全能签等工具重签。免费 Apple ID 的签名通常 7 天过期，需要在设备上重新签名安装；重签后的 IPA SHA 会与未签名 artifact 不同。安装前可在 IPA 内确认以下顶层文件存在：
+
+```text
+Payload/PicaX.app/IllustrationJaNai_V3detail_FDAT_M_2x_float32.mlmodelc/
+Payload/PicaX.app/IllustrationJaNai_V3detail_FDAT_M_2x_float32.superresolution.json
+Payload/PicaX.app/SuperResolutionAttribution.txt
+```
+
+**安装后仍必须验证**
+
+进入阅读器 → 画质增强 → 本页 AI 试处理，选择彩色模型、整页模式，确认界面显示实际模型、实际模式“整页（单次推理）”、输入/输出尺寸、耗时和回退原因。若显示模型缺失，先检查 IPA 顶层资源和签名工具是否保留了 `mlmodelc`。macOS CI 的数值通过不等于 iPhone Duo 真机通过：仍需在设备上测量峰值内存、OOM、各 compute unit 的耗时和实际画质；`.all` 只是系统选择，不保证使用 Neural Engine。彩色模型的 CPU_ONLY 已在五个尺寸验证，`cpuAndGPU`/`.all` 只在 256×384 与 1000×1500 采样；真机长页和极端尺寸仍可能拒绝或失败，失败时应显示原因并保留原图。
+
 ## 在 macOS 暂存转换
 
 请先独立确认权重来源及许可；只获取实际需要的 checkpoint，不要将整个模型仓库、无关模型或读者漫画加入项目。将每个下载文件放独立空目录，安全检查归档及其中许可后只取所需文件；避免路径穿越/链接，不在下载或解压目录执行代码。使用受信任的 Python 环境，从另一个安全工作目录运行，所有输入使用绝对路径。脚本不提供不安全 pickle 回退：先将同一文件字节读入内存、核对调用者给出的 SHA 与上表锁定值及实测 SHA，再对 `.pth` 调用 `torch.load(..., weights_only=True, map_location="cpu")`；彩色使用 safetensors。PyTorch 2.6.0 修复了已知的 CVE-2025-32434，但 `weights_only` 和 safetensors 也不是运行不可信内容的完整沙箱；绝不能接受任意 hash 或关闭核验。已知 hash 来自第三方、不是作者签名，也不能替代信任及隔离。
@@ -232,7 +282,7 @@ MAX_HEIGHT=  # 操作者选择，不能为空
 1. 审核每个实际 checkpoint 的许可及来源；解决 V1 的 SA/非 SA 冲突，确认目标分发/授权，保留完整归属和变更说明。核实及记录每个权重 hash；Manga 相关的所有许可未确认前禁止打包。
 2. 在固定 macOS 工具链实际转换并核对报告：所有 eager/trace 与 CPU Core ML 比较通过预先选择的阈值；包的 hash 与报告对应。各档 range 正确、互不重叠，只有样本所需档位；在没有匹配/经过批准的范围时跳过，不从未安装的档位推断已安装模型。FP16/FP32 彩色候选应分目录比较，最终 bundle 只放一个经批准的彩色 descriptor，避免候选歧义。
 3. 完成非均匀合成整页与分块的误差/接缝比较、边角/奇数页/小页测试，以及 RGB/灰度/透明/方向/色域测试。整页路径还需在要求的每个尺寸上用 CPU_ONLY 与同一补齐输入的 PyTorch 整页结果比较，并在追加样本上记录 GPU/`.all` 的真实行为；不能仅凭 CPU 数值或输出尺寸宣称真机画质通过。
-4. 只有完成上述许可与工程核验并经人工审核、保留证据后，才能人工更新 descriptor 的确切许可和 `validated`，将模型和对应 `*.superresolution.json` 作为应用资源加入 Xcode，用于后续真机试处理。`validated` 仅声明工程和许可门槛已通过，**不等于用户已确认实际阅读画质提升**。当前描述文件仅接受确切的 `CC-BY-NC-4.0` 或 `CC-BY-NC-SA-4.0`；这只是声明检查，不独立证明实际权重授权。资源基名只使用 ASCII 字母、数字、下划线或连字符，特征名固定 `input`/`output`，来源必须是含有效主机名的 HTTPS URL。iPhone 包内的 descriptor 和对应 `.mlmodelc` 必须作为主应用顶层资源，不能仅放在嵌套文件夹或其他 bundle 内。每个模型 ID、资源名唯一，黑白闭区间不得重叠，彩色只启用一个候选；彩色通常不填高度范围，若填写也必须是完整、为正且有序的上下界。必须在 macOS 核实项目最低部署 iOS 15.2 与模型最低 iOS 16 的资源编译兼容性；必要时将经相应工具链编译的 `.mlmodelc` 作为资源集成，不能为通过构建擅自提高整个 App 的最低系统版本。该脚本不执行集成、不修改 Xcode 工程、不运行远程构建。任何步骤未通过则继续显示不可用/原图，原图不可覆盖。
+4. 只有完成上述许可与工程核验并经人工审核、保留证据后，才能人工更新 descriptor 的确切许可和 `validated`，将模型和对应 `*.superresolution.json` 作为应用资源加入 Xcode，用于后续真机试处理。`validated` 仅声明工程和许可门槛已通过，**不等于用户已确认实际阅读画质提升**。当前描述文件仅接受确切的 `CC-BY-NC-4.0` 或 `CC-BY-NC-SA-4.0`；这只是声明检查，不独立证明实际权重授权。资源基名只使用 ASCII 字母、数字、下划线或连字符，特征名固定 `input`/`output`，来源必须是含有效主机名的 HTTPS URL。iPhone 包内的 descriptor 和对应 `.mlmodelc` 必须作为主应用顶层资源，不能仅放在嵌套文件夹或其他 bundle 内。每个模型 ID、资源名唯一，黑白闭区间不得重叠，彩色只启用一个候选；彩色通常不填高度范围，若填写也必须是完整、为正且有序的上下界。必须在 macOS 核实项目最低部署 iOS 15.2 与模型最低 iOS 16 的资源编译兼容性；必要时将经相应工具链编译的 `.mlmodelc` 作为资源集成，不能为通过构建擅自提高整个 App 的最低系统版本。个人非商业彩色入口采用构建后 `xcrun coremlc` 编译并复制顶层资源的路径：`stage_bundle_model.py` 只修改该次构建的副本，不改原 artifact 或 Xcode 工程。任何步骤未通过则继续显示不可用/原图，原图不可覆盖。
 5. `BuildScripts/verify-super-resolution-bundle.py` 会在 iPhone 打包前审计已编译资源和描述契约，并将 `SuperResolutionModels.json` 随构建产物提供。没有模型时明确标记 `engineering-build-no-models`，这类 IPA 只是工程验证版，**不是已完成 AI 画质验证的交付物**。存在未验证、许可未解决、缺少编译资源或选择有歧义的描述时阻止打包。资源审计不能替代数值、真机、签名或独立许可验证。
 
 6. 有模型的试验 IPA 安装后，才进行用户真机门槛：在目标 iPhone、目标 compute unit 和代表性的黑白文字、网点、彩色纹理页面进行画质、耗时、实际峰值内存和存储验收。对比页显示的内存是图像工作预算估算，不是实测峰值，也不包括无法在此约束的全部 Core ML/系统分配；实际峰值需用 Xcode Instruments 等工具测量。用户确认收益后再进入整章队列和后台续跑阶段。
