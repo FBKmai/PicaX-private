@@ -166,7 +166,10 @@ final class ImageCacheBoundedReadTests: XCTestCase {
         for headers in [[:], ["Content-Length": "1"]] {
             let stopped = expectation(description: "oversized transfer was cancelled")
             let fixture = BoundedImageFixture(
-                chunks: Array(repeating: Data([1, 2, 3, 4]), count: 20),
+                // AsyncBytes may prefetch a Foundation-sized buffer before
+                // yielding its first byte. Use a body larger than that bounded
+                // prefetch to verify cancellation stops the remaining transfer.
+                chunks: Array(repeating: Data(repeating: 1, count: 16 * 1024), count: 20),
                 headers: headers,
                 onStop: { stopped.fulfill() }
             )

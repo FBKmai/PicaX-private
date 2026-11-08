@@ -867,7 +867,12 @@ enum JmImageScrambler {
         }
         let depth = (properties[kCGImagePropertyDepth] as? NSNumber)?.intValue ?? 8
         guard depth > 0, depth <= 16 else { throw ReaderImageDisplayError.budgetExceeded }
-        let outputWidth = min(targetPixelWidth, width)
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.int32Value ?? 1
+        let swapsAxes = (5...8).contains(orientation)
+        let rawDemand = swapsAxes
+            ? Int(ceil(Double(targetPixelWidth) * Double(width) / Double(height)))
+            : targetPixelWidth
+        let outputWidth = min(rawDemand, width)
         try ReaderImageDisplayBudget.validateJM(
             dimensions: ReaderImageDimensions(width: width, height: height),
             encodedByteCount: data.count, targetPixelWidth: outputWidth
@@ -911,8 +916,10 @@ enum JmImageScrambler {
             guard let segment = cgImage.cropping(to: CGRect(
                 x: 0, y: CGFloat(sourceY), width: CGFloat(width), height: CGFloat(currentHeight)
             )) else { return nil }
+            // CGImage crops count rows from the top; CGContext draws from
+            // the bottom. Flip the destination placement, not each segment.
             context.draw(segment, in: CGRect(
-                x: 0, y: Double(destinationY) * scale,
+                x: 0, y: Double(height - destinationY - currentHeight) * scale,
                 width: Double(targetPixelWidth), height: Double(currentHeight) * scale
             ))
             destinationY += currentHeight

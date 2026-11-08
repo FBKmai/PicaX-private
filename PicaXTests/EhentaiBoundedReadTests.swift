@@ -88,7 +88,7 @@ private nonisolated final class EhBoundedFixture: @unchecked Sendable {
         recorded.append(request)
         lock.unlock()
         switch request.url?.path {
-        case "/g/1/token/":
+        case "/g/1/token", "/g/1/token/":
             return Data((oversizedMetadata ? String(repeating: "x", count: 2048) :
                 "<a href=\"/s/image-key/1-1\">page</a>").utf8)
         case "/s/image-key/1-1":

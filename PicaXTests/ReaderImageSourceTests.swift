@@ -124,6 +124,23 @@ final class ReaderImageSourceTests: XCTestCase {
         XCTAssertEqual(smaller.height, 49)
     }
 
+    func testJMDisplayNormalizesEXIFLikeTheStrictSource() throws {
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, "public.tiff" as CFString, 1, nil))
+        CGImageDestinationAddImage(destination, stripes(width: 17, height: 103), [
+            kCGImagePropertyOrientation: 6
+        ] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        let url = try XCTUnwrap(URL(string: "https://example.invalid/photos/250000/00001.jpg"))
+        let expected = try ReaderImageSourceLoader.decode(data: data as Data, url: url)
+        let display = try XCTUnwrap(JmImageScrambler.displayImage(
+            data: data as Data, url: url, targetPixelWidth: 103
+        ).picaxCGImage)
+        XCTAssertEqual(display.width, expected.dimensions.width)
+        XCTAssertEqual(display.height, expected.dimensions.height)
+        XCTAssertEqual(rgba(display), rgba(expected.image))
+    }
+
     func testEXIFOrientationNormalizesDimensionsAndImage() throws {
         let data = NSMutableData()
         let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, "public.tiff" as CFString, 1, nil))
