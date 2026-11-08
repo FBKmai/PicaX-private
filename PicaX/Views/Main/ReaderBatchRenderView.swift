@@ -361,7 +361,7 @@ struct ReaderBatchRenderView: View {
         guard let rawValue, let mode = SuperResolutionInferenceMode(rawValue: rawValue) else {
             return rawValue ?? "未知"
         }
-        switch mode {
+        return switch mode {
         case .fullPage: "整页（单次推理）"
         case .tiled: "分块（128）"
         case .automatic: "自动"
