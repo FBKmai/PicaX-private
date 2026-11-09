@@ -100,7 +100,6 @@ def create_app(store, worker, settings):
                 continue
             state = worker.model_states.get(model.id, {})
             capability = model.capability(settings["maximum_side"], settings["maximum_pixels"])
-            capability["maximumInputPixels"] = min(capability["maximumInputPixels"], state.get("metadata", {}).get("maximumInputPixels", capability["maximumInputPixels"]))
             models.append(dict(capability, ready=bool(state.get("ready")), error=state.get("error")))
         ready = [model for model in models if model["ready"]]
         default = next((model["id"] for model in ready if "fdat-xl" in model["id"]), ready[0]["id"] if ready else None)
@@ -118,8 +117,7 @@ def create_app(store, worker, settings):
         state = worker.model_states.get(body["modelID"], {})
         if body["modelID"] not in settings["weights"] or not state.get("ready"):
             raise ProtocolError("Selected model is not configured and verified", 503)
-        maximum_pixels = min(settings["maximum_pixels"], state.get("metadata", {}).get("maximumInputPixels", settings["maximum_pixels"]))
-        return await asyncio.to_thread(store.create, owner, body, settings["maximum_side"], maximum_pixels)
+        return await asyncio.to_thread(store.create, owner, body, settings["maximum_side"], settings["maximum_pixels"])
 
     @app.get("/v1/jobs/{job_id}")
     async def status(job_id: str, request: Request):

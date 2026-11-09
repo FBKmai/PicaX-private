@@ -21,8 +21,6 @@ class Model:
     architecture: str
     scale: int
     alignment: int
-    maximum_pixels: int
-    working_bytes_per_pixel: int
 
     @property
     def delivery_scales(self):
@@ -33,29 +31,31 @@ class Model:
                 "nativeScale": self.scale, "deliveryScales": list(self.delivery_scales),
                 "alignment": self.alignment, "minimumSide": 64,
                 "maximumSide": maximum_side,
-                "maximumInputPixels": min(maximum_pixels, self.maximum_pixels),
+                # Wire compatibility: this is the configured decoder limit,
+                # never a model-specific ceiling or a prediction of free VRAM.
+                "maximumInputPixels": maximum_pixels,
                 "precision": "float32", "mode": "fullPage", "license": LICENSE,
                 "sourceURL": SOURCE}
 
 
-# Limits are conservative configuration ceilings, NOT measured GPU guarantees.
+# Architecture/identity only. Do not invent per-model input or VRAM ceilings.
 MODELS = (
     Model("illustrationjanai-v3detail-hat-l-4x-float32", "HAT-L · 细节优先",
           "4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.safetensors",
           "38c00c9ff871ae292617ae1127edc150f81c4e0f8f98685e48ff9c9cd87fba3b",
-          "HAT", 4, 64, 1_048_576, 40960),
+          "HAT", 4, 64),
     Model("illustrationjanai-v3denoise-dat2-4x-float32", "DAT2 · 去噪",
           "4x_IllustrationJaNai_V3denoise_DAT2_27k_bf16.safetensors",
           "430d5e58053be88d250b6ee2c1016a19f919baafb9b6bda0f45c14b54453fb12",
-          "DAT", 4, 64, 2_097_152, 32768),
+          "DAT", 4, 64),
     Model("illustrationjanai-v3detail-fdat-xl-4x-float32", "FDAT-XL · 均衡",
           "4x_IllustrationJaNai_V3detail_FDAT_XL_27k_bf16.safetensors",
           "fbafec1f5a126c251de8a21e177e5a710ba2e75c7fd88fe989eb8df0508790c9",
-          "FDAT", 4, 16, 4_000_000, 10240),
+          "FDAT", 4, 16),
     Model("illustrationjanai-v3detail-fdat-m-2x-float32", "FDAT-M · 快速 2×",
           "2x_IllustrationJaNai_V3detail_FDAT_M_unshuffle_40k_fp16.safetensors",
           "8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0",
-          "FDAT", 2, 16, 8_000_000, 2048),
+          "FDAT", 2, 16),
 )
 BY_ID = {model.id: model for model in MODELS}
 

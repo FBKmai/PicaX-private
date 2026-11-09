@@ -5,8 +5,7 @@ from pathlib import Path
 
 from .models import LICENSE, SOURCE, get_model
 from .protocol import (MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS, MAX_PIXELS,
-                       MAX_NATIVE_PIXELS, ProtocolError, digest_file, padded_dimensions,
-                       png_dimensions, validate_result)
+                       ProtocolError, digest_file, padded_dimensions, png_dimensions, validate_result)
 
 
 def trusted_tooling():
@@ -73,14 +72,10 @@ class Predictor:
         else:
             raise RuntimeError("Unsupported device")
         self.model = detected.model.float().eval().to(device)
-        maximum_pixels = min(settings["maximum_pixels"], model.maximum_pixels)
-        if device == "cuda":
-            free, _ = torch.cuda.mem_get_info()
-            maximum_pixels = min(maximum_pixels, (int(free * 0.8) - 256 * 1024**2) // (model.working_bytes_per_pixel + model.scale**2 * 16))
-            if maximum_pixels < 4096:
-                raise RuntimeError("Insufficient free VRAM even for the minimum input")
         self.metadata = {
-            "maximumInputPixels": maximum_pixels,
+            # Decoder/transport capacity only; do not turn a startup free-VRAM
+            # estimate into an input veto on the phone or the server.
+            "maximumInputPixels": min(settings["maximum_pixels"], MAX_PIXELS),
             "modelID": model.id, "modelSHA256": model.sha256, "nativeScale": model.scale,
             "engine": "PyTorch", "device": device, "deviceName": name,
             "precision": "float32", "torchVersion": str(torch.__version__),
@@ -100,20 +95,12 @@ class Predictor:
         if digest_file(source) != page["sha256"]:
             raise RuntimeError("Stored input hash changed")
         pw, ph = padded_dimensions(width, height, model.alignment)
-        if max(pw, ph) > self.settings["maximum_side"] or pw * ph > min(model.maximum_pixels, self.settings["maximum_pixels"]) or pw * ph * native**2 > MAX_NATIVE_PIXELS:
-            raise RuntimeError("Aligned page exceeds declared server capability")
+        if max(pw, ph) > self.settings["maximum_side"] or width * height > min(MAX_PIXELS, self.settings["maximum_pixels"]):
+            raise RuntimeError("Page exceeds the configured input decoder limit")
         if width * height * scale**2 > MAX_OUTPUT_PIXELS:
-            raise RuntimeError("Delivered image exceeds pixel budget")
+            raise RuntimeError("Delivered image exceeds the phone's receive limits")
         if self.settings["device"] == "cuda":
-            free, _ = torch.cuda.mem_get_info()
-            # Unused allocator cache is reusable by this worker. Counting only
-            # driver-free VRAM would reject a second page after the first page
-            # populated PyTorch's cache, despite an identical working set.
-            free += max(0, torch.cuda.memory_reserved() - torch.cuda.memory_allocated())
-            # Planning guard, not a measured peak. OOM is handled separately.
-            estimate = pw * ph * model.working_bytes_per_pixel + width * height * native**2 * 16 + 256 * 1024**2
-            if estimate > free * 0.8:
-                raise RuntimeError("Page exceeds the conservative free-VRAM budget; choose another model explicitly")
+            # Attempt the actual single-page inference; no predicted VRAM veto.
             torch.cuda.reset_peak_memory_stats()
         with Image.open(source) as image:
             if image.mode == "RGBA":
@@ -168,7 +155,15 @@ def worker_main(connection, settings):
             metadata = predictor.predict(Path(work["source"]), Path(work["destination"]), work["page"], work["spec"])
             connection.send({"result": metadata})
         except Exception as error:
-            connection.send({"error": type(error).__name__ + ": " + str(error)[:768]})
+            if settings["device"] == "cuda" and isinstance(error, predictor.torch.cuda.OutOfMemoryError):
+                page = work["page"]
+                message = (f"CUDA 显存实际不足：{predictor.descriptor.name} 处理单页 "
+                           f"{page['width']}×{page['height']}，原生 {predictor.descriptor.scale}×、FP32。"
+                           "这是实际推理分配失败，不是输入像素预估拦截；未缩图、未分块、未换模型。"
+                           f" {str(error)[:256]}")
+            else:
+                message = type(error).__name__ + ": " + str(error)[:768]
+            connection.send({"error": message})
             if settings["device"] == "cuda":
                 connection.close()
                 return

@@ -1,6 +1,6 @@
 """Stdlib-only tests. No Torch, Pillow, network or GPU imports are required."""
 import copy
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import hashlib
 import io
 import json
@@ -11,7 +11,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 import uuid
 import zlib
 
@@ -86,11 +86,37 @@ class ProtocolTests(unittest.TestCase):
         body = spec(); body["pages"][0].update(id="e0002-p0000", chapterIndex=2)
         with self.assertRaises(ProtocolError): validate_spec(body)
 
-    def test_output_budget_and_alignment_checked(self):
+    def test_delivery_and_input_decoder_limits_are_separate(self):
         body = spec(MODELS[-2], 4); body["pages"][0].update(width=1500, height=1500)
-        with self.assertRaises(ProtocolError): validate_spec(body)
+        with self.assertRaises(ProtocolError) as error: validate_spec(body)
+        self.assertEqual(error.exception.status, 413)
+        self.assertIn("phone's receive limits", str(error.exception))
         body = spec(); body["pages"][0].update(width=65, height=64)
-        with self.assertRaises(ProtocolError): validate_spec(body, maximum_pixels=4096)
+        with self.assertRaises(ProtocolError) as error: validate_spec(body, maximum_pixels=4096)
+        self.assertIn("input decoder limit", str(error.exception))
+
+    def test_all_models_accept_large_pages_without_model_or_native_pixel_ceiling(self):
+        # Manifest-only checks; no large image buffers or model loading.
+        for model in MODELS:
+            for width, height in ((1280, 1864), (2000, 3000), (2000, 4000)):
+                with self.subTest(model=model.id, size=(width, height)):
+                    body = spec(model); body["pages"][0].update(width=width, height=height)
+                    self.assertIs(validate_spec(body, maximum_side=4096), body)
+                    self.assertEqual(model.capability(4096, 8_000_000)["maximumInputPixels"], 8_000_000)
+
+    def test_input_decoder_limit_counts_original_not_aligned_pixels(self):
+        for model in MODELS:
+            with self.subTest(model=model.id):
+                body = spec(model); body["pages"][0].update(width=65, height=63)
+                self.assertIs(validate_spec(body, maximum_pixels=4096), body)
+                body["pages"][0].update(width=2001, height=4000)
+                with self.assertRaises(ProtocolError) as error: validate_spec(body)
+                self.assertIn("input decoder limit", str(error.exception))
+
+    def test_configured_alignment_side_limit_is_still_enforced(self):
+        body = spec(MODELS[0]); body["pages"][0].update(width=100, height=64)
+        with self.assertRaises(ProtocolError) as error: validate_spec(body, maximum_side=100)
+        self.assertIn("configured side limit", str(error.exception))
 
     def test_identity_result_dimensions_and_provenance(self):
         body = spec()
@@ -128,11 +154,13 @@ class ProtocolTests(unittest.TestCase):
 
 
 class StartupTests(unittest.TestCase):
-    def test_cli_starts_plain_http_and_accepts_old_launcher_flag(self):
+    def test_cli_starts_plain_http_with_legacy_flag_and_disk_quotas(self):
         from picax_lan.cli import main
         from picax_lan import worker as worker_module
-        for old_flags in ([], ["--pair"]):
-            with self.subTest(old_flags=old_flags), tempfile.TemporaryDirectory() as directory:
+        cases = (([], 8, 16), (["--pair"], 8, 16),
+                 (["--job-quota-gib", "32", "--total-quota-gib", "64"], 32, 64))
+        for flags, job_gib, total_gib in cases:
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root / MODELS[-2].file).touch()  # Worker is mocked; no checkpoint is loaded.
                 worker = SimpleNamespace(thread=SimpleNamespace(ident=None), start=Mock())
@@ -140,9 +168,12 @@ class StartupTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.dict(sys.modules, {"uvicorn": SimpleNamespace(run=run), "qrcode": SimpleNamespace(QRCode=Mock())}), \
                      patch.object(worker_module, "Worker", return_value=worker), \
+                     patch("picax_lan.cli.JobStore", wraps=JobStore) as store_factory, \
                      patch("picax_lan.server.create_app", return_value="http-app"), redirect_stdout(output):
                     main(["--host", "192.168.5.8", "--weights-dir", str(root), "--data-dir", str(root / "data"),
-                          "--no-discovery", "--accept-noncommercial-license"] + old_flags)
+                          "--no-discovery", "--accept-noncommercial-license"] + flags)
+                self.assertEqual(store_factory.call_args.kwargs,
+                                 {"job_quota": job_gib * 1024**3, "total_quota": total_gib * 1024**3})
                 worker.start.assert_called_once()
                 run.assert_called_once()
                 self.assertEqual(run.call_args.args, ("http-app",))
@@ -150,6 +181,123 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("http://192.168.5.8:18443", output.getvalue())
                 self.assertNotIn("pairingSecret", output.getvalue())
                 self.assertFalse((root / "data" / "identity").exists())
+
+    def test_invalid_disk_quotas_rejected_before_storage_is_opened(self):
+        from picax_lan.cli import main
+        for job_gib, total_gib in (("0", "16"), ("-1", "16"), ("17", "16"), ("8", "0"), ("1.5", "16")):
+            with self.subTest(job=job_gib, total=total_gib), \
+                 patch("picax_lan.cli.JobStore") as store_factory, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    main(["--cleanup", "--job-quota-gib", job_gib, "--total-quota-gib", total_gib])
+                self.assertEqual(error.exception.code, 2)
+                store_factory.assert_not_called()
+
+
+class InferenceContractTests(unittest.TestCase):
+    """Mock only the inference boundary; never import Torch, NumPy or Pillow."""
+
+    class CUDAOutOfMemoryError(RuntimeError):
+        pass
+
+    def test_startup_does_not_derive_input_limit_from_free_vram(self):
+        from picax_lan.inference import Predictor
+        for model in MODELS:
+            with self.subTest(model=model.id):
+                torch = MagicMock()
+                torch.__version__ = "test-only"
+                torch.version.cuda = "test-only"
+                torch.cuda.is_available.return_value = True
+                torch.cuda.get_device_capability.return_value = (8, 0)
+                torch.cuda.get_device_name.return_value = "Mock GPU; no model loaded"
+                torch.cuda.mem_get_info.side_effect = AssertionError("No startup VRAM estimate allowed")
+                descriptor_type = type("TestDescriptor", (SimpleNamespace,), {})
+                detected = descriptor_type(architecture=SimpleNamespace(id=model.architecture), scale=model.scale,
+                    input_channels=3, output_channels=3, model=MagicMock(),
+                    size_requirements=SimpleNamespace(square=False, check=Mock(return_value=True), multiple_of=model.alignment))
+                loader = SimpleNamespace(load_from_state_dict=Mock(return_value=detected))
+                safetensors = SimpleNamespace(load=Mock(return_value={}))
+                modules = {"numpy": SimpleNamespace(), "torch": torch,
+                           "safetensors": SimpleNamespace(torch=safetensors), "safetensors.torch": safetensors,
+                           "spandrel": SimpleNamespace(ImageModelDescriptor=descriptor_type, ModelLoader=Mock(return_value=loader),
+                                                       canonicalize_state_dict=lambda value: value)}
+                settings = {"model_id": model.id, "device": "cuda", "noncommercial": True,
+                            "weights": {model.id: "not-a-real-checkpoint"}, "maximum_pixels": 8_000_000}
+                contract = SimpleNamespace(checked_weight_bytes=Mock(return_value=b"test-only"))
+                with patch.dict(sys.modules, modules), \
+                     patch("picax_lan.inference.trusted_tooling", return_value=(contract, SimpleNamespace())):
+                    predictor = Predictor(settings)
+                self.assertEqual(predictor.metadata["maximumInputPixels"], 8_000_000)
+                self.assertEqual(predictor.metadata["precision"], "float32")
+                detected.model.float.assert_called_once_with()
+                torch.cuda.mem_get_info.assert_not_called()
+
+    def test_large_page_reaches_actual_model_without_vram_estimate(self):
+        from picax_lan.inference import Predictor
+        for model in MODELS:
+            with self.subTest(model=model.id):
+                body = spec(model); page = body["pages"][0]
+                page.update(width=2000, height=3000)
+                predictor = Predictor.__new__(Predictor)
+                predictor.descriptor = model
+                predictor.settings = {"device": "cuda", "maximum_side": 4096, "maximum_pixels": 8_000_000}
+                predictor.np, predictor.torch = MagicMock(), MagicMock()
+                predictor.torch.inference_mode.side_effect = nullcontext
+                predictor.torch.cuda.mem_get_info.side_effect = AssertionError("No per-page VRAM estimate allowed")
+                predictor.full_page = SimpleNamespace(pad_reflect=MagicMock())
+                predictor.model = Mock(side_effect=self.CUDAOutOfMemoryError("simulated allocation failure"))
+                image = MagicMock()
+                image.open.return_value.__enter__.return_value.mode = "RGB"
+                source, destination = Path("no-source-file.png"), Path("no-result-file.part")
+                with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}), \
+                     patch("picax_lan.inference.validate_png"), \
+                     patch("picax_lan.inference.digest_file", return_value=page["sha256"]):
+                    with self.assertRaises(self.CUDAOutOfMemoryError):
+                        predictor.predict(source, destination, page, body)
+                predictor.model.assert_called_once_with(predictor.torch.from_numpy.return_value.to.return_value)
+                predictor.torch.cuda.reset_peak_memory_stats.assert_called_once_with()
+                predictor.torch.cuda.mem_get_info.assert_not_called()
+                predictor.torch.cuda.memory_reserved.assert_not_called()
+                pw, ph = padded_dimensions(page["width"], page["height"], model.alignment)
+                self.assertEqual(predictor.full_page.pad_reflect.call_args.args[2:], (2000, 3000, pw, ph))
+
+    def test_cuda_allocation_failure_is_reported_as_actual_single_page_oom(self):
+        from picax_lan.inference import worker_main
+        for failure in (self.CUDAOutOfMemoryError("test allocation failure"), RuntimeError("test invalid output")):
+            with self.subTest(error=type(failure).__name__):
+                body = spec(MODELS[0]); page = body["pages"][0]
+                page.update(width=1280, height=1864)
+                predictor = SimpleNamespace(metadata={"test": True}, descriptor=MODELS[0],
+                    torch=SimpleNamespace(cuda=SimpleNamespace(OutOfMemoryError=self.CUDAOutOfMemoryError)),
+                    predict=Mock(side_effect=failure))
+                connection = Mock()
+                connection.recv.return_value = {"source": "source.png", "destination": "result.part", "page": page, "spec": body}
+                with patch("picax_lan.inference.Predictor", return_value=predictor):
+                    worker_main(connection, {"device": "cuda"})
+                self.assertEqual(connection.send.call_args_list[0].args[0], {"ready": True, "metadata": predictor.metadata})
+                error = connection.send.call_args_list[1].args[0]["error"]
+                if isinstance(failure, self.CUDAOutOfMemoryError):
+                    for fragment in ("显存实际不足", "1280×1864", "原生 4×", "FP32", "不是输入像素预估拦截", "未缩图、未分块、未换模型"):
+                        self.assertIn(fragment, error)
+                else:
+                    self.assertEqual(error, "RuntimeError: test invalid output")
+                connection.close.assert_called_once_with()
+                connection.recv.assert_called_once_with()
+
+    def test_worker_process_handles_each_page_in_separate_predict_call(self):
+        from picax_lan.inference import worker_main
+        body = spec(pages=2)
+        work = [{"source": f"source-{index}.png", "destination": f"result-{index}.part", "page": page, "spec": body}
+                for index, page in enumerate(body["pages"])]
+        predictor = SimpleNamespace(metadata={"test": True}, predict=Mock(side_effect=[{"page": 0}, {"page": 1}]))
+        connection = Mock()
+        connection.recv.side_effect = [*work, None]
+        with patch("picax_lan.inference.Predictor", return_value=predictor):
+            worker_main(connection, {"device": "cuda"})
+        self.assertEqual([entry.args for entry in predictor.predict.call_args_list],
+                         [(Path(item["source"]), Path(item["destination"]), item["page"], body) for item in work])
+        self.assertEqual([entry.args[0] for entry in connection.send.call_args_list[1:]],
+                         [{"result": {"page": 0}}, {"result": {"page": 1}}])
+        connection.close.assert_called_once_with()
 
 
 class StorageTests(unittest.TestCase):
@@ -238,9 +386,69 @@ class StorageTests(unittest.TestCase):
 
     def test_quota_rejection_and_traversal(self):
         self.store.job_quota = 1
-        with self.assertRaises(ProtocolError): self.store.create(self.owner, spec(), 8192, 8_000_000)
+        candidate = spec()
+        with self.assertRaises(ProtocolError) as error:
+            self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertEqual(error.exception.status, 507)
+        self.assertIn("单任务磁盘配额不足", str(error.exception))
+        self.assertIn("--job-quota-gib", str(error.exception))
+        self.assertIn("清理旧任务不会解除单任务上限", str(error.exception))
+        self.assertFalse(self.store.directory(candidate["jobID"]).exists())
         for page in ("../../oops", "e0000-p0000/../../oops"):
             with self.assertRaises(ProtocolError): self.store.path(self.body["jobID"], page, "source.png")
+
+    def test_total_quota_rejection_is_distinct_from_single_task_limit(self):
+        reserved = self.store.db.execute("SELECT reserved FROM jobs WHERE id=?", (self.body["jobID"],)).fetchone()[0]
+        self.store.job_quota = reserved
+        self.store.total_quota = reserved * 2 - 1
+        candidate = spec()
+        with self.assertRaises(ProtocolError) as error:
+            self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertEqual(error.exception.status, 507)
+        self.assertIn("任务总磁盘配额不足", str(error.exception))
+        self.assertIn("已有任务预留", str(error.exception))
+        self.assertIn("--total-quota-gib", str(error.exception))
+        self.assertFalse(self.store.directory(candidate["jobID"]).exists())
+
+    def test_disk_space_rejection_is_distinct_from_configured_quota(self):
+        reserved = self.store.db.execute("SELECT reserved FROM jobs WHERE id=?", (self.body["jobID"],)).fetchone()[0]
+        candidate = spec()
+        with patch("picax_lan.jobs.shutil.disk_usage", return_value=SimpleNamespace(free=reserved + 128 * 1024**2 - 1)):
+            with self.assertRaises(ProtocolError) as error:
+                self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertEqual(error.exception.status, 507)
+        self.assertIn("实际剩余空间不足", str(error.exception))
+        self.assertIn("提高任务配额不能解决", str(error.exception))
+        self.assertFalse(self.store.directory(candidate["jobID"]).exists())
+
+    def test_larger_quota_accepts_large_manifest_without_bypassing_real_disk_check(self):
+        # Manifest only: never allocate large images, weights or disk files.
+        candidate = spec(pages=256)
+        for page in candidate["pages"]:
+            page.update(width=1280, height=1864, bytes=3_000_000)
+        with self.assertRaises(ProtocolError) as error:
+            self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertIn("单任务磁盘配额不足", str(error.exception))
+        self.store.job_quota = 32 * 1024**3
+        self.store.total_quota = 64 * 1024**3
+        with patch("picax_lan.jobs.shutil.disk_usage", return_value=SimpleNamespace(free=1024**3)):
+            with self.assertRaises(ProtocolError) as error:
+                self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertIn("实际剩余空间不足", str(error.exception))
+        with patch("picax_lan.jobs.shutil.disk_usage", return_value=SimpleNamespace(free=64 * 1024**3)):
+            status = self.store.create(self.owner, candidate, 8192, 8_000_000)
+        self.assertEqual(status["state"], "uploading")
+        self.assertEqual(len(status["pages"]), 256)
+        self.assertEqual(list(self.store.directory(candidate["jobID"]).iterdir()), [])
+
+    def test_quota_boundaries_and_idempotent_recovery(self):
+        reserved = self.store.db.execute("SELECT reserved FROM jobs WHERE id=?", (self.body["jobID"],)).fetchone()[0]
+        self.store.job_quota = reserved
+        self.store.total_quota = reserved * 2
+        candidate = spec()
+        self.assertEqual(self.store.create(self.owner, candidate, 8192, 8_000_000)["state"], "uploading")
+        self.store.job_quota = self.store.total_quota = 1
+        self.assertEqual(self.store.create(self.owner, candidate, 8192, 8_000_000)["state"], "uploading")
 
     def test_http_connection_url_needs_no_identity_or_secret(self):
         self.assertEqual(connection_url("192.168.5.8", 18443), "http://192.168.5.8:18443")

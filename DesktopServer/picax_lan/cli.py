@@ -23,6 +23,10 @@ def main(argv=None):
     parser.add_argument("--maximum-pixels", type=int, default=MAX_PIXELS)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--retention-hours", type=int, default=24)
+    parser.add_argument("--job-quota-gib", type=int, default=8,
+                        help="Maximum estimated disk reservation per task in GiB (default: 8)")
+    parser.add_argument("--total-quota-gib", type=int, default=16,
+                        help="Maximum estimated disk reservation for all retained tasks in GiB (default: 16)")
     # Accept existing launchers, but there is no longer a pairing mode.
     parser.add_argument("--pair", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--accept-noncommercial-license", action="store_true")
@@ -32,6 +36,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not 1 <= args.retention_hours <= 720:
         parser.error("retention must be 1..720 hours")
+    if not 1 <= args.job_quota_gib <= args.total_quota_gib:
+        parser.error("disk quotas must be positive GiB values, with job quota <= total quota")
     if args.cleanup:
         store = JobStore(args.data_dir)
         try:
@@ -56,7 +62,8 @@ def main(argv=None):
     from .server import create_app
     from .worker import Worker
     import uvicorn
-    store = JobStore(args.data_dir)
+    store = JobStore(args.data_dir, job_quota=args.job_quota_gib * 1024**3,
+                     total_quota=args.total_quota_gib * 1024**3)
     worker = Worker(store, settings)
     advertisement = None
     try:
@@ -66,6 +73,7 @@ def main(argv=None):
         print("PicaX LAN: enter this address in the phone app, or scan the QR:")
         print(address)
         print("No pairing code, password or certificate. Trusted LAN only; do not expose this port to the Internet.")
+        print(f"Estimated disk reservation limits: {args.job_quota_gib} GiB per task, {args.total_quota_gib} GiB total; actual free disk space is checked separately.")
         import qrcode
         qr = qrcode.QRCode(border=2)
         qr.add_data(address)

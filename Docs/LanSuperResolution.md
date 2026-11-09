@@ -17,6 +17,7 @@
 - Python 3.11.18：`D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\python`
 - 项目环境：`DesktopServer\.venv`
 - 权重：`D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights`
+- 本机任务数据库、上传原图和超分结果：`D:\折腾\picax\pic`。本机启动文件显式传入该路径，不再使用 C 盘默认数据目录。
 - PyTorch `2.11.0+cu128`、CUDA 12.8、Spandrel 0.4.2。
 - GPU：RTX 5090 D v2，24455 MiB；驱动 616.64。
 - 本机局域网地址：`192.168.5.8`（变化后修改启动地址，并在手机输入新地址即可；不用重新生成证书）。
@@ -32,7 +33,7 @@ D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\launchers\start-picax-server.cmd
 也可在仓库目录的 Windows 终端执行：
 
 ```bat
-DesktopServer\start-server.cmd --host 192.168.5.8 --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --diagnostics --accept-noncommercial-license
+DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pic" --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --job-quota-gib 32 --total-quota-gib 64 --diagnostics --accept-noncommercial-license
 ```
 
 若 Windows 弹出网络访问询问，仅允许你信任的**专用网络**。程序不会自动修改防火墙、开启公网端口、UPnP 或端口转发。手机和电脑须能互相访问同一局域网；访客 Wi-Fi/AP 隔离可能阻止连接。
@@ -42,13 +43,13 @@ DesktopServer\start-server.cmd --host 192.168.5.8 --weights-dir "D:\折腾\picax
 | CLI 名称 | 模型 | 原生倍率 | 可选回传 | 定位 |
 |---|---|---:|---|---|
 | `fdat-xl` | IllustrationJaNai V3detail FDAT-XL | 4× | 2× / 4× | 默认，已实测普通漫画页尺寸 |
-| `hat-l` | IllustrationJaNai V3detail HAT-L | 4× | 2× / 4× | 高显存细节档，较大整页可能被预算拒绝 |
+| `hat-l` | IllustrationJaNai V3detail HAT-L | 4× | 2× / 4× | 高显存细节档；单页实际显存不足时明确报错 |
 | `fdat-m` | IllustrationJaNai V3detail FDAT-M unshuffle | 2× | 2× | 快速档、手机模型对照基线 |
 | `dat2` | IllustrationJaNai V3denoise DAT2 | 4× | 2× / 4× | 允许列表候选；本机未下载/验证，不会显示为已就绪 |
 
 默认回传 **2×**。4× 模型回传 2× 时，先运行真实原生 4× AI，再用 Lanczos 缩小到 2×；并非普通放大代替 AI。FP16/BF16 是部分上游**存储**格式，当前推理统一 FP32，关闭 TF32；未默认启用半精度或编译优化。
 
-首版只开放**整页推理**。不自动退回之前存在上下文/接缝问题的 128 像素分块，不缩小原图来规避预算，也不保证所有页面能处理。模型越重不意味着文字、网点或线条一定更忠实。请用自己的少量页面确认画质。
+只开放**逐页整图推理**，每次模型调用处理一页，不把整本漫画拼成一张图。不自动退回之前存在上下文/接缝问题的 128 像素分块，不缩小原图或更换模型，也不保证所有页面能处理。手机不按模型专属输入像素数、对齐后像素数或启动时显存估算拦截输入；只检查回传图片的接收范围和上传文件大小，电脑另检查输入解码/传输限制。模型越重不意味着文字、网点或线条一定更忠实。请用自己的少量页面确认画质。
 
 ### 权重与来源
 
@@ -92,7 +93,7 @@ D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-first\report.json
 D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-https\report.json
 ```
 
-显存预算已按本机测量上调：HAT-L 不能按轻量模型估计。启动时按剩余显存进一步限制手机可见的像素上限，每页推理前再次检查；分配失败/超时会终止并重启 worker，失败信息不会伪装成功。
+这些历史实测不是输入尺寸硬上限。本次已移除模型专属像素上限、原生中间结果像素上限，以及启动时/每页执行前的显存估算拒绝。能力字段 `maximumInputPixels` 仅表示配置的输入解码上限，不代表显存预测或成功保证；手机也不依据旧任务缓存中的该字段拒绝页面。实际 CUDA 分配失败时，错误会明确说明模型、单页尺寸、原生倍率和 FP32，并区分“实际显存不足”与输入解码/回传限制；worker 会被终止，后续页重新加载，不会缩图、分块或换模型。本次只做轻量回归，未重新实测大图 GPU 推理。
 
 ## 新机器安装
 
@@ -122,10 +123,10 @@ DesktopServer\.venv\Scripts\python.exe -I -m pip install -r DesktopServer\requir
 - 同一电脑换 IP 时修改电脑启动参数，再在手机输入新地址即可继续原任务。电脑 ID 仅用于防止把旧任务错误地发给另一台电脑，不作证书认证。
 - 明确取消需要电脑确认；电脑丢失/任务过期时可放弃本机跟踪，不删除已收取页。
 
-默认数据目录为 `%LOCALAPPDATA%\PicaX-LAN`。旧版 `identity` 和客户端令牌记录不再被读取，不必删除或重建。闲置任务默认保留 24 小时，`--retention-hours 168` 可延长到一周；启动时会清理过期任务。手动清理前先停止服务：
+通用 CLI 默认数据目录仍为 `%LOCALAPPDATA%\PicaX-LAN`；**这台电脑已经迁移到 `D:\折腾\picax\pic`，须使用上面的双击启动文件或显式传入 `--data-dir`，否则会打开另一套空库**。旧版 `identity` 和客户端令牌记录不再被读取，不必删除或重建。闲置任务默认保留 24 小时，`--retention-hours 168` 可延长到一周；启动时会清理过期任务。以下手动清理会删除该目录内过期任务及其图片，只在确认需要清理并停止服务后运行：
 
 ```bat
-DesktopServer\start-server.cmd --cleanup --retention-hours 24
+DesktopServer\start-server.cmd --data-dir "D:\折腾\picax\pic" --cleanup --retention-hours 24
 ```
 
 ## 协议概览（v1）
@@ -133,7 +134,7 @@ DesktopServer\start-server.cmd --cleanup --retention-hours 24
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/` | 无需认证的服务状态页，供手机浏览器排查连接 |
-| GET | `/v1/capabilities` | 已配置/校验模型、预算、默认回传倍率 |
+| GET | `/v1/capabilities` | 已配置/校验模型、解码/传输限制、默认回传倍率 |
 | POST | `/v1/jobs` | 幂等创建完整任务清单 |
 | PUT | `/v1/jobs/{id}/pages/{page}` | 逐页规范化 RGB PNG |
 | POST | `/v1/jobs/{id}/commit` | 输入完整后入队 |
@@ -143,7 +144,15 @@ DesktopServer\start-server.cmd --cleanup --retention-hours 24
 | POST | `/v1/jobs/{id}/retry` | 仅重试失败页 |
 | POST | `/v1/jobs/{id}/cancel` | 明确取消 |
 
-任务 UUID、固定 `e0000-p0000` 页 ID、紧凑章节/连续页索引，不能传任意文件路径。清单最多 2 MiB/4096 页，输入 PNG 64 MiB/800 万像素，输出 128 MiB/3200 万像素/单边 16384；还需满足模型对齐、原生输出和显存上限。默认单任务磁盘配额 8 GiB、总配额 16 GiB、最多 8 个活跃任务。每个查询/收取/操作均校验任务归属。
+任务 UUID、固定 `e0000-p0000` 页 ID、紧凑章节/连续页索引，不能传任意文件路径。清单最多 2 MiB/4096 页，输入 PNG 64 MiB/800 万原始像素，输入单边默认 4096（可通过 `--maximum-side` 配置至 8192，包含模型对齐后边长）；输出 128 MiB/3200 万像素/单边 16384。模型对齐只用于整页边缘填充与裁切，不额外限制原生中间结果像素或预估显存。最多 8 个活跃任务。每个查询/收取/操作均校验任务归属。
+
+### 磁盘配额与 HTTP 507
+
+- 通用启动默认单任务预估配额 **8 GiB**、全部保留任务合计 **16 GiB**；可用 `--job-quota-gib 32 --total-quota-gib 64` 调整，要求两者为正整数且单任务不大于总配额。本机上文的双击启动文件已配置为 **32 / 64 GiB**。
+- 配额不是 PNG 实际压缩大小：逐页预留 `2 × 输入 PNG 字节数 + 输出宽 × 输出高 × 4 + 64 KiB`，包含重复上传临时文件和保守的输出空间。因此几百页漫画即使源文件不大，也可能超过旧版 8 GiB 单任务上限。
+- **单任务超限**时，即使清空全部旧任务也不会解决；需拆分任务或增大 `--job-quota-gib`。**总配额超限**才与旧任务占用有关；已收取和取消的任务在文件被清理前仍计入配额，仅在手机移除记录不会释放电脑空间。
+- 仍会单独检查数据所在磁盘的实际剩余空间，并保留至少 128 MiB 余量。增大配额不会绕过实际空间检查，也不改变解码/传输限制或实际显存容量；调整配额本身不会删除旧图片，启动时原有的过期任务清理规则仍适用。
+- HTTP 507 分别显示单任务预估/上限、总预留/上限或实际磁盘剩余空间，不再一律提示清理旧任务。修改配额或更新电脑代码后需重启服务，手机 IPA 不用更新。
 
 ## 验证命令
 

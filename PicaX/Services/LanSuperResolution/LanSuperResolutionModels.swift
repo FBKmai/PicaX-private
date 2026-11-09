@@ -147,16 +147,16 @@ nonisolated struct LanSRModelCapability: Codable, Identifiable, Sendable {
     }
     func validatePage(width: Int, height: Int, scale: Int) throws {
         try validate()
-        guard width > 0, height > 0, width <= maximumSide, height <= maximumSide, deliveryScales.contains(scale) else {
-            throw LanSRError.message("页面尺寸或回传倍率不受当前模型支持。")
+        guard width > 0, height > 0, deliveryScales.contains(scale) else {
+            throw LanSRError.message("页面尺寸无效或回传倍率不受当前模型支持。")
         }
-        let pw = max(64, (width + alignment - 1) / alignment * alignment)
-        let ph = max(64, (height + alignment - 1) / alignment * alignment)
-        guard pw <= maximumSide, ph <= maximumSide, pw * ph <= maximumInputPixels,
-              pw * ph * nativeScale * nativeScale <= 64_000_000,
-              max(width, height) * scale <= 16384,
-              width * height * scale * scale <= LanSRContract.maximumOutputPixels else {
-            throw LanSRError.message("页面超出所选模型的整页/回传像素预算；原图未修改。")
+        // These legacy capability fields can contain stale startup VRAM estimates
+        // in saved jobs. Never use them to predict whether the PC can run a page.
+        // Only bound the delivered image that this phone must decode and store.
+        // Check each side first so multiplication is safe even for corrupt input.
+        guard width <= 16384 / scale, height <= 16384 / scale,
+              width * height <= LanSRContract.maximumOutputPixels / (scale * scale) else {
+            throw LanSRError.message("回传图片超过手机接收范围（单边 16384、3200 万像素）；这不是电脑输入或显存限制。请降低回传倍率，原图未修改。")
         }
     }
 }

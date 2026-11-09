@@ -21,7 +21,6 @@ MAX_PIXELS = 8_000_000
 MAX_PAGES = 4096
 MAX_OUTPUT_PIXELS = 32_000_000
 MAX_OUTPUT_SIDE = 16384
-MAX_NATIVE_PIXELS = 64_000_000
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 SHA_RE = re.compile(r"[0-9a-f]{64}\Z")
 PAGE_RE = re.compile(r"e[0-9]{4}-p[0-9]{4}\Z")
@@ -124,12 +123,12 @@ def validate_spec(body, maximum_side=MAX_SIDE, maximum_pixels=MAX_PIXELS):
         width = integer(page["width"], 1, min(MAX_SIDE, maximum_side), "width")
         height = integer(page["height"], 1, min(MAX_SIDE, maximum_side), "height")
         padded_width, padded_height = padded_dimensions(width, height, model.alignment)
-        if padded_width * padded_height > min(MAX_PIXELS, maximum_pixels, model.maximum_pixels):
-            raise ProtocolError("Page exceeds the server's aligned pixel limit", 413)
+        if width * height > min(MAX_PIXELS, maximum_pixels):
+            raise ProtocolError("Page exceeds the configured input decoder limit", 413)
         if padded_width > maximum_side or padded_height > maximum_side:
-            raise ProtocolError("Aligned page exceeds the server's side limit", 413)
-        if width * height * scale**2 > MAX_OUTPUT_PIXELS or max(width, height) * scale > MAX_OUTPUT_SIDE or padded_width * padded_height * native**2 > MAX_NATIVE_PIXELS:
-            raise ProtocolError("Requested/native result exceeds output budget", 413)
+            raise ProtocolError("Aligned page exceeds the configured side limit", 413)
+        if width * height * scale**2 > MAX_OUTPUT_PIXELS or max(width, height) * scale > MAX_OUTPUT_SIDE:
+            raise ProtocolError("Delivered image exceeds the phone's receive limits", 413)
         integer(page["bytes"], 1, MAX_INPUT_BYTES, "bytes")
         if not isinstance(page["sha256"], str) or not SHA_RE.fullmatch(page["sha256"]):
             raise ProtocolError("Invalid SHA-256")

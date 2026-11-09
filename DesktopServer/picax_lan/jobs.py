@@ -81,11 +81,24 @@ class JobStore:
                 if existing["spec"] != encoded:
                     raise ProtocolError("Job ID reused with different inputs", 409)
                 return self.status(spec["jobID"], client_id)
+            gib = 1024**3
+            if reserved > self.job_quota:
+                raise ProtocolError(
+                    f"单任务磁盘配额不足：{len(spec['pages'])} 页预计需要 {reserved / gib:.2f} GiB，"
+                    f"单任务上限 {self.job_quota / gib:.2f} GiB。"
+                    "请拆分任务或提高电脑端 --job-quota-gib；清理旧任务不会解除单任务上限。", 507)
             total = self.db.execute("SELECT COALESCE(SUM(reserved),0) FROM jobs").fetchone()[0]
-            if reserved > self.job_quota or reserved + total > self.total_quota:
-                raise ProtocolError("Task disk quota exceeded; collect or clear old tasks", 507)
-            if shutil.disk_usage(self.root).free < reserved + 128 * 1024**2:
-                raise ProtocolError("Insufficient server disk space", 507)
+            if reserved + total > self.total_quota:
+                raise ProtocolError(
+                    f"任务总磁盘配额不足：已有任务预留 {total / gib:.2f} GiB，"
+                    f"新任务需要 {reserved / gib:.2f} GiB，总上限 {self.total_quota / gib:.2f} GiB。"
+                    "请清理不再需要的旧任务或提高电脑端 --total-quota-gib。", 507)
+            free = shutil.disk_usage(self.root).free
+            if free < reserved + 128 * 1024**2:
+                raise ProtocolError(
+                    f"电脑磁盘实际剩余空间不足：剩余 {free / gib:.2f} GiB，"
+                    f"新任务预计需要 {reserved / gib:.2f} GiB，另需保留 128 MiB。"
+                    "请释放空间；提高任务配额不能解决实际磁盘不足。", 507)
             if self.db.execute("SELECT COUNT(*) FROM jobs WHERE state IN ('uploading','queued','running')").fetchone()[0] >= 8:
                 raise ProtocolError("Server queue is full", 429)
             directory = self.directory(spec["jobID"])

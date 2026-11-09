@@ -46,13 +46,52 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.harness.request("GET", base)[1]["state"], "uploading")
         self.assertEqual(self.harness.request("POST", base + "/cancel")[0], 200)
 
-    def test_capability_default_and_live_budget(self):
+    def test_capabilities_ignore_cached_startup_vram_estimate(self):
         self.worker.model_states[MODELS[0].id]["metadata"] = {"maximumInputPixels": 400000}
         code, data = self.request("GET", "/v1/capabilities")
         self.assertEqual(code, 200)
         self.assertEqual(data["defaultDeliveryScale"], 2)
         self.assertEqual(data["defaultModelID"], MODELS[-2].id)
-        self.assertEqual(data["models"][0]["maximumInputPixels"], 400000)
+        self.assertTrue(all(model["maximumInputPixels"] == self.settings["maximum_pixels"] for model in data["models"]))
+
+    def test_large_page_manifest_is_not_rejected_by_model_or_startup_vram_ceiling(self):
+        # Manifests only; do not create large images or run inference.
+        for model in (MODELS[0], MODELS[-2]):
+            for width, height in ((1280, 1864), (2000, 3000), (2000, 4000)):
+                with self.subTest(model=model.id, size=(width, height)):
+                    self.worker.model_states[model.id]["metadata"] = {"maximumInputPixels": 400000}
+                    body = spec(model=model)
+                    body["pages"][0].update(width=width, height=height)
+                    code, data = self.request("POST", "/v1/jobs", body)
+                    self.assertEqual(code, 200, data)
+                    self.assertEqual(data["state"], "uploading")
+
+    def test_book_manifest_is_validated_per_page_not_as_one_combined_image(self):
+        body = spec(model=MODELS[-2], pages=84)
+        for page in body["pages"]:
+            page.update(width=1280, height=1864)
+        code, data = self.request("POST", "/v1/jobs", body)
+        self.assertEqual(code, 200, data)
+        self.assertEqual(len(data["pages"]), 84)
+        self.assertEqual(list(self.store.directory(body["jobID"]).iterdir()), [])
+
+    def test_configured_input_decoder_limit_remains_enforced(self):
+        self.settings["maximum_pixels"] = 1_000_000
+        self.worker.model_states[MODELS[-2].id]["metadata"] = {"maximumInputPixels": 8_000_000}
+        code, data = self.request("GET", "/v1/capabilities")
+        self.assertEqual(code, 200)
+        self.assertTrue(all(model["maximumInputPixels"] == 1_000_000 for model in data["models"]))
+        body = spec(model=MODELS[-2]); body["pages"][0].update(width=1000, height=1500)
+        code, data = self.request("POST", "/v1/jobs", body)
+        self.assertEqual(code, 413)
+        self.assertIn("configured input decoder limit", data["error"])
+
+    def test_delivery_decode_limit_is_still_enforced(self):
+        body = spec(model=MODELS[-2], scale=4)
+        body["pages"][0].update(width=1500, height=1500)
+        code, data = self.request("POST", "/v1/jobs", body)
+        self.assertEqual(code, 413)
+        self.assertIn("phone's receive limits", data["error"])
 
     def test_client_ids_group_jobs_but_need_no_token(self):
         body = spec(); self.request("POST", "/v1/jobs", body)

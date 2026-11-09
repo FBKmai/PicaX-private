@@ -160,7 +160,7 @@ struct LanSuperResolutionView: View {
                         Picker("回传倍率", selection: $deliveryScale) {
                             ForEach(model.deliveryScales, id: \.self) { scale in Text("\(scale)×").tag(scale) }
                         }
-                        Text("原生 \(model.nativeScale)× · FP32 · 整页推理\n输入上限 \(model.maximumInputPixels) 像素（含对齐）；实际仍受显存、输出尺寸和超时限制。")
+                        Text("原生 \(model.nativeScale)× · FP32 · 整页推理\n电脑每次单独处理一页，不拼接整本，也不分块。手机不按显存估算拦截输入；实际显存不足由电脑报告。回传图片仍受接收大小和超时限制。")
                             .font(.caption).foregroundStyle(.secondary)
                         if deliveryScale < model.nativeScale {
                             Text("先运行原生 \(model.nativeScale)× AI，再以 Lanczos 缩到 \(deliveryScale)× 回传；不是用普通放大代替 AI。")
