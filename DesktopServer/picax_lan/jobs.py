@@ -32,7 +32,6 @@ class JobStore:
                 PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=FULL;
                 CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS clients (id TEXT PRIMARY KEY, digest TEXT UNIQUE NOT NULL);
                 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, client TEXT NOT NULL,
                     spec TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                     updated REAL NOT NULL, reserved INTEGER NOT NULL);
@@ -45,23 +44,6 @@ class JobStore:
 
     def close(self):
         self.db.close()
-
-    def add_client(self, client_id, digest):
-        with self.lock, self.db:
-            if self.db.execute("SELECT 1 FROM clients WHERE id=?", (client_id,)).fetchone():
-                raise ProtocolError("Client already paired; use a new client ID", 409)
-            self.db.execute("INSERT INTO clients VALUES (?, ?)", (client_id, digest))
-
-    def client_for_digest(self, digest):
-        with self.lock:
-            row = self.db.execute("SELECT id FROM clients WHERE digest=?", (digest,)).fetchone()
-            return row[0] if row else None
-
-    def revoke(self, client_id):
-        identifier(client_id)
-        with self.lock, self.db:
-            self.db.execute("DELETE FROM clients WHERE id=?", (client_id,))
-            self.db.execute("UPDATE jobs SET state='cancelled',updated=? WHERE client=? AND state NOT IN ('acknowledged','cancelled')", (time.time(), client_id))
 
     def directory(self, job_id):
         identifier(job_id)

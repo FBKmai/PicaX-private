@@ -62,25 +62,34 @@ nonisolated enum LanSRContract {
     }
 }
 
-nonisolated struct LanSRPairingPayload: Codable, Sendable {
-    let version: Int
+nonisolated struct LanSRConnectionAddress: Codable, Equatable, Sendable {
+    static let defaultPort = 18443
     let host: String
     let port: Int
-    let serverID: String
-    let certificateSHA256: String
-    let pairingSecret: String
-    let expiresAt: Double
 
-    static func parse(_ text: String, now: Date = Date()) throws -> Self {
-        guard text.utf8.count <= 4096 else { throw LanSRError.message("连接信息过长。") }
-        let value = try JSONDecoder().decode(Self.self, from: Data(text.utf8))
-        guard value.version == 1, LanSRContract.isLAN(value.host), (1...65535).contains(value.port),
-              LanSRContract.isUUID(value.serverID), LanSRContract.isSHA(value.certificateSHA256),
-              (32...128).contains(value.pairingSecret.utf8.count),
-              value.pairingSecret.utf8.allSatisfy({ (45...122).contains($0) && ($0 == 45 || $0 == 95 || (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0)) }),
-              value.expiresAt.isFinite, value.expiresAt > now.timeIntervalSince1970,
-              value.expiresAt <= now.timeIntervalSince1970 + 600 else {
-            throw LanSRError.message("连接信息无效或已过期；请在电脑重新显示配对二维码。")
+    static func parse(_ text: String) throws -> Self {
+        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text.utf8.count <= 4096 else {
+            throw LanSRError.message("请输入电脑地址，例如 192.168.5.8:18443。")
+        }
+        let value: Self
+        if text.hasPrefix("{") {
+            // Also accepts old QR JSON: secrets, pins and expiry are ignored.
+            value = try JSONDecoder().decode(Self.self, from: Data(text.utf8))
+        } else if LanSRContract.isLAN(text) {
+            value = Self(host: text, port: defaultPort)
+        } else {
+            guard let url = URLComponents(string: text.contains("://") ? text : "http://\(text)"),
+                  ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+                  let host = url.host, url.user == nil, url.password == nil,
+                  url.query == nil, url.fragment == nil, url.path.isEmpty || url.path == "/" else {
+                throw LanSRError.message("电脑地址格式不正确，例如 192.168.5.8:18443。")
+            }
+            value = Self(host: host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")),
+                         port: url.port ?? defaultPort)
+        }
+        guard LanSRContract.isLAN(value.host), (1...65535).contains(value.port) else {
+            throw LanSRError.message("请填写电脑的局域网 IP 和端口。")
         }
         return value
     }
@@ -90,16 +99,14 @@ nonisolated struct LanSRServer: Codable, Equatable, Sendable {
     let host: String
     let port: Int
     let serverID: String
-    let certificateSHA256: String
-    var address: String { "\(host):\(port)" }
+    var address: String { "\(host.contains(":") ? "[\(host)]" : host):\(port)" }
     func url(path: String) throws -> URL {
         guard LanSRContract.isLAN(host), (1...65535).contains(port),
-              LanSRContract.isUUID(serverID), LanSRContract.isSHA(certificateSHA256),
               path.hasPrefix("/v1/"), !path.contains(".."), !path.contains("?"), !path.contains("#") else {
-            throw LanSRError.message("拒绝无效的电脑地址或路径。")
+            throw LanSRError.message("无效的电脑地址或路径。")
         }
         var components = URLComponents()
-        components.scheme = "https"
+        components.scheme = "http"
         components.host = host.contains(":") ? "[\(host)]" : host
         components.port = port
         components.path = path
@@ -108,10 +115,10 @@ nonisolated struct LanSRServer: Codable, Equatable, Sendable {
     }
 }
 
-nonisolated struct LanSRCredential: Codable, Sendable {
+/// The client ID only keeps different phones' jobs separate; it is not a secret.
+nonisolated struct LanSRConnection: Codable, Sendable {
     let server: LanSRServer
     let clientID: String
-    let token: String
 }
 
 nonisolated struct LanSRModelCapability: Codable, Identifiable, Sendable {

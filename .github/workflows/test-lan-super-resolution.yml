@@ -1,4 +1,4 @@
-name: Test LAN super-resolution contracts and HTTPS
+name: Test LAN super-resolution contracts and HTTP
 
 on:
   push:
@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   transport:
-    name: Contracts and loopback HTTPS (${{ matrix.os }})
+    name: Contracts and loopback HTTP (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -50,5 +50,5 @@ jobs:
       - name: Install transport-only dependencies (no Torch or weights)
         run: python -I -m pip install --disable-pip-version-check -r DesktopServer/requirements-transport.txt
 
-      - name: Test real loopback HTTPS without AI inference
+      - name: Test real loopback HTTP without AI inference
         run: python -I -B -X utf8 DesktopServer/tests/test_http.py

@@ -37,26 +37,51 @@ final class LanSuperResolutionTests: XCTestCase {
             XCTAssertFalse(LanSRContract.isLAN(host), host)
         }
     }
-    func testPairingExpirationAndPinAreMandatory() throws {
-        let now = Date(timeIntervalSince1970: 1_700_000_000)
-        func payload(host: String = "192.168.1.2", pin: String = String(repeating: "a", count: 64), expiry: Double = 1_700_000_300) throws -> String {
-            let value = LanSRPairingPayload(version: 1, host: host, port: 18443, serverID: serverID,
-                certificateSHA256: pin, pairingSecret: String(repeating: "x", count: 43), expiresAt: expiry)
-            return String(decoding: try JSONEncoder().encode(value), as: UTF8.self)
+    func testConnectionAcceptsIPURLAndOldQRWithoutExpiryOrPin() throws {
+        let expected = LanSRConnectionAddress(host: "192.168.5.8", port: 18443)
+        for text in ["192.168.5.8", "192.168.5.8:18443", "http://192.168.5.8:18443/", " 192.168.5.8 \n"] {
+            XCTAssertEqual(try LanSRConnectionAddress.parse(text), expected)
         }
-        XCTAssertEqual(try LanSRPairingPayload.parse(payload(), now: now).serverID, serverID)
-        XCTAssertThrowsError(try LanSRPairingPayload.parse(payload(host: "8.8.8.8"), now: now))
-        XCTAssertThrowsError(try LanSRPairingPayload.parse(payload(pin: "short"), now: now))
-        XCTAssertThrowsError(try LanSRPairingPayload.parse(payload(expiry: now.timeIntervalSince1970), now: now))
-        XCTAssertThrowsError(try LanSRPairingPayload.parse(payload(expiry: now.timeIntervalSince1970 + 601), now: now))
+        let oldQR = #"{"version":1,"host":"192.168.5.8","port":18443,"serverID":"old","certificateSHA256":"unused","pairingSecret":"expired","expiresAt":0}"#
+        XCTAssertEqual(try LanSRConnectionAddress.parse(oldQR), expected)
+        XCTAssertEqual(try LanSRConnectionAddress.parse(#"{"host":"192.168.5.8","port":18443}"#), expected)
+        XCTAssertThrowsError(try LanSRConnectionAddress.parse("http://8.8.8.8:18443"))
+        XCTAssertThrowsError(try LanSRConnectionAddress.parse("192.168.5.8:0"))
+        XCTAssertThrowsError(try LanSRConnectionAddress.parse("http://user:password@192.168.5.8"))
     }
-    func testPinnedEndpointCannotRedirectOrUsePublicHost() throws {
-        let server = LanSRServer(host: "192.168.5.8", port: 18443, serverID: serverID, certificateSHA256: String(repeating: "a", count: 64))
-        XCTAssertEqual(try server.url(path: "/v1/capabilities").scheme, "https")
+    func testEndpointUsesHTTPWithoutCertificateFields() throws {
+        let server = LanSRServer(host: "192.168.5.8", port: 18443, serverID: serverID)
+        XCTAssertEqual(try server.url(path: "/v1/capabilities").absoluteString, "http://192.168.5.8:18443/v1/capabilities")
         XCTAssertThrowsError(try server.url(path: "/v1/../elsewhere"))
         XCTAssertThrowsError(try server.url(path: "/v1/jobs?redirect=1"))
-        let ipv6 = LanSRServer(host: "fc00::1", port: 18443, serverID: serverID, certificateSHA256: String(repeating: "a", count: 64))
+        let ipv6 = LanSRServer(host: "fc00::1", port: 18443, serverID: serverID)
         XCTAssertTrue(try ipv6.url(path: "/v1/capabilities").absoluteString.contains("[fc00::1]"))
+        XCTAssertEqual(try LanSRConnectionAddress.parse("http://[fc00::1]:18443"), LanSRConnectionAddress(host: "fc00::1", port: 18443))
+        XCTAssertEqual(try LanSRConnectionAddress.parse("fc00::1").port, 18443)
+    }
+    func testLegacySavedConnectionIgnoresTokenAndCertificate() throws {
+        let text = #"{"server":{"host":"192.168.5.8","port":18443,"serverID":"22222222-2222-4222-8222-222222222222","certificateSHA256":"old"},"clientID":"phone-id","token":"no-longer-used"}"#
+        let connection = try JSONDecoder().decode(LanSRConnection.self, from: Data(text.utf8))
+        XCTAssertEqual(connection.server.serverID, serverID)
+        XCTAssertEqual(connection.clientID, "phone-id")
+        let encoded = String(decoding: try JSONEncoder().encode(connection), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("token"))
+        XCTAssertFalse(encoded.contains("certificate"))
+    }
+    func testLocalHTTPTransportPolicyIncludesPrivateIPRanges() throws {
+        let info = try XCTUnwrap(Bundle.main.infoDictionary)
+        let ats = try XCTUnwrap(info["NSAppTransportSecurity"] as? [String: Any])
+        XCTAssertEqual(ats["NSAllowsLocalNetworking"] as? Bool, true)
+        let exceptions = try XCTUnwrap(ats["NSExceptionDomains"] as? [String: [String: Any]])
+        for network in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10"] {
+            XCTAssertEqual(exceptions[network]?["NSExceptionAllowsInsecureHTTPLoads"] as? Bool, true, network)
+        }
+        XCTAssertNotEqual(ats["NSAllowsArbitraryLoads"] as? Bool, true)
+    }
+    func testConnectionFailureIncludesAddressInsteadOfBareCanceled() {
+        let error = LanSRHTTPTransfer.connectionError(URLError(.cancelled), address: "192.168.5.8:18443")
+        XCTAssertTrue(error.localizedDescription.contains("192.168.5.8:18443"))
+        XCTAssertTrue(error.localizedDescription.contains("连接已中断"))
     }
     func testNativeFourWithDeliveryTwoOrFour() throws {
         try model().validatePage(width: 1000, height: 1500, scale: 2)

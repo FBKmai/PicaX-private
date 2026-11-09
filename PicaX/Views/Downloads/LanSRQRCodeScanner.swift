@@ -64,7 +64,7 @@ nonisolated private final class LanSRCamera: NSObject, AVCaptureMetadataOutputOb
     }
     func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
         guard !stopped, let text = metadataObjects.compactMap({ ($0 as? AVMetadataMachineReadableCodeObject)?.stringValue }).first else { return }
-        guard text.utf8.count <= 4096 else { onError("二维码内容过长，不是 PicaX 配对信息。"); return }
+        guard text.utf8.count <= 4096 else { onError("二维码内容过长，不是 PicaX 连接信息。"); return }
         stopped = true
         session.stopRunning()
         onCode(text)
@@ -113,7 +113,7 @@ struct LanSRQRCodeScanner: View {
         PicaxNavigationContainer {
             ZStack(alignment: .bottom) {
                 LanSRScannerPreview(onCode: { text in onCode(text); dismiss() }, onError: { errorMessage = $0 })
-                Text(errorMessage ?? "扫描电脑终端上的 PicaX 配对二维码；扫描后仍需确认连接。")
+                Text(errorMessage ?? "扫描电脑上的 PicaX 连接二维码，扫描后直接连接。")
                     .padding().frame(maxWidth: .infinity).background(.regularMaterial)
             }
             .navigationTitle("扫描电脑二维码")

@@ -24,42 +24,42 @@ final class LanSuperResolutionCoordinator: ObservableObject {
         do { jobs = try LanSRJournal.load() }
         catch { journalAvailable = false; errorMessage = error.localizedDescription }
         downloads.restoreLanReservations(Set(jobs.filter { !$0.finished }.map(\.sourceRecordID)))
-        reloadCredential()
+        reloadConnection()
     }
 
-    private func reloadCredential() {
-        do { server = try LanSRCredentialStore.load()?.server }
-        catch {
-            // WhenUnlockedThisDeviceOnly failures are waiting states, never
-            // delete credentials or silently weaken their accessibility.
-            errorMessage = "等待解锁后读取配对凭据：\(error.localizedDescription)"
-        }
+    private func reloadConnection() {
+        do { server = try LanSRConnectionStore.load()?.server }
+        catch { errorMessage = "无法读取电脑地址：\(error.localizedDescription)" }
     }
 
-    func pair(text: String) async throws {
-        guard !jobs.contains(where: { !$0.finished }) else {
-            throw LanSRError.message("请先完成或明确取消现有电脑任务，再更换配对。")
+    func connect(text: String) async throws {
+        let address = try LanSRConnectionAddress.parse(text)
+        let previous = try? LanSRConnectionStore.load()
+        let (connection, capabilities) = try await LanSRClient.connect(address,
+            clientID: previous?.clientID ?? UUID().uuidString.lowercased())
+        guard !jobs.contains(where: { !$0.finished && $0.serverID != connection.server.serverID }) else {
+            throw LanSRError.message("现有任务属于另一台电脑，请先完成或放弃跟踪；同一电脑换 IP 可以直接重连。")
         }
-        let payload = try LanSRPairingPayload.parse(text)
-        let credential = try await LanSRClient.pair(payload)
-        try LanSRCredentialStore.save(credential)
-        server = credential.server
-        capabilities = nil
-        try await refreshCapabilities()
+        try LanSRConnectionStore.save(connection)
+        server = connection.server
+        self.capabilities = capabilities
+        errorMessage = nil
+        runTask?.cancel()
+        resumeAgain = runTask != nil
         resume()
     }
-    func unpair() throws {
+    func disconnect() throws {
         guard !jobs.contains(where: { !$0.finished }) else {
-            throw LanSRError.message("断开配对前需完成或明确取消电脑任务，防止遗留无法收取的结果。")
+            throw LanSRError.message("断开前需完成或放弃现有电脑任务。")
         }
-        try LanSRCredentialStore.delete()
+        LanSRConnectionStore.delete()
         server = nil
         capabilities = nil
     }
     func refreshCapabilities() async throws {
-        guard let credential = try LanSRCredentialStore.load() else { throw LanSRError.message("请先扫描电脑二维码配对。") }
-        server = credential.server
-        capabilities = try await LanSRClient(credential: credential).capabilities()
+        guard let connection = try LanSRConnectionStore.load() else { throw LanSRError.message("请先输入电脑地址或扫码连接。") }
+        server = connection.server
+        capabilities = try await LanSRClient(connection: connection).capabilities()
         errorMessage = nil
     }
 
@@ -100,7 +100,7 @@ final class LanSuperResolutionCoordinator: ObservableObject {
         foreground = true
         verifiedResults.removeAll()
         retryAfter.removeAll()
-        reloadCredential()
+        reloadConnection()
         resume()
     }
     func applicationDidEnterBackground() {
@@ -165,11 +165,11 @@ final class LanSuperResolutionCoordinator: ObservableObject {
                 if self.resumeAgain { self.resumeAgain = false; self.resume() }
             }
             do {
-                guard let credential = try LanSRCredentialStore.load() else {
-                    self.errorMessage = "等待配对电脑。"
+                guard let connection = try LanSRConnectionStore.load() else {
+                    self.errorMessage = "等待连接电脑。"
                     return
                 }
-                let client = LanSRClient(credential: credential)
+                let client = LanSRClient(connection: connection)
                 while !Task.isCancelled, self.foreground {
                     let unfinished = self.jobs.filter { !$0.finished && ($0.phase != "部分失败" || $0.retryRequested || $0.cancelRequested) }
                     if unfinished.isEmpty { break }
@@ -234,8 +234,8 @@ final class LanSuperResolutionCoordinator: ObservableObject {
 
     private func synchronize(_ id: String, client: LanSRClient) async throws {
         var current = try job(id)
-        guard current.serverID == client.credential.server.serverID else {
-            throw LanSRError.message("等待连接此任务原先配对的电脑。")
+        guard current.serverID == client.connection.server.serverID else {
+            throw LanSRError.message("等待连接此任务原先使用的电脑。")
         }
         if current.cancelRequested {
             if current.spec != nil {

@@ -3,8 +3,8 @@ import Combine
 import Foundation
 import Network
 
-/// Discovery is an untrusted hint only. It cannot supply a certificate pin,
-/// change a paired endpoint, or authenticate a computer.
+/// Discovery lists nearby servers. Connections use the scanned or entered LAN
+/// address, independently of the comic-source networking configuration.
 @MainActor
 final class LanSRDiscovery: ObservableObject {
     @Published private(set) var names: [String] = []
@@ -30,7 +30,7 @@ final class LanSRDiscovery: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self, self.generation == generation else { return }
                 self.names = names
-                self.message = names.isEmpty ? "暂未发现电脑；仍可直接扫码或粘贴连接信息。" : "发现结果未经认证，请扫描电脑上的配对二维码。"
+                self.message = names.isEmpty ? "暂未发现电脑；仍可直接扫码或粘贴连接信息。" : "发现电脑后，扫描电脑二维码或输入地址即可连接。"
             }
         }
         browser.stateUpdateHandler = { [weak self] state in

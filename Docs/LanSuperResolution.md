@@ -2,12 +2,13 @@
 
 ## 范围与状态
 
-- 下载库多选**已下载的漫画图片** → **电脑超分**，或在“设置 → 下载 → 局域网电脑超分”配对、查看任务。
+- 下载库多选**已下载的漫画图片** → **电脑超分**，或在“设置 → 下载 → 局域网电脑超分”输入电脑地址/扫码连接、查看任务。
 - 保留“本机超分”和下载后自动超分；自动超分仍在手机运行，不会悄悄改到电脑。
 - 结果独立保存到“下载 → 超分”，不覆盖源下载。可沿用下载库的阅读、ZIP 和 PDF 导出。ZIP 附带模型来源/许可说明，完整任务还附每页推理元数据；PDF 只包含图片页。
 - 电脑使用真实 PyTorch/CUDA 模型，没有普通插值冒充 AI、隐式 CPU 回退或失败后换模型。
 - 参考 LANDrop 的发现、配对和独立传输思路；**不是 LANDrop 协议实现，不与 LANDrop 互通，也不要求安装 LANDrop**。
-- Windows 电脑上的真实模型和 HTTPS 服务链路已实测，见下文。手机端编译、XCTest 和 IPA 状态以对应 Actions 运行及交付报告为准；iPhone 真机跨局域网端到端仍待验证。
+- 当前连接采用**局域网 HTTP 直连**，不使用证书、口令或一次性配对。旧版 HTTPS 手机包需要更新；不能只重启电脑端就让旧包改用 HTTP。
+- 原版 HTTPS 链路曾在 Windows 上实测；改版不重复跑大模型测试。手机端编译、XCTest 和 IPA 状态以对应 Actions 运行及交付报告为准；iPhone 真机跨局域网端到端仍待验证。
 
 ## 当前电脑已经装好的环境
 
@@ -18,7 +19,7 @@
 - 权重：`D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights`
 - PyTorch `2.11.0+cu128`、CUDA 12.8、Spandrel 0.4.2。
 - GPU：RTX 5090 D v2，24455 MiB；驱动 616.64。
-- 本机局域网地址：`192.168.5.8`（地址变化后需要处理证书与重新配对）。
+- 本机局域网地址：`192.168.5.8`（变化后修改启动地址，并在手机输入新地址即可；不用重新生成证书）。
 
 已配置的快捷启动文件：
 
@@ -26,12 +27,12 @@
 D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\launchers\start-picax-server.cmd
 ```
 
-验证结束后服务已停止，不会常驻占用 GPU。双击上述文件即可启动并显示一次性配对码。保持终端运行；Ctrl+C 停止。不要分享配对码截图。
+双击上述文件即可启动并显示长期有效的连接地址/二维码。保持终端运行；Ctrl+C 停止。无需配对，不会生成或读取证书；启动脚本已启用简短的请求状态日志。
 
 也可在仓库目录的 Windows 终端执行：
 
 ```bat
-DesktopServer\start-server.cmd --host 192.168.5.8 --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --pair --accept-noncommercial-license
+DesktopServer\start-server.cmd --host 192.168.5.8 --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --diagnostics --accept-noncommercial-license
 ```
 
 若 Windows 弹出网络访问询问，仅允许你信任的**专用网络**。程序不会自动修改防火墙、开启公网端口、UPnP 或端口转发。手机和电脑须能互相访问同一局域网；访客 Wi-Fi/AP 隔离可能阻止连接。
@@ -77,7 +78,7 @@ DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\fetch_models.py --mod
 
 测试还覆盖各模型 128×192 → 256×384。PyTorch allocated 不含桌面显示/其他进程的所有显存，不等于整机 GPU 总占用，也不是大图的保证。
 
-实际 HTTPS → SQLite → CUDA → 收取 → SHA-256 → ACK 链路另测了 FDAT-XL：
+历史版本的 HTTPS → SQLite → CUDA → 收取 → SHA-256 → ACK 链路另测了 FDAT-XL（以下不是本次 HTTP 改版的重新实测）：
 
 - 连续两张 1000×1500 → 2000×3000，分别约 12.125 / 11.281 秒推理，证明后续页面不会因可复用的 PyTorch 缓存被误拒。
 - 256×384 → 1024×1536 原生 4× 回传。
@@ -104,36 +105,34 @@ DesktopServer\.venv\Scripts\python.exe -I -m pip install -r DesktopServer\requir
 
 直接依赖固定版本，Torch/Torchvision 的官方 Windows wheel URL 带 SHA-256；`requirements-transport.txt` 不是完整的传递依赖 hash 锁文件。无 CUDA 时启动报错，不默认改用 CPU。`--device cpu` 仅为显式诊断用。
 
-## 配对、传输与恢复
+## 连接、传输与恢复
 
-- Bonjour `_picax-sr._tcp` **只提供未经认证的发现提示**，不能更新已配对地址或证书。
-- 电脑 `--pair` 显示 5 分钟、一次性、高熵配对码，包含地址、电脑 ID、TLS 叶证书 SHA-256；手机支持扫码和手动粘贴 JSON，连接前显示确认。
-- TLS pin 必须和二维码一致；自签名证书仍检查 SAN/有效期。不“信任所有证书”。只允许 HTTPS 私有字面 IP，不跟随重定向。
-- 配对后每台手机独立 bearer token；电脑仅存摘要。手机 token/pin 在 `WhenUnlockedThisDeviceOnly` Keychain，不进设置备份。锁屏无法读凭据时等待，不删凭据。
-- 手机采用独立 ephemeral URLSession，不继承漫画源代理、Cookie、认证、缓存，不使用蜂窝。
-- 页级 SHA-256、字节数、实际 PNG 尺寸、模型 ID/散列/倍率和推理来源都验证。
-- **页级恢复**，不是 PNG 字节级断点续传。手机进入后台只暂停传输，不发送取消；上传完整并 commit 后电脑独立运行。
-- 结果导入顺序：校验文件 → 原子落盘 → throwing SQLite 更新 → 恢复日志 → ACK。重复结果不重复加大小/页数；冲突 hash 不覆盖。
-- 本机自动超分队列不会删除远程部分结果；同一本下载被远程任务占用时，不允许新下载或本机超分修改来源。
-- 明确“取消任务”需要电脑确认；电脑丢失/任务过期时可**放弃本机跟踪**，这不等于取消电脑，也不删除已收取页。
+1. 启动电脑服务。在新版 PicaX 的“局域网电脑超分”输入 `192.168.5.8:18443`，或扫描电脑二维码，直接连接。
+2. 手机和电脑都必须使用这一版 HTTP 连接方式。旧 IPA 的 HTTPS/配对流程不能连接新服务，需要重装新版 IPA。
+3. 排查网络时，可先用手机浏览器打开 `http://192.168.5.8:18443/`，出现 `status: ok` 就说明手机能访问服务端口。电脑能 ping 通手机，并不能证明反向 TCP 端口可达。
 
-命令：
+- 不再使用 TLS、自签名证书、证书指纹、一次性密钥、5 分钟有效期、bearer token 或配对确认。二维码只包含 HTTP 地址，重启服务后仍可使用。
+- **没有加密或访问口令**。任何能访问该端口的设备都能调用服务，只在自己的可信局域网运行，不要开放公网/端口转发。
+- Bonjour `_picax-sr._tcp` 仅用于发现附近名称；扫码或输入 IP 不依赖发现服务。
+- iOS 只对私有/链路本地 IP 网段放行 HTTP，不全局关闭 ATS。传输仍使用独立 ephemeral URLSession，不继承漫画源代理、Cookie、认证或缓存。
+- 手机本地仅保存电脑地址与任务分组 ID，不再保存新口令或 pin；旧版已保存的地址/任务分组 ID 可以沿用。
+- `X-PicaX-Client-ID` 只是区分手机任务的普通标签，**不是身份认证**，无需注册或令牌。
+- 页级恢复、大小和像素上限、PNG 解码、文件完整性与不覆盖原图的保护保留。手机进入后台只暂停传输，不取消电脑任务；完整上传并 commit 后电脑独立运行。
+- 结果原子落盘、更新 SQLite 后才 ACK；重复收取不重复计数。本机自动超分仍不会删除远程部分结果。
+- 同一电脑换 IP 时修改电脑启动参数，再在手机输入新地址即可继续原任务。电脑 ID 仅用于防止把旧任务错误地发给另一台电脑，不作证书认证。
+- 明确取消需要电脑确认；电脑丢失/任务过期时可放弃本机跟踪，不删除已收取页。
+
+默认数据目录为 `%LOCALAPPDATA%\PicaX-LAN`。旧版 `identity` 和客户端令牌记录不再被读取，不必删除或重建。闲置任务默认保留 24 小时，`--retention-hours 168` 可延长到一周；启动时会清理过期任务。手动清理前先停止服务：
 
 ```bat
-DesktopServer\start-server.cmd --list-clients
-DesktopServer\start-server.cmd --revoke-client <手机UUID>
 DesktopServer\start-server.cmd --cleanup --retention-hours 24
 ```
-
-默认数据目录为 `%LOCALAPPDATA%\PicaX-LAN`。保管其中私钥/数据库，不放到公开同步目录。闲置任务默认保留 24 小时，`--retention-hours 168` 可延长到一周；清理在启动或显式 `--cleanup` 时执行。不要在服务运行期间用另一进程操作同一数据目录。
-
-私有 IP 改变时不自动换证书：固定地址/ DHCP 保留优先。确需更换时先停止服务，备份身份文件，明确重建身份并在手机重新配对；不要只改 pin 绕过不匹配。
 
 ## 协议概览（v1）
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| POST | `/v1/pair` | 唯一无需 bearer 的短期配对入口 |
+| GET | `/` | 无需认证的服务状态页，供手机浏览器排查连接 |
 | GET | `/v1/capabilities` | 已配置/校验模型、预算、默认回传倍率 |
 | POST | `/v1/jobs` | 幂等创建完整任务清单 |
 | PUT | `/v1/jobs/{id}/pages/{page}` | 逐页规范化 RGB PNG |

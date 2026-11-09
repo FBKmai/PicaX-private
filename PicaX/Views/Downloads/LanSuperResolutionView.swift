@@ -9,10 +9,9 @@ struct LanSuperResolutionView: View {
     let records: [DownloadRecord]
     var onSubmitted: (() -> Void)?
     @State private var connectionText = ""
-    @State private var pairingPreview: LanSRPairingPayload?
-    @State private var showsPairConfirmation = false
+    @State private var scannedConnection: String?
     @State private var showsScanner = false
-    @State private var showsUnpairConfirmation = false
+    @State private var showsDisconnectConfirmation = false
     @State private var cancelJob: LanSRLocalJob?
     @State private var abandonJob: LanSRLocalJob?
     @State private var selectedModelID = ""
@@ -36,36 +35,34 @@ struct LanSuperResolutionView: View {
             }
             connectionSection
             if coordinator.server == nil { discoverySection }
-            pairingSection
+            addressSection
             modelSection
             if !records.isEmpty { submissionSection }
             taskSection
             Section {
                 Text("仅发送已下载漫画的规范化原图，不传送漫画源账号或 Cookie。结果另存到“下载 → 超分”，不覆盖原图。")
                 Text("关闭页面不会取消电脑任务。手机只有在前台时传输；完整上传并提交后，电脑会独立处理。回到同一局域网并打开 App 后继续收取。")
-                Text("电脑默认保留闲置任务 24 小时，可在启动参数中延长。请及时收取结果；电脑关闭、换 IP、撤销配对或任务过期会中断同步。")
+                Text("电脑默认保留闲置任务 24 小时，可在启动参数中延长。请及时收取结果；电脑关闭或任务过期会中断同步，换 IP 后输入新地址即可重连。")
             } header: { Text("使用说明") }
         }
         .picaxInsetGroupedListStyle()
         .navigationTitle("局域网电脑超分")
         .picaxNavigationBarTitleDisplayModeInline()
         .picaxHidesTabBar()
-        .sheet(isPresented: $showsScanner) {
-            LanSRQRCodeScanner { text in connectionText = text; previewPairing() }
+        .sheet(isPresented: $showsScanner, onDismiss: {
+            // Wait for the scanner sheet to close before updating connection UI.
+            guard let text = scannedConnection else { return }
+            scannedConnection = nil
+            connectionText = text
+            connect()
+        }) {
+            LanSRQRCodeScanner { text in scannedConnection = text }
         }
-        .confirmationDialog("配对此电脑？", isPresented: $showsPairConfirmation, titleVisibility: .visible) {
-            Button("确认配对") { connect() }
-            Button("取消", role: .cancel) { pairingPreview = nil }
-        } message: {
-            if let payload = pairingPreview {
-                Text("地址：\(payload.host):\(payload.port)\n证书 SHA-256：\(payload.certificateSHA256)\n仅确认来自你信任电脑上的连接信息。")
+        .confirmationDialog("断开电脑连接？", isPresented: $showsDisconnectConfirmation, titleVisibility: .visible) {
+            Button("断开连接", role: .destructive) {
+                do { try coordinator.disconnect() } catch { localError = error.localizedDescription }
             }
-        }
-        .confirmationDialog("断开手机配对？", isPresented: $showsUnpairConfirmation, titleVisibility: .visible) {
-            Button("断开配对", role: .destructive) {
-                do { try coordinator.unpair() } catch { localError = error.localizedDescription }
-            }
-        } message: { Text("只删除本机凭据。如需撤销电脑保存的令牌，请使用电脑端 --revoke-client。") }
+        } message: { Text("只删除本机保存的电脑地址，不删除已收取的结果。") }
         .confirmationDialog("取消电脑任务？", isPresented: Binding(get: { cancelJob != nil }, set: { if !$0 { cancelJob = nil } }), titleVisibility: .visible) {
             Button("取消电脑任务", role: .destructive) {
                 if let job = cancelJob { coordinator.cancel(jobID: job.id) }
@@ -80,7 +77,7 @@ struct LanSuperResolutionView: View {
                 abandonJob = nil
             }
         } message: {
-            Text("这不会取消电脑上的处理，也不会删除已收取的页面。仅在电脑丢失、任务过期或配对无法恢复时使用；放弃后无法从此任务继续收取。")
+            Text("这不会取消电脑上的处理，也不会删除已收取的页面。仅在电脑丢失、任务过期或连接无法恢复时使用；放弃后无法从此任务继续收取。")
         }
         .onReceive(coordinator.$capabilities) { updateSelection($0) }
         .onChange(of: selectedModelID) { _ in
@@ -96,16 +93,14 @@ struct LanSuperResolutionView: View {
     private var connectionSection: some View {
         Section {
             if let server = coordinator.server {
-                LabeledContent("已配对电脑", value: server.address)
-                Text("电脑 ID：\(server.serverID)").font(.caption).textSelection(.enabled)
-                Text("证书 SHA-256：\(server.certificateSHA256)").font(.caption2).textSelection(.enabled)
-                if isConnecting { ProgressView("连接中…") }
+                LabeledContent("已连接电脑", value: "http://\(server.address)")
                 Button("刷新电脑模型 / 重新连接") { Task { await refresh() } }.disabled(isConnecting)
-                Button("断开配对", role: .destructive) { showsUnpairConfirmation = true }
+                Button("断开连接", role: .destructive) { showsDisconnectConfirmation = true }
                     .disabled(hasUnfinishedJobs || isConnecting)
             } else {
-                Text("尚未配对。先在电脑启动 DesktopServer，再扫描或粘贴终端里的连接信息。")
+                Text("先启动电脑服务，再输入电脑 IP 或扫描二维码即可连接。")
             }
+            if isConnecting { ProgressView("正在连接电脑…") }
         } header: { Text("电脑连接") }
     }
 
@@ -114,24 +109,25 @@ struct LanSuperResolutionView: View {
             Button(discovery.isSearching ? "重新搜索附近电脑" : "搜索附近电脑") { discovery.start() }
             ForEach(discovery.names, id: \.self) { name in Label(name, systemImage: "desktopcomputer") }
             if !discovery.message.isEmpty { Text(discovery.message).font(.caption).foregroundStyle(.secondary) }
-        } header: { Text("局域网发现（未经认证）") }
-        footer: { Text("发现服务只显示名称，不会自动信任证书或更换配对电脑。找不到时也可以直接扫码。") }
+        } header: { Text("局域网发现") }
+        footer: { Text("扫描电脑二维码或直接输入 IP 地址连接。") }
     }
 
-    private var pairingSection: some View {
+    private var addressSection: some View {
         Section {
-            Button { showsScanner = true } label: { Label("扫描电脑配对二维码", systemImage: "qrcode.viewfinder") }
-                .disabled(hasUnfinishedJobs || isConnecting)
-            TextEditor(text: $connectionText)
-                .frame(height: 90)
-                .font(.caption.monospaced())
+            Button { scannedConnection = nil; showsScanner = true } label: { Label("扫描电脑连接二维码", systemImage: "qrcode.viewfinder") }
+                .disabled(isConnecting)
+            TextField("例如 192.168.5.8:18443", text: $connectionText)
+                .font(.callout.monospaced())
                 .picaxDisablesTextAutocapitalization()
                 .autocorrectionDisabled()
-                .accessibilityLabel("电脑终端连接信息 JSON")
-            Button("检查粘贴的连接信息并配对") { previewPairing() }
-                .disabled(connectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || hasUnfinishedJobs || isConnecting)
-        } header: { Text("扫码或粘贴配对") }
-        footer: { Text("配对码为一次性，有效期 5 分钟。必须从你自己的电脑获取；不要分享配对码截图。现有任务完成或取消前不能更换电脑。") }
+                .keyboardType(.URL)
+                .accessibilityLabel("电脑 IP 地址或连接信息")
+                .disabled(isConnecting)
+            Button("连接电脑") { connect() }
+                .disabled(connectionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isConnecting)
+        } header: { Text("输入地址或扫码连接") }
+        footer: { Text("无需配对、口令或证书，二维码不过期。使用局域网 HTTP 直连，不加密；只在自己的可信局域网使用，不要映射到公网。") }
     }
 
     private var selectedModel: LanSRModelCapability? {
@@ -167,7 +163,7 @@ struct LanSuperResolutionView: View {
                         if let error = model.error { Text(error).font(.caption).foregroundStyle(.secondary) }
                     }
                 }
-            } else { Text("配对并刷新后显示电脑实际配置的模型。") }
+            } else { Text("连接后显示电脑实际配置的模型。") }
         } header: { Text("模型与回传尺寸") }
         footer: { Text("重模型不保证更好。请先用少量页比较文字、线条和网点。首版不会自动换模型、降低倍率或退回有已知接缝问题的分块模式。模型仅限 CC-BY-NC-4.0 非商业用途。") }
     }
@@ -218,21 +214,15 @@ struct LanSuperResolutionView: View {
         } header: { Text("电脑任务") }
     }
 
-    private func previewPairing() {
-        do {
-            pairingPreview = try LanSRPairingPayload.parse(connectionText.trimmingCharacters(in: .whitespacesAndNewlines))
-            showsPairConfirmation = true
-        } catch { localError = error.localizedDescription }
-    }
     private func connect() {
-        guard pairingPreview != nil else { return }
-        // Freeze the exact reviewed payload; edits cannot substitute another host.
-        guard let data = try? JSONEncoder().encode(pairingPreview), let text = String(data: data, encoding: .utf8) else { return }
-        pairingPreview = nil
+        guard !isConnecting else { return }
+        let text = connectionText
+        localError = nil
+        coordinator.errorMessage = nil
         isConnecting = true
         Task {
             defer { isConnecting = false }
-            do { try await coordinator.pair(text: text); connectionText = ""; localError = nil }
+            do { try await coordinator.connect(text: text); connectionText = ""; localError = nil }
             catch { localError = error.localizedDescription }
         }
     }

@@ -1,14 +1,14 @@
-"""HTTPS-only authenticated transport. This module never imports Torch."""
+"""Plain HTTP on a trusted LAN; no pairing, TLS or bearer authentication."""
 import asyncio
 import json
+import logging
 import time
 
-from .auth import authenticate
 from .inference import validate_png
 from .models import MODELS
 from .protocol import (VERSION, MAX_JSON, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES,
                        MAX_OUTPUT_PIXELS, MAX_OUTPUT_SIDE, ProtocolError, exact_keys,
-                       local_address, validate_spec)
+                       validate_spec)
 
 
 def strict_json(data):
@@ -27,7 +27,7 @@ def strict_json(data):
         raise ProtocolError("Invalid JSON") from None
 
 
-def create_app(store, worker, pairing, settings):
+def create_app(store, worker, settings):
     from fastapi import FastAPI, Request
     from fastapi.responses import FileResponse, JSONResponse
     # FastAPI resolves forward annotations in module globals, not this scope.
@@ -42,10 +42,9 @@ def create_app(store, worker, pairing, settings):
 
     @app.middleware("http")
     async def private_transport(request, call_next):
+        started = time.monotonic()
+        response = None
         try:
-            if request.url.scheme != "https" or not request.client:
-                raise ProtocolError("HTTPS required", 403)
-            local_address(request.client.host, allow_loopback=settings.get("diagnostic", False))
             if request.headers.get("content-encoding", "identity") != "identity":
                 raise ProtocolError("Compressed request bodies are not accepted", 415)
             response = await call_next(request)
@@ -53,10 +52,25 @@ def create_app(store, worker, pairing, settings):
             response.headers["X-Content-Type-Options"] = "nosniff"
             return response
         except ProtocolError as error:
-            return JSONResponse({"error": str(error)}, status_code=error.status)
+            response = JSONResponse({"error": str(error)}, status_code=error.status)
+            return response
+        finally:
+            if settings.get("diagnostics"):
+                # Only registered route templates are logged. Never log raw
+                # URLs, query strings, headers, request bodies or responses.
+                route = getattr(request.scope.get("route"), "path", "unmatched")
+                method = request.method if request.method in {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} else "OTHER"
+                logging.getLogger("uvicorn.error").info(
+                    "LAN request peer=%s method=%s route=%s status=%s elapsed_ms=%.1f",
+                    request.client.host if request.client else "unknown", method, route,
+                    response.status_code if response is not None else 500,
+                    (time.monotonic() - started) * 1000,
+                )
 
     def client(request):
-        return authenticate(store, request.headers.get("authorization"))
+        # A nonsecret grouping label, not authentication. No registration needed;
+        # simple HTTP clients without the header share the default LAN group.
+        return request.headers.get("x-picax-client-id") or "lan"
 
     async def read_json(request, maximum=MAX_JSON):
         if request.headers.get("content-type", "").split(";")[0].lower() != "application/json":
@@ -73,18 +87,13 @@ def create_app(store, worker, pairing, settings):
             raise ProtocolError("Request timed out", 408) from None
         return strict_json(body)
 
-    @app.post("/v1/pair")
-    async def pair(request: Request):
-        if pairing is None:
-            raise ProtocolError("Pairing is disabled; restart with --pair", 403)
-        body = await read_json(request, 2048)
-        exact_keys(body, ("clientID", "pairingSecret"))
-        token = await asyncio.to_thread(pairing.pair, body["pairingSecret"], body["clientID"])
-        return {"version": VERSION, "serverID": store.server_id, "token": token}
+    @app.get("/")
+    async def health():
+        return {"status": "ok", "service": "PicaX LAN", "transport": "http",
+                "serverID": store.server_id}
 
     @app.get("/v1/capabilities")
-    async def capabilities(request: Request):
-        client(request)
+    async def capabilities():
         models = []
         for model in MODELS:
             if model.id not in settings["weights"]:

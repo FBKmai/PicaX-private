@@ -1,14 +1,13 @@
 import Foundation
-import CryptoKit
-import Security
 
 nonisolated struct LanSRHTTPResponse: Sendable {
     let status: Int
     let data: Data
 }
 
-/// One bounded transfer per instance. Session configuration never inherits the
-/// comic-source proxy, cookies or credentials; trust is an out-of-band cert pin.
+/// One bounded LAN transfer per instance. Does not inherit the comic-source
+/// proxy, cookies or credentials. The local server uses plain HTTP, without TLS
+/// certificates or authentication challenges.
 nonisolated final class LanSRHTTPTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let server: LanSRServer
     private let maximum: Int
@@ -51,7 +50,6 @@ nonisolated final class LanSRHTTPTransfer: NSObject, URLSessionDataDelegate, @un
                 config.requestCachePolicy = .reloadIgnoringLocalCacheData
                 config.timeoutIntervalForRequest = 30
                 config.timeoutIntervalForResource = 180
-                config.tlsMinimumSupportedProtocolVersion = .TLSv12
                 let queue = OperationQueue()
                 queue.maxConcurrentOperationCount = 1
                 let session = URLSession(configuration: config, delegate: self, delegateQueue: queue)
@@ -78,32 +76,6 @@ nonisolated final class LanSRHTTPTransfer: NSObject, URLSessionDataDelegate, @un
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
         completionHandler(nil)
-    }
-
-    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
-                    completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-              challenge.protectionSpace.host == server.host,
-              let trust = challenge.protectionSpace.serverTrust,
-              let leaf = SecTrustGetCertificateAtIndex(trust, 0) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-        let hash = SHA256.hash(data: SecCertificateCopyData(leaf) as Data).map { String(format: "%02x", $0) }.joined()
-        guard hash == server.certificateSHA256 else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-        // Trust exactly the pinned certificate, while still checking its SAN,
-        // validity dates and TLS policy. Bonjour can never update this anchor.
-        SecTrustSetAnchorCertificates(trust, [leaf] as CFArray)
-        SecTrustSetAnchorCertificatesOnly(trust, true)
-        SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, server.host as CFString))
-        guard SecTrustEvaluateWithError(trust, nil) else {
-            completionHandler(.cancelAuthenticationChallenge, nil)
-            return
-        }
-        completionHandler(.useCredential, URLCredential(trust: trust))
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
@@ -156,43 +128,64 @@ nonisolated final class LanSRHTTPTransfer: NSObject, URLSessionDataDelegate, @un
         lock.unlock()
         defer { session.finishTasksAndInvalidate() }
         if wasCancelled { completion?.resume(throwing: CancellationError()) }
-        else if let failure = failure ?? error { completion?.resume(throwing: failure) }
+        else if let failure { completion?.resume(throwing: failure) }
+        else if let error { completion?.resume(throwing: Self.connectionError(error, address: server.address)) }
         else if let response { completion?.resume(returning: LanSRHTTPResponse(status: response.statusCode, data: data)) }
         else { completion?.resume(throwing: LanSRError.message("电脑没有返回 HTTP 响应。")) }
     }
+    static func connectionError(_ error: Error, address: String) -> Error {
+        guard let error = error as? URLError else { return error }
+        let reason: String
+        switch error.code {
+        case .cannotConnectToHost, .cannotFindHost:
+            reason = "无法连接，请确认电脑服务已启动、地址正确，并允许局域网访问该端口。"
+        case .timedOut:
+            reason = "连接超时，请确认手机和电脑在同一局域网，且未被 VPN 或防火墙拦截。"
+        case .notConnectedToInternet, .dataNotAllowed:
+            reason = "局域网不可用，请连接 Wi-Fi 并允许 PicaX 的本地网络权限。"
+        case .cancelled:
+            reason = "连接已中断，请重试。"
+        default:
+            reason = error.localizedDescription
+        }
+        return LanSRError.message("电脑 \(address)：\(reason)")
+    }
 }
 
-nonisolated enum LanSRCredentialStore {
-    static let service = "moye.PicaX.lan-super-resolution"
-    static func load() throws -> LanSRCredential? {
-        try SecureCodableStore.load(LanSRCredential.self, service: service, account: "paired-server")
+/// Only an address and a nonsecret job-grouping ID are saved, not credentials.
+nonisolated enum LanSRConnectionStore {
+    private static let key = "moye.PicaX.lan-super-resolution.connection"
+    static func load() throws -> LanSRConnection? {
+        if let data = UserDefaults.standard.data(forKey: key) {
+            return try JSONDecoder().decode(LanSRConnection.self, from: data)
+        }
+        // Old installs can keep their job-grouping ID. Token/pin fields are
+        // ignored, and an unavailable old Keychain never blocks a new connection.
+        if !UserDefaults.standard.bool(forKey: key + ".ignoreLegacy"),
+           let legacy = try? SecureCodableStore.load(LanSRConnection.self,
+            service: "moye.PicaX.lan-super-resolution", account: "paired-server") {
+            try save(legacy)
+            return legacy
+        }
+        return nil
     }
-    static func save(_ value: LanSRCredential) throws {
-        try SecureCodableStore.save(value, service: service, account: "paired-server")
+    static func save(_ value: LanSRConnection) throws {
+        UserDefaults.standard.set(try JSONEncoder().encode(value), forKey: key)
     }
-    static func delete() throws { try SecureCodableStore.delete(service: service, account: "paired-server") }
+    static func delete() {
+        UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.set(true, forKey: key + ".ignoreLegacy")
+    }
 }
 
 nonisolated struct LanSRClient: Sendable {
-    let credential: LanSRCredential
+    let connection: LanSRConnection
 
-    static func pair(_ payload: LanSRPairingPayload) async throws -> LanSRCredential {
-        struct Reply: Decodable { let version: Int; let serverID: String; let token: String }
-        let server = LanSRServer(host: payload.host, port: payload.port, serverID: payload.serverID,
-                                 certificateSHA256: payload.certificateSHA256)
-        let clientID = UUID().uuidString.lowercased()
-        var request = URLRequest(url: try server.url(path: "/v1/pair"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["clientID": clientID, "pairingSecret": payload.pairingSecret])
-        let response = try await LanSRHTTPTransfer(server: server, maximum: 4096, destination: nil).perform(request)
-        try check(response)
-        let reply = try JSONDecoder().decode(Reply.self, from: response.data)
-        guard reply.version == 1, reply.serverID == server.serverID, (32...128).contains(reply.token.utf8.count),
-              reply.token.utf8.allSatisfy({ $0 > 32 && $0 < 127 }) else {
-            throw LanSRError.message("电脑返回了无效配对信息。")
-        }
-        return LanSRCredential(server: server, clientID: clientID, token: reply.token)
+    static func connect(_ address: LanSRConnectionAddress, clientID: String) async throws -> (LanSRConnection, LanSRCapabilities) {
+        let initial = LanSRConnection(server: LanSRServer(host: address.host, port: address.port, serverID: ""), clientID: clientID)
+        let capabilities = try await Self(connection: initial).capabilities()
+        let server = LanSRServer(host: address.host, port: address.port, serverID: capabilities.serverID)
+        return (LanSRConnection(server: server, clientID: clientID), capabilities)
     }
 
     static func check(_ response: LanSRHTTPResponse) throws {
@@ -205,22 +198,21 @@ nonisolated struct LanSRClient: Sendable {
 
     func send(path: String, method: String = "GET", body: Data? = nil, upload: URL? = nil,
               destination: URL? = nil, maximum: Int = LanSRContract.maximumJSON) async throws -> Data {
-        guard LanSRContract.isUUID(credential.clientID), !credential.token.contains("\r"), !credential.token.contains("\n") else {
-            throw LanSRError.message("配对凭据无效，请重新配对。")
-        }
-        var request = URLRequest(url: try credential.server.url(path: path))
+        var request = URLRequest(url: try connection.server.url(path: path))
         request.httpMethod = method
-        request.setValue("Bearer \(credential.token)", forHTTPHeaderField: "Authorization")
+        request.setValue(connection.clientID, forHTTPHeaderField: "X-PicaX-Client-ID")
         request.setValue(upload == nil ? "application/json" : "image/png", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
-        let response = try await LanSRHTTPTransfer(server: credential.server, maximum: maximum, destination: destination).perform(request, upload: upload)
+        let response = try await LanSRHTTPTransfer(server: connection.server, maximum: maximum, destination: destination).perform(request, upload: upload)
         try Self.check(response)
         return response.data
     }
 
     func capabilities() async throws -> LanSRCapabilities {
         let value = try JSONDecoder().decode(LanSRCapabilities.self, from: await send(path: "/v1/capabilities"))
-        guard value.version == 1, value.serverID == credential.server.serverID, value.defaultDeliveryScale == 2,
+        guard value.version == 1, LanSRContract.isUUID(value.serverID),
+              (connection.server.serverID.isEmpty || value.serverID == connection.server.serverID),
+              value.defaultDeliveryScale == 2,
               value.models.count <= 4, Set(value.models.map(\.id)).count == value.models.count else {
             throw LanSRError.message("电脑能力响应无效。")
         }

@@ -1,4 +1,5 @@
 """Supervise a single spawned GPU process; release it when switching models."""
+import logging
 import multiprocessing
 import os
 import threading
@@ -59,6 +60,12 @@ class Worker:
                 if parent.poll(0.25):
                     self.info = parent.recv()
                     self.model_states[model_id] = dict(self.info)
+                    if self.settings.get("diagnostics"):
+                        logging.getLogger("uvicorn.error").info(
+                            "LAN model model=%s ready=%s maximum_pixels=%s",
+                            model_id, bool(self.info.get("ready")),
+                            self.info.get("metadata", {}).get("maximumInputPixels"),
+                        )
                     if self.info.get("ready"):
                         self.current_model = model_id
                         return True

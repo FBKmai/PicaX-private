@@ -1,4 +1,4 @@
-"""Loopback HTTPS integration tests. No model loading or GPU work."""
+"""Loopback HTTP integration tests for CI. No model loading or GPU work."""
 from pathlib import Path
 import sys
 import tempfile
@@ -7,10 +7,9 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(1, str(Path(__file__).resolve().parent))
-from picax_lan.auth import Pairing
 from picax_lan.jobs import JobStore
 from picax_lan.models import MODELS
-from http_harness import HTTPSHarness
+from http_harness import HTTPHarness
 from test_contracts import spec, png, result
 
 
@@ -24,24 +23,28 @@ class HTTPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.store = JobStore(self.temp.name)
-        self.pairing = Pairing(self.store)
         self.worker = FakeWorker()
         self.settings = {"weights": {model.id: "test-not-a-checkpoint" for model in MODELS}, "maximum_side": 4096, "maximum_pixels": 8_000_000}
-        self.harness = HTTPSHarness(self.store, self.worker, self.pairing, self.settings).__enter__()
+        self.harness = HTTPHarness(self.store, self.worker, self.settings).__enter__()
         self.owner = str(uuid.uuid4())
-        code, data = self.harness.request("POST", "/v1/pair", {"clientID": self.owner, "pairingSecret": self.pairing.secret})
-        self.assertEqual(code, 200)
-        self.token = data["token"]
     def tearDown(self):
         self.harness.__exit__(); self.store.close(); self.temp.cleanup()
     def request(self, method, path, body=None, **kwargs):
-        return self.harness.request(method, path, body=body, token=self.token, **kwargs)
+        return self.harness.request(method, path, body=body, client_id=self.owner, **kwargs)
 
-    def test_authentication_and_revocation(self):
-        self.assertEqual(self.harness.request("GET", "/v1/capabilities")[0], 401)
+    def test_http_connects_without_pairing_or_authorization(self):
+        code, data = self.harness.request("GET", "/")
+        self.assertEqual(code, 200)
+        self.assertEqual(data["transport"], "http")
+        self.assertEqual(self.harness.request("GET", "/v1/capabilities")[0], 200)
         self.assertEqual(self.request("GET", "/v1/capabilities")[0], 200)
-        self.store.revoke(self.owner)
-        self.assertEqual(self.request("GET", "/v1/capabilities")[0], 401)
+        self.assertEqual(self.harness.request("POST", "/v1/pair", {})[0], 404)
+
+    def test_jobs_work_without_any_client_registration(self):
+        body = spec(); base = "/v1/jobs/" + body["jobID"]
+        self.assertEqual(self.harness.request("POST", "/v1/jobs", body)[0], 200)
+        self.assertEqual(self.harness.request("GET", base)[1]["state"], "uploading")
+        self.assertEqual(self.harness.request("POST", base + "/cancel")[0], 200)
 
     def test_capability_default_and_live_budget(self):
         self.worker.model_states[MODELS[0].id]["metadata"] = {"maximumInputPixels": 400000}
@@ -51,9 +54,10 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(data["defaultModelID"], MODELS[-2].id)
         self.assertEqual(data["models"][0]["maximumInputPixels"], 400000)
 
-    def test_no_owner_leak_or_unknown_model_submission(self):
+    def test_client_ids_group_jobs_but_need_no_token(self):
         body = spec(); self.request("POST", "/v1/jobs", body)
         self.assertEqual(self.store.status(body["jobID"], self.owner)["state"], "uploading")
+        self.assertEqual(self.harness.request("GET", "/v1/jobs/" + body["jobID"], client_id=str(uuid.uuid4()))[0], 404)
         self.assertEqual(self.request("GET", "/v1/jobs/" + str(uuid.uuid4()))[0], 404)
         self.worker.model_states[body["modelID"]] = {"ready": False}
         self.assertEqual(self.request("POST", "/v1/jobs", spec())[0], 503)
@@ -81,13 +85,6 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.request("PUT", path, b"X" * len(png()), raw=True)[0], 400)
         self.assertEqual(self.request("PUT", path, {"not": "png"})[0], 415)
         self.assertEqual(self.request("PUT", path, png(), raw=True)[0], 200)
-
-    def test_tls_pin_and_single_use_pairing(self):
-        self.assertEqual(self.harness.request("POST", "/v1/pair", {"clientID": str(uuid.uuid4()), "pairingSecret": self.pairing.secret})[0], 403)
-        old = self.harness.fingerprint
-        self.harness.fingerprint = "0" * 64
-        with self.assertRaises(RuntimeError): self.request("GET", "/v1/capabilities")
-        self.harness.fingerprint = old
 
 
 if __name__ == "__main__":

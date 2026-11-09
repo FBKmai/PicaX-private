@@ -1,6 +1,6 @@
-"""Opt-in real CUDA + HTTPS end-to-end validation, bound to loopback only.
+"""Opt-in real CUDA + HTTP end-to-end validation, bound to loopback only.
 
-Uses the actual production pairing, transport, SQLite store and GPU worker.
+Uses the production HTTP transport, SQLite store and GPU worker.
 No mock inference, no firewall edits, no LAN listener, no permanent server.
 """
 import argparse
@@ -14,12 +14,11 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(1, str(Path(__file__).resolve().parent / "tests"))
-from picax_lan.auth import Pairing
 from picax_lan.cli import ALIASES
 from picax_lan.jobs import JobStore
 from picax_lan.protocol import digest_file, validate_result
 from picax_lan.worker import Worker
-from http_harness import HTTPSHarness
+from http_harness import HTTPHarness
 from validate_local import make_fixture
 
 
@@ -38,24 +37,18 @@ def main():
     settings = {"weights": {model.id: str((args.weights_dir / model.file).resolve())}, "device": "cuda", "noncommercial": True,
                 "maximum_side": 4096, "maximum_pixels": 8_000_000, "timeout": 180}
     worker = Worker(store, settings)
-    report = {"kind": "real-HTTPS-SQLite-CUDA-end-to-end", "passed": False, "cases": []}
+    report = {"kind": "real-HTTP-SQLite-CUDA-end-to-end", "passed": False, "cases": []}
     try:
         worker.start()
-        with HTTPSHarness(store, worker, Pairing(store), settings) as transport:
-            # The exact server leaf is verified before any pairing/token header.
+        with HTTPHarness(store, worker, settings) as transport:
             owner = str(uuid.uuid4())
-            code, pairing = transport.request("POST", "/v1/pair", {"clientID": owner, "pairingSecret": transport.pairing.secret})
-            if code != 200:
-                raise RuntimeError("Pairing failed: " + str(code))
-            token = pairing["token"]
-            report["certificateSHA256"] = transport.fingerprint
             report["serverID"] = store.server_id
             def request(method, path, body=None, raw=False):
-                code, response = transport.request(method, path, body, token=token, raw=raw)
+                code, response = transport.request(method, path, body, client_id=owner, raw=raw)
                 if code != 200:
                     raise RuntimeError("HTTP %s %s: %s" % (code, path, response))
                 return response
-            HTTPSHarness.wait(lambda: worker.model_states[model.id].get("ready") or worker.model_states[model.id].get("error") != "Not checked yet", 180)
+            HTTPHarness.wait(lambda: worker.model_states[model.id].get("ready") or worker.model_states[model.id].get("error") != "Not checked yet", 180)
             capabilities = request("GET", "/v1/capabilities")
             if not capabilities["models"][0]["ready"]:
                 raise RuntimeError("CUDA worker failed: " + str(capabilities))
@@ -67,9 +60,9 @@ def main():
                 started = time.monotonic()
                 source = args.output_dir / ("source-%d.png" % number)
                 make_fixture(source, width, height)
-                page = {"id": "e0000-p0000", "chapterIndex": 0, "chapterTitle": "HTTPS validation", "pageIndex": 0,
+                page = {"id": "e0000-p0000", "chapterIndex": 0, "chapterTitle": "HTTP validation", "pageIndex": 0,
                         "width": width, "height": height, "bytes": source.stat().st_size, "sha256": digest_file(source)}
-                spec = {"version": 1, "jobID": str(uuid.uuid4()), "sourceRecordID": "loopback-validation", "title": "HTTPS CUDA validation",
+                spec = {"version": 1, "jobID": str(uuid.uuid4()), "sourceRecordID": "loopback-validation", "title": "HTTP CUDA validation",
                         "modelID": model.id, "modelSHA256": model.sha256, "nativeScale": model.scale,
                         "deliveryScale": scale, "mode": "fullPage", "pages": [page]}
                 base = "/v1/jobs/" + spec["jobID"]
@@ -81,13 +74,13 @@ def main():
                     if status["state"] == "partial":
                         raise RuntimeError("Real worker failed: " + str(status["pages"][0]["error"]))
                     return status if status["state"] == "completed" else None
-                status = HTTPSHarness.wait(completed, 210)
+                status = HTTPHarness.wait(completed, 210)
                 metadata = validate_result(status["pages"][0]["result"], spec, page)
                 if metadata["device"] != "cuda":
                     raise RuntimeError("Unexpected CPU execution")
                 output = request("GET", base + "/pages/" + page["id"] + "/result")
                 if hashlib.sha256(output).hexdigest() != metadata["sha256"]:
-                    raise RuntimeError("Result hash mismatch over HTTPS")
+                    raise RuntimeError("Result hash mismatch over HTTP")
                 destination = args.output_dir / ("received-%d.png" % number)
                 destination.write_bytes(output)
                 from PIL import Image
@@ -101,7 +94,7 @@ def main():
                     raise RuntimeError("Durable ACK did not finish the task")
                 report["cases"].append({"input": [width, height], "deliveryScale": scale, "result": metadata,
                                         "roundTripSeconds": time.monotonic() - started, "passed": True})
-                print("PASS HTTPS + CUDA", width, height, "->", metadata["width"], metadata["height"],
+                print("PASS HTTP + CUDA", width, height, "->", metadata["width"], metadata["height"],
                       "%.3fs inference" % metadata["seconds"], flush=True)
             store.recover()
             report["restartRecoveryPassed"] = True

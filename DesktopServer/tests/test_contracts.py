@@ -1,18 +1,22 @@
 """Stdlib-only tests. No Torch, Pillow, network or GPU imports are required."""
 import copy
+from contextlib import redirect_stdout
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import struct
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock, patch
 import uuid
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from picax_lan.auth import Pairing, authenticate, token_digest
+from picax_lan.identity import connection_url
 from picax_lan.jobs import JobStore
 from picax_lan.models import MODELS, LICENSE, SOURCE
 from picax_lan.protocol import (ProtocolError, canonical, digest_file, identifier, local_address,
@@ -123,6 +127,31 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual({key: (sha, int(scale)) for key, sha, scale in found}, {m.id: (m.sha256, m.scale) for m in MODELS})
 
 
+class StartupTests(unittest.TestCase):
+    def test_cli_starts_plain_http_and_accepts_old_launcher_flag(self):
+        from picax_lan.cli import main
+        from picax_lan import worker as worker_module
+        for old_flags in ([], ["--pair"]):
+            with self.subTest(old_flags=old_flags), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / MODELS[-2].file).touch()  # Worker is mocked; no checkpoint is loaded.
+                worker = SimpleNamespace(thread=SimpleNamespace(ident=None), start=Mock())
+                run = Mock()
+                output = io.StringIO()
+                with patch.dict(sys.modules, {"uvicorn": SimpleNamespace(run=run), "qrcode": SimpleNamespace(QRCode=Mock())}), \
+                     patch.object(worker_module, "Worker", return_value=worker), \
+                     patch("picax_lan.server.create_app", return_value="http-app"), redirect_stdout(output):
+                    main(["--host", "192.168.5.8", "--weights-dir", str(root), "--data-dir", str(root / "data"),
+                          "--no-discovery", "--accept-noncommercial-license"] + old_flags)
+                worker.start.assert_called_once()
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args, ("http-app",))
+                self.assertFalse(any(key.startswith("ssl_") for key in run.call_args.kwargs))
+                self.assertIn("http://192.168.5.8:18443", output.getvalue())
+                self.assertNotIn("pairingSecret", output.getvalue())
+                self.assertFalse((root / "data" / "identity").exists())
+
+
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -213,11 +242,9 @@ class StorageTests(unittest.TestCase):
         for page in ("../../oops", "e0000-p0000/../../oops"):
             with self.assertRaises(ProtocolError): self.store.path(self.body["jobID"], page, "source.png")
 
-    def test_revoke_cancels_only_own_jobs(self):
-        self.store.add_client(self.owner, token_digest("a" * 43))
-        self.store.revoke(self.owner)
-        self.assertIsNone(self.store.client_for_digest(token_digest("a" * 43)))
-        self.assertEqual(self.store.status(self.body["jobID"], self.owner)["state"], "cancelled")
+    def test_http_connection_url_needs_no_identity_or_secret(self):
+        self.assertEqual(connection_url("192.168.5.8", 18443), "http://192.168.5.8:18443")
+        self.assertEqual(connection_url("fc00::1", 18443), "http://[fc00::1]:18443")
 
     def test_png_header_limits(self):
         path = Path(self.temp.name) / "page.png"; path.write_bytes(png())
@@ -226,25 +253,6 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ProtocolError): png_dimensions(path, 1024, 4095)
         path.write_bytes(b"not a PNG")
         with self.assertRaises(ProtocolError): png_dimensions(path, 1024, 4096)
-
-    def test_single_use_pairing_and_token_digest_only(self):
-        pairing = Pairing(self.store)
-        token = pairing.pair(pairing.secret, self.owner)
-        self.assertEqual(authenticate(self.store, "Bearer " + token), self.owner)
-        self.assertNotEqual(self.store.db.execute("SELECT digest FROM clients").fetchone()[0], token)
-        with self.assertRaises(ProtocolError): pairing.pair(pairing.secret, self.other)
-
-    def test_pairing_expiration_unicode_and_rate_limit(self):
-        clock = [0]
-        pairing = Pairing(self.store, ttl=2, clock=lambda: clock[0])
-        with self.assertRaises(ProtocolError): pairing.pair("测试" * 20, self.owner)
-        clock[0] = 3
-        with self.assertRaises(ProtocolError): pairing.pair(pairing.secret, self.owner)
-        clock[0] = 0
-        for _ in range(8):
-            with self.assertRaises(ProtocolError): pairing.pair("wrong", self.owner)
-        with self.assertRaises(ProtocolError) as caught: pairing.pair(pairing.secret, self.owner)
-        self.assertEqual(caught.exception.status, 429)
 
 
 if __name__ == "__main__":
