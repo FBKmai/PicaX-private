@@ -9,3 +9,6 @@ __pycache__/
 /build
 /build-mac
 /AGENTS.md
+/DesktopServer/.venv/
+/DesktopServer/weights/
+/DesktopServer/data/

@@ -1,0 +1,7 @@
+# CPython 3.11 x64 Windows ONLY. Do not reuse macOS Core ML conversion wheels.
+-r requirements-transport.txt
+numpy==2.4.6
+safetensors==0.8.0
+spandrel==0.4.2
+torch @ https://download-r2.pytorch.org/whl/cu128/torch-2.11.0%2Bcu128-cp311-cp311-win_amd64.whl#sha256=90ef0c2454e5296a9fb021ddd42252e4ce1abe2c0a4988a173ef90a6cded0bf5
+torchvision @ https://download-r2.pytorch.org/whl/cu128/torchvision-0.26.0%2Bcu128-cp311-cp311-win_amd64.whl#sha256=d26091b15cd6e3c74c148d9b68c9a901ad6fb9b0f66fa3ea3ab09f04132a07d3

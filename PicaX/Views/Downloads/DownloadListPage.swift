@@ -24,6 +24,8 @@ struct DownloadListPage: View {
     @State private var listAlert: DownloadListFeedback?
 #if os(iOS)
     @State private var libraryBatch: LibrarySuperResolutionBatch?
+    @State private var showsLanSuperResolution = false
+    @State private var lanSelectedRecords: [DownloadRecord] = []
 #endif
     @State private var exportingRecordID: String?
     @State private var archiveExportDocument = DownloadedComicExportDocument()
@@ -61,6 +63,10 @@ struct DownloadListPage: View {
                     .accessibilityLabel("下载队列")
 
 #if os(iOS)
+                    Button { lanSelectedRecords = []; showsLanSuperResolution = true } label: {
+                        Image(systemName: "desktopcomputer")
+                    }
+                    .accessibilityLabel("电脑超分任务与配对")
                     Button {
                         beginSelection()
                     } label: {
@@ -141,6 +147,16 @@ struct DownloadListPage: View {
             ComicSearchPage(initialQuery: request.tag.query, platform: request.tag.platform, service: service)
         }
 #if os(iOS)
+        .sheet(isPresented: $showsLanSuperResolution) {
+            PicaxNavigationContainer {
+                LanSuperResolutionView(records: lanSelectedRecords, onSubmitted: endSelection)
+                    .toolbar {
+                        ToolbarItem(placement: .picaxTopBarTrailing) {
+                            Button("关闭") { showsLanSuperResolution = false }
+                        }
+                    }
+            }
+        }
         .fullScreenCover(item: $libraryBatch) { batch in
             LibrarySuperResolutionView(batch: batch) {
                 libraryBatch = nil
@@ -360,9 +376,19 @@ struct DownloadListPage: View {
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Button {
+                    lanSelectedRecords = displayRecords.filter {
+                        selectedDownloadIDs.contains($0.id) && downloadService.canSuperResolution($0)
+                    }
+                    showsLanSuperResolution = true
+                } label: {
+                    Label("电脑超分", systemImage: "desktopcomputer")
+                }
+                .buttonStyle(.bordered)
+                .disabled(selectedDownloadIDs.isEmpty)
+                Button {
                     startLibraryBatch()
                 } label: {
-                    Label("批量超分", systemImage: "sparkles")
+                    Label("本机超分", systemImage: "sparkles")
                 }
                 .buttonStyle(.borderedProminent)
                 .disabled(selectedDownloadIDs.isEmpty)
@@ -573,7 +599,7 @@ struct DownloadListPage: View {
 
     private var emptyDescription: String {
         if libraryFilter == .superResolution {
-            return "在“全部”或“正常”分类中多选漫画，点击底部“批量超分”生成。"
+            return "在“全部”或“正常”分类中多选漫画，再选择“本机超分”或“电脑超分”生成。"
         }
         if hasActiveFilters {
             return "调整右上角高级筛选后再试。"

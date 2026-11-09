@@ -53,7 +53,7 @@ struct DownloadedChapterRecord: Identifiable, Equatable, Codable {
     }
 }
 
-/// Describes a synthetic download record that holds 2x super-resolved pages.
+/// Describes a synthetic download record that holds local or LAN AI results.
 /// The original download record and its files are never modified.
 struct SuperResolutionDownloadInfo: Equatable, Codable {
     let sourceRecordID: String
@@ -64,6 +64,13 @@ struct SuperResolutionDownloadInfo: Equatable, Codable {
     var completedAt: Date?
     /// Compact chapter index -> source page count at the time the batch began.
     var expectedPageCounts: [Int: Int]? = nil
+    // Optional for compatibility with all existing local/legacy downloads.
+    var backend: String? = nil
+    var serverID: String? = nil
+    var jobID: String? = nil
+    var modelID: String? = nil
+    var nativeScale: Int? = nil
+    var deliveryScale: Int? = nil
 }
 
 struct DownloadRecord: Identifiable, Equatable, Codable {
@@ -526,6 +533,15 @@ final class DownloadService: ObservableObject {
     private var autoSuperResolutionObserverTask: Task<Void, Never>?
     private var pendingAutoSuperResolutionRecordIDs: [String] = []
     private var currentAutoSuperResolutionRecordID: String?
+    private var lanReservedSourceIDs = Set<String>()
+
+    func restoreLanReservations(_ ids: Set<String>) { lanReservedSourceIDs = ids }
+    func reserveLanSource(_ record: DownloadRecord) throws {
+        guard records.contains(where: { $0.id == record.id && $0 == record }),
+              canSuperResolution(record) else { throw SuperResolutionLibraryError.sourceBusy(record.item.title) }
+        lanReservedSourceIDs.insert(record.id)
+    }
+    func releaseLanSource(_ id: String) { lanReservedSourceIDs.remove(id) }
     #if os(iOS)
     private var autoSuperResolutionSetIdleTimerDisabled = false
     #endif
@@ -705,12 +721,12 @@ final class DownloadService: ObservableObject {
         id.hasPrefix(superResolutionIDPrefix)
     }
 
-    nonisolated static func superResolutionItem(for item: ComicListItem) -> ComicListItem {
+    nonisolated static func superResolutionItem(for item: ComicListItem, scale: Int = 2, lanJobID: String? = nil) -> ComicListItem {
         ComicListItem(
-            id: "\(superResolutionIDPrefix)\(item.id)",
+            id: "\(superResolutionIDPrefix)\(item.id)" + (lanJobID.map { "-lan-\($0)" } ?? ""),
             platform: item.platform,
             title: item.title,
-            subtitle: "2× AI 超分（来自下载）",
+            subtitle: "\(scale)× AI 超分（来自下载）",
             coverURLString: item.coverURLString,
             tags: item.tags,
             pageCount: item.pageCount,
@@ -730,6 +746,8 @@ final class DownloadService: ObservableObject {
         !record.isSuperResolution
             && !record.chapters.isEmpty
             && task(for: record.item) == nil
+            && !lanReservedSourceIDs.contains(record.id)
+            && currentAutoSuperResolutionRecordID != record.id
             && superResolutionRecord(forSourceRecordID: record.id) == nil
     }
 
@@ -747,7 +765,7 @@ final class DownloadService: ObservableObject {
         guard !sourceChapters.isEmpty else {
             throw SuperResolutionLibraryError.noDownloadedChapters
         }
-        guard task(for: sourceRecord.item) == nil else {
+        guard task(for: sourceRecord.item) == nil, !lanReservedSourceIDs.contains(sourceRecord.id) else {
             throw SuperResolutionLibraryError.sourceBusy(sourceRecord.item.title)
         }
         guard superResolutionRecord(forSourceRecordID: sourceRecord.id) == nil else {
@@ -827,6 +845,13 @@ final class DownloadService: ObservableObject {
                     detail: "找不到对应的下载记录，可能已被删除。",
                     progress: 0
                 )
+                continue
+            }
+            // Remote work is restored before configure(); never delete its
+            // partial target through the legacy automatic restart path.
+            if lanReservedSourceIDs.contains(recordID)
+                || superResolutionRecord(forSourceRecordID: recordID)?.superResolution?.backend == "lan" {
+                removePersistedAutoSuperResolutionRecord(recordID)
                 continue
             }
             // A queued book whose automatic run was interrupted by suspension or
@@ -1017,7 +1042,7 @@ final class DownloadService: ObservableObject {
         guard !sourceChapters.isEmpty else {
             throw SuperResolutionLibraryError.noDownloadedChapters
         }
-        guard task(for: sourceRecord.item) == nil else {
+        guard task(for: sourceRecord.item) == nil, !lanReservedSourceIDs.contains(sourceRecord.id) else {
             throw SuperResolutionLibraryError.sourceBusy(sourceRecord.item.title)
         }
 
@@ -1208,13 +1233,151 @@ final class DownloadService: ObservableObject {
         PicaXSQLiteStore.upsertDownloadRecord(record)
     }
 
+    // MARK: - Durable LAN result library
+
+    func ensureLanSuperResolutionTarget(job: LanSRLocalJob) throws -> DownloadRecord {
+        if let existing = records.first(where: { $0.superResolution?.jobID == job.id }) {
+            guard existing.superResolution?.serverID == job.serverID,
+                  existing.superResolution?.modelID == job.model.id,
+                  existing.superResolution?.deliveryScale == job.deliveryScale else {
+                throw LanSRError.message("已有超分记录与此电脑任务不匹配。")
+            }
+            return existing
+        }
+        guard let source = records.first(where: { $0.id == job.sourceRecordID }), !source.isSuperResolution,
+              superResolutionRecord(forSourceRecordID: source.id) == nil,
+              task(for: source.item) == nil,
+              LanSRContract.isUUID(job.id), job.spec != nil,
+              !job.chapters.isEmpty, job.pageCounts.count == job.chapters.count else {
+            throw LanSRError.message("原下载已删除、正在修改或已有其他超分版本。")
+        }
+        let item = Self.superResolutionItem(for: source.item, scale: job.deliveryScale, lanJobID: job.id)
+        let directory = try downloadsRootURL().appendingPathComponent(Self.directoryName(for: item), isDirectory: true)
+        let marker = directory.appendingPathComponent("lan-job-id.txt")
+        // A retry may encounter the directory left by a failed database write;
+        // only reuse it when its ownership marker matches. Never clear it.
+        if fileManager.fileExists(atPath: directory.path) {
+            guard (try? String(contentsOf: marker, encoding: .utf8)) == job.id else {
+                throw LanSRError.message("远程结果目录缺少匹配标识，未覆盖任何文件。")
+            }
+        } else {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data(job.id.utf8).write(to: marker, options: .atomic)
+        }
+        let info = SuperResolutionDownloadInfo(sourceRecordID: source.id, sourceItemID: source.item.id,
+            sourcePlatform: source.item.platform, sourceTitle: source.item.title, createdAt: Date(),
+            completedAt: nil, expectedPageCounts: Dictionary(uniqueKeysWithValues: job.pageCounts.enumerated().map { ($0.offset, $0.element) }),
+            backend: "lan", serverID: job.serverID, jobID: job.id, modelID: job.model.id,
+            nativeScale: job.model.nativeScale, deliveryScale: job.deliveryScale)
+        var cover: String?
+        if let original = localCoverURL(for: source) {
+            let target = directory.appendingPathComponent("cover.jpg")
+            if !fileManager.fileExists(atPath: target.path) { try? fileManager.copyItem(at: original, to: target) }
+            if fileManager.fileExists(atPath: target.path) { cover = "cover.jpg" }
+        }
+        let record = DownloadRecord(item: item, chapters: [], totalChapterCount: job.chapters.count,
+            totalBytes: 0, directoryName: Self.directoryName(for: item), coverFileName: cover,
+            detail: ComicDetailInfo(item: item,
+                description: "局域网电脑 AI 超分 · \(job.model.name) · 原生 \(job.model.nativeScale)× / 回传 \(job.deliveryScale)×。原下载未修改。",
+                tagGroups: [], chapters: job.chapters, related: [], updatedText: nil),
+            comments: [], updatedAt: Date(), superResolution: info)
+        try PicaXSQLiteStore.upsertDownloadRecordOrThrow(record)
+        records.insert(record, at: 0)
+        return record
+    }
+
+    func lanResultExists(job: LanSRLocalJob, page: LanSRPage, result: LanSRResult) throws -> Bool {
+        guard let record = records.first(where: { $0.superResolution?.jobID == job.id }),
+              job.chapters.indices.contains(page.chapterIndex) else { return false }
+        let directory = try Self.chapterDirectoryURL(item: record.item, chapter: job.chapters[page.chapterIndex], index: page.chapterIndex)
+        let path = directory.appendingPathComponent(ReaderBatchRenderStore.libraryPageFileName(pageIndex: page.pageIndex))
+        guard fileManager.fileExists(atPath: path.path) else { return false }
+        try LanSRFiles.validateResultFile(path, result: result)
+        return true
+    }
+
+    /// File first, throwing SQLite update second, journal third, server ACK last.
+    /// A repeated identical page repairs statistics; a conflicting hash is refused.
+    func importLanResult(job: LanSRLocalJob, page: LanSRPage, result: LanSRResult, file: URL?) throws {
+        guard let spec = job.spec, job.chapters.indices.contains(page.chapterIndex) else {
+            throw LanSRError.message("远程页面映射已丢失。")
+        }
+        try result.validate(spec: spec, page: page)
+        let target = try ensureLanSuperResolutionTarget(job: job)
+        let chapter = job.chapters[page.chapterIndex]
+        let directory = try Self.chapterDirectoryURL(item: target.item, chapter: chapter, index: page.chapterIndex)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = directory.appendingPathComponent(ReaderBatchRenderStore.libraryPageFileName(pageIndex: page.pageIndex))
+        if fileManager.fileExists(atPath: destination.path) {
+            try LanSRFiles.validateResultFile(destination, result: result)
+        } else {
+            guard let file else { throw LanSRError.message("已收取的结果文件丢失；请重新收取。") }
+            try LanSRFiles.validateResultFile(file, result: result)
+            try LanSRFiles.checkSpace(at: directory, required: Int64(result.bytes))
+            let staging = directory.appendingPathComponent(".lan-\(page.id).part")
+            if fileManager.fileExists(atPath: staging.path) { try fileManager.removeItem(at: staging) }
+            try fileManager.copyItem(at: file, to: staging)
+            let handle = try FileHandle(forWritingTo: staging)
+            try handle.synchronize()
+            try handle.close()
+            try fileManager.moveItem(at: staging, to: destination)
+        }
+        guard let index = records.firstIndex(where: { $0.id == target.id }) else {
+            throw SuperResolutionLibraryError.recordNotFound
+        }
+        var record = records[index]
+        var count = 0
+        var bytes: Int64 = 0
+        for expected in spec.pages where expected.chapterIndex == page.chapterIndex {
+            let path = directory.appendingPathComponent(ReaderBatchRenderStore.libraryPageFileName(pageIndex: expected.pageIndex))
+            if fileManager.fileExists(atPath: path.path) {
+                count += 1
+                bytes += Int64(try LanSRFiles.size(path))
+            }
+        }
+        let chapterRecord = DownloadedChapterRecord(index: page.chapterIndex, chapter: chapter,
+            pageCount: count, bytes: bytes, downloadedAt: Date())
+        record.chapters.removeAll { $0.index == page.chapterIndex }
+        record.chapters.append(chapterRecord)
+        record.chapters.sort { $0.index < $1.index }
+        record.totalBytes = record.chapters.reduce(0) { $0 + $1.bytes }
+        record.updatedAt = Date()
+        try PicaXSQLiteStore.upsertDownloadRecordOrThrow(record)
+        records[index] = record
+    }
+
+    func completeLanResult(job: LanSRLocalJob) throws {
+        guard let spec = job.spec, spec.pages.count == job.imported.count,
+              let index = records.firstIndex(where: { $0.superResolution?.jobID == job.id }) else {
+            throw LanSRError.message("仍有结果未收取，不能标记完成。")
+        }
+        for page in spec.pages {
+            guard let result = job.results[page.id], job.imported[page.id] == result.sha256,
+                  try lanResultExists(job: job, page: page, result: result) else {
+                throw LanSRError.message("结果缺页，不能标记完成。")
+            }
+        }
+        var record = records[index]
+        record.superResolution?.completedAt = Date()
+        record.updatedAt = Date()
+        if let directory = comicDirectoryURLIfAvailable(for: record.item) {
+            let manifest = try JSONEncoder().encode(job.results)
+            try manifest.write(to: directory.appendingPathComponent("LAN-SuperResolution.json"), options: .atomic)
+            let readme = LanSRContract.readme(modelID: job.model.id, modelSHA256: job.model.sha256,
+                nativeScale: job.model.nativeScale, deliveryScale: job.deliveryScale)
+            try Data(readme.utf8).write(to: directory.appendingPathComponent("LAN-README.txt"), options: .atomic)
+        }
+        try PicaXSQLiteStore.upsertDownloadRecordOrThrow(record)
+        records[index] = record
+    }
+
     func enqueue(
         detail: ComicDetailInfo,
         chapterIndexes: [Int],
         downloadsComments: Bool = false,
         autoSuperResolutionAfterDownload: Bool = false
     ) -> DownloadEnqueueResult {
-        guard task(for: detail.item) == nil else {
+        guard task(for: detail.item) == nil, !lanReservedSourceIDs.contains(downloadID(for: detail.item)) else {
             return .alreadyDownloading
         }
 
@@ -1246,7 +1409,7 @@ final class DownloadService: ObservableObject {
         downloadsComments: Bool = false,
         autoSuperResolutionAfterDownload: Bool = false
     ) -> DownloadEnqueueResult {
-        guard task(for: item) == nil else {
+        guard task(for: item) == nil, !lanReservedSourceIDs.contains(downloadID(for: item)) else {
             return .alreadyDownloading
         }
 
@@ -1278,7 +1441,7 @@ final class DownloadService: ObservableObject {
 
         let results = items.map { item -> DownloadEnqueueResult in
             let id = downloadID(for: item)
-            guard !taskIDs.contains(id) else {
+            guard !taskIDs.contains(id), !lanReservedSourceIDs.contains(id) else {
                 return .alreadyDownloading
             }
             guard !completedRecordIDs.contains(id) else {
@@ -2171,7 +2334,7 @@ final class DownloadService: ObservableObject {
     private nonisolated static func makeArchiveExport(for record: DownloadRecord, fileNameTemplate: String) async throws -> DownloadArchiveExport {
         try await Task.detached(priority: .utility) {
             let imageURLs = try exportImageURLs(for: record)
-            let entries = imageURLs.enumerated().map { pageIndex, fileURL in
+            var entries = imageURLs.enumerated().map { pageIndex, fileURL in
                 StreamingZipEntry(sourceURL: fileURL, archivePath: archiveFileName(pageNumber: pageIndex + 1, sourceURL: fileURL))
             }
             guard !entries.isEmpty else { throw DownloadArchiveExportError.noImages }
@@ -2180,6 +2343,23 @@ final class DownloadService: ObservableObject {
             let temporaryDirectoryURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PicaX-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: temporaryDirectoryURL, withIntermediateDirectories: true)
+            if let info = record.superResolution, info.backend == "lan" {
+                guard let modelID = info.modelID, let known = LanSRContract.models[modelID],
+                      let scale = info.deliveryScale, [2, known.scale].contains(scale) else {
+                    throw LanSRError.message("电脑超分模型信息缺失，无法保留导出许可与倍率说明。")
+                }
+                // Include attribution even when exporting a cancelled/partial job.
+                let readme = temporaryDirectoryURL.appendingPathComponent("LAN-README.txt")
+                try Data(LanSRContract.readme(modelID: modelID, modelSHA256: known.sha,
+                    nativeScale: known.scale, deliveryScale: scale).utf8).write(to: readme, options: .atomic)
+                entries.append(StreamingZipEntry(sourceURL: readme, archivePath: readme.lastPathComponent))
+                let manifest = try downloadsRootURL()
+                    .appendingPathComponent(directoryName(for: record.item), isDirectory: true)
+                    .appendingPathComponent("LAN-SuperResolution.json")
+                if FileManager.default.fileExists(atPath: manifest.path) {
+                    entries.append(StreamingZipEntry(sourceURL: manifest, archivePath: manifest.lastPathComponent))
+                }
+            }
             let outputURL = temporaryDirectoryURL.appendingPathComponent(fileName)
             try StreamingZipArchive.write(entries: entries, to: outputURL)
             return DownloadArchiveExport(fileURL: outputURL, fileName: fileName)

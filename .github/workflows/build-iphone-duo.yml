@@ -87,6 +87,7 @@ jobs:
           python -I -B BuildScripts/SuperResolution/test_fetch_checkpoint.py
           python -I -B BuildScripts/SuperResolution/test_stage_bundle_model.py
           python -I -B BuildScripts/test-super-resolution-bundle.py
+          python -I -B DesktopServer/tests/test_contracts.py
 
       - name: Stage validated color full-page model
         if: inputs.bundle_color_model == true

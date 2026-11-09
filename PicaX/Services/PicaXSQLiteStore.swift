@@ -450,6 +450,14 @@ enum PicaXSQLiteStore {
         upsert(table: "download_records", id: record.id, sortDate: record.updatedAt, value: record)
     }
 
+    /// Remote result ACKs must never follow a silently failed database write.
+    static func upsertDownloadRecordOrThrow(_ record: DownloadRecord) throws {
+        try db.execute(
+            "INSERT OR REPLACE INTO download_records(id, sort_date, value) VALUES(?, ?, ?)",
+            bindings: [.text(record.id), .double(record.updatedAt.timeIntervalSince1970),
+                       .data(try encodedOrThrow(record))])
+    }
+
     static func replaceDownloadRecords(_ records: [DownloadRecord]) {
         replace(table: "download_records", values: records) { record in
             (record.id, record.updatedAt)

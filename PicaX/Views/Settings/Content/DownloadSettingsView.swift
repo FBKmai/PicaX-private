@@ -88,6 +88,15 @@ struct DownloadSettingsView: View {
 
             #if os(iOS)
             Section {
+                NavigationLink {
+                    LanSuperResolutionView()
+                } label: {
+                    Label("局域网电脑超分", systemImage: "desktopcomputer")
+                }
+            } footer: {
+                Text("配对局域网电脑、查看模型和收取远程结果；不会改变手机的自动超分设置。")
+            }
+            Section {
                 Toggle("允许在后台继续超分", isOn: $autoSuperResolutionInBackground)
             } header: {
                 Text("后台超分")

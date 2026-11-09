@@ -57,6 +57,19 @@
 	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>发现并连接你选择的局域网电脑，加密传输已下载漫画进行 AI 超分，并收取结果。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_picax-sr._tcp</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>扫描你电脑上的一次性配对二维码，以验证局域网超分服务器的地址与证书。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSFaceIDUsageDescription</key>
 	<string>使用 Face ID 验证身份以解锁 PicaX 并保护漫画内容。</string>
 	<key>NSSupportsLiveActivities</key>

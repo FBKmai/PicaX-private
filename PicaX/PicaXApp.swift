@@ -76,8 +76,14 @@ struct PicaXApp: App {
                     }
                     ImageCacheService.configure()
                     ComicDetailCacheService.configure()
+                    // Restore LAN source reservations before the automatic
+                    // local queue can inspect/remove interrupted SR targets.
+                    _ = LanSuperResolutionCoordinator.shared
                     downloadService.configure { platform in
                         platformAccountService.account(for: platform)
+                    }
+                    if scenePhase == .active {
+                        LanSuperResolutionCoordinator.shared.applicationDidBecomeActive()
                     }
                     followUpdatesService.configure { platform in
                         platformAccountService.account(for: platform)
@@ -91,6 +97,7 @@ struct PicaXApp: App {
                 .onChange(of: scenePhase) { newValue in
                     switch newValue {
                     case .active:
+                        LanSuperResolutionCoordinator.shared.applicationDidBecomeActive()
                         downloadService.applicationDidBecomeActive()
                         followUpdatesService.checkAutomaticallyIfNeeded()
                         Task {
@@ -100,6 +107,7 @@ struct PicaXApp: App {
                             await platformAccountService.autoLoginJmComicIfNeeded()
                         }
                     case .background:
+                        LanSuperResolutionCoordinator.shared.applicationDidEnterBackground()
                         downloadService.applicationDidEnterBackground()
                     case .inactive:
                         break
