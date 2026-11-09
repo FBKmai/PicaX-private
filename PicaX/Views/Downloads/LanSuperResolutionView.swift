@@ -1,6 +1,17 @@
 #if os(iOS)
 import SwiftUI
 
+/// One item drives both sheet presentation and its immutable download snapshot.
+/// An empty snapshot is the connection/task manager opened from the toolbar.
+struct LanSuperResolutionPresentation: Identifiable {
+    let id = UUID()
+    let records: [DownloadRecord]
+
+    init(records: [DownloadRecord] = []) {
+        self.records = records
+    }
+}
+
 /// Used both from download multi-select and Settings. Closing this view never
 /// owns/cancels a submitted job; the shared coordinator owns its lifetime.
 struct LanSuperResolutionView: View {
@@ -37,7 +48,7 @@ struct LanSuperResolutionView: View {
             if coordinator.server == nil { discoverySection }
             addressSection
             modelSection
-            if !records.isEmpty { submissionSection }
+            submissionSection
             taskSection
             Section {
                 Text("仅发送已下载漫画的规范化原图，不传送漫画源账号或 Cookie。结果另存到“下载 → 超分”，不覆盖原图。")
@@ -170,16 +181,26 @@ struct LanSuperResolutionView: View {
 
     private var submissionSection: some View {
         Section {
-            Text("已选择 \(records.count) 本已下载漫画")
+            if records.isEmpty {
+                Text("尚未选择要发送的漫画")
+                Text("请返回下载库，在“全部”或“正常”分类多选已下载漫画，再点底部“电脑超分”。这里不会自动发送整个下载库。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("已选择 \(records.count) 本已下载漫画")
+                ForEach(records) { record in
+                    Text(record.item.title)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
             Button(didSubmit ? "已加入电脑任务" : "发送到电脑超分") {
-                guard let model = selectedModel else { return }
+                guard !records.isEmpty, let model = selectedModel else { return }
                 do {
                     try coordinator.enqueue(records: records, model: model, scale: deliveryScale)
                     didSubmit = true
                     onSubmitted?()
                 } catch { localError = error.localizedDescription }
             }
-            .disabled(didSubmit || selectedModel == nil || isConnecting)
+            .disabled(records.isEmpty || didSubmit || selectedModel == nil || isConnecting)
         } header: { Text("手动提交") }
         footer: { Text("仅处理本次所选下载，不改变“下载后自动超分”的手机本地处理设置。准备和上传时请保持 App 在前台，直到任务显示“输入已完整提交”。") }
     }

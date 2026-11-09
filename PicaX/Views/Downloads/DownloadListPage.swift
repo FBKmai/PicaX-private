@@ -24,8 +24,7 @@ struct DownloadListPage: View {
     @State private var listAlert: DownloadListFeedback?
 #if os(iOS)
     @State private var libraryBatch: LibrarySuperResolutionBatch?
-    @State private var showsLanSuperResolution = false
-    @State private var lanSelectedRecords: [DownloadRecord] = []
+    @State private var lanSuperResolutionPresentation: LanSuperResolutionPresentation?
 #endif
     @State private var exportingRecordID: String?
     @State private var archiveExportDocument = DownloadedComicExportDocument()
@@ -63,10 +62,10 @@ struct DownloadListPage: View {
                     .accessibilityLabel("下载队列")
 
 #if os(iOS)
-                    Button { lanSelectedRecords = []; showsLanSuperResolution = true } label: {
+                    Button { lanSuperResolutionPresentation = LanSuperResolutionPresentation() } label: {
                         Image(systemName: "desktopcomputer")
                     }
-                    .accessibilityLabel("电脑超分任务与配对")
+                    .accessibilityLabel("电脑超分任务与连接")
                     Button {
                         beginSelection()
                     } label: {
@@ -147,12 +146,12 @@ struct DownloadListPage: View {
             ComicSearchPage(initialQuery: request.tag.query, platform: request.tag.platform, service: service)
         }
 #if os(iOS)
-        .sheet(isPresented: $showsLanSuperResolution) {
+        .sheet(item: $lanSuperResolutionPresentation) { presentation in
             PicaxNavigationContainer {
-                LanSuperResolutionView(records: lanSelectedRecords, onSubmitted: endSelection)
+                LanSuperResolutionView(records: presentation.records, onSubmitted: endSelection)
                     .toolbar {
                         ToolbarItem(placement: .picaxTopBarTrailing) {
-                            Button("关闭") { showsLanSuperResolution = false }
+                            Button("关闭") { lanSuperResolutionPresentation = nil }
                         }
                     }
             }
@@ -376,10 +375,7 @@ struct DownloadListPage: View {
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Button {
-                    lanSelectedRecords = displayRecords.filter {
-                        selectedDownloadIDs.contains($0.id) && downloadService.canSuperResolution($0)
-                    }
-                    showsLanSuperResolution = true
+                    presentLanSubmission()
                 } label: {
                     Label("电脑超分", systemImage: "desktopcomputer")
                 }
@@ -448,6 +444,22 @@ struct DownloadListPage: View {
     }
 
 #if os(iOS)
+    private func presentLanSubmission() {
+        let selected = displayRecords.filter {
+            selectedDownloadIDs.contains($0.id) && downloadService.canSuperResolution($0)
+        }
+        guard !selected.isEmpty else {
+            listAlert = DownloadListFeedback(
+                title: "没有可发送的漫画",
+                message: "所选漫画已有超分版本、正在下载或处理，或没有已下载章节。请重新选择普通下载。"
+            )
+            return
+        }
+        // Present the selection snapshot itself, so the first sheet render
+        // cannot read an old empty array from independent presentation state.
+        lanSuperResolutionPresentation = LanSuperResolutionPresentation(records: selected)
+    }
+
     private func startLibraryBatch() {
         let selected = displayRecords.filter {
             selectedDownloadIDs.contains($0.id) && downloadService.canSuperResolution($0)

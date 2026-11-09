@@ -9,6 +9,31 @@ final class DownloadRecordTests: XCTestCase {
         XCTAssertTrue(makeRecord(totalChapterCount: 2, downloadedChapterCount: 2).isFullyDownloaded)
     }
 
+    #if os(iOS)
+    func testLanSheetPresentationKeepsSelectionSnapshot() {
+        let record = makeRecord(totalChapterCount: 1, downloadedChapterCount: 1)
+        var selected = [record]
+        let presentation = LanSuperResolutionPresentation(records: selected)
+
+        selected.removeAll()  // Ending download selection must not empty the sheet.
+
+        XCTAssertTrue(selected.isEmpty)
+        XCTAssertEqual(presentation.records, [record])
+    }
+
+    func testLanSheetManagerAndSubmissionHaveSeparateIdentities() {
+        let record = makeRecord(totalChapterCount: 1, downloadedChapterCount: 1)
+        let manager = LanSuperResolutionPresentation()
+        let submission = LanSuperResolutionPresentation(records: [record])
+        let reopened = LanSuperResolutionPresentation(records: [record])
+
+        XCTAssertTrue(manager.records.isEmpty)
+        XCTAssertEqual(submission.records, [record])
+        XCTAssertNotEqual(manager.id, submission.id)
+        XCTAssertNotEqual(submission.id, reopened.id)
+    }
+    #endif
+
     func testLegacyRecordWithoutSuperResolutionStillDecodes() throws {
         let record = makeRecord(totalChapterCount: 1, downloadedChapterCount: 1)
         let data = try JSONEncoder().encode(record)
