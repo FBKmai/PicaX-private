@@ -190,6 +190,8 @@ class StartupTests(unittest.TestCase):
                 self.assertEqual(store_factory.call_args.kwargs,
                                  {"job_quota": job_gib * 1024**3, "total_quota": total_gib * 1024**3})
                 self.assertEqual(worker_factory.call_args.args[1]["precisions"], {MODELS[-2].id: "float32"})
+                self.assertEqual(worker_factory.call_args.args[1]["hat_window_batch"], 128)
+                self.assertEqual(worker_factory.call_args.args[1]["hat_attention_backend"], "eager")
                 worker.start.assert_called_once()
                 run.assert_called_once()
                 self.assertEqual(run.call_args.args, ("http-app",))
@@ -206,10 +208,12 @@ class StartupTests(unittest.TestCase):
                 (root / model.file).touch()  # No real weights are loaded.
             base = ["--host", "192.168.5.8", "--weights-dir", str(root), "--data-dir", str(root / "data"),
                     "--models", "hat-l", "fdat-xl", "--no-discovery", "--accept-noncommercial-license"]
-            for flags, expected in (
-                (["--model-precision", "hat-l=bfloat16"], {MODELS[0].id: "bfloat16", MODELS[-2].id: "float32"}),
-                (["--precision", "bfloat16", "--model-precision", "hat-l=bfloat16", "--model-precision", "hat-l=float32"],
-                 {MODELS[0].id: "float32", MODELS[-2].id: "bfloat16"}),
+            for flags, expected, window_batch, backend in (
+                (["--model-precision", "hat-l=bfloat16", "--hat-window-batch", "0"],
+                 {MODELS[0].id: "bfloat16", MODELS[-2].id: "float32"}, 0, "eager"),
+                (["--precision", "bfloat16", "--model-precision", "hat-l=bfloat16", "--model-precision", "hat-l=float32",
+                  "--hat-window-batch", "256", "--hat-attention-backend", "sdpa"],
+                 {MODELS[0].id: "float32", MODELS[-2].id: "bfloat16"}, 256, "sdpa"),
             ):
                 worker = SimpleNamespace(thread=SimpleNamespace(ident=None), start=Mock())
                 with patch.dict(sys.modules, {"uvicorn": SimpleNamespace(run=Mock()), "qrcode": SimpleNamespace(QRCode=Mock())}), \
@@ -217,8 +221,14 @@ class StartupTests(unittest.TestCase):
                      patch("picax_lan.server.create_app", return_value="http-app"), redirect_stdout(io.StringIO()):
                     main(base + flags)
                 self.assertEqual(factory.call_args.args[1]["precisions"], expected)
+                self.assertEqual(factory.call_args.args[1]["hat_window_batch"], window_batch)
+                self.assertEqual(factory.call_args.args[1]["hat_attention_backend"], backend)
             for flags in (["--model-precision", "hat-l=float16"], ["--model-precision", "fdat-m=bfloat16"],
-                          ["--model-precision", "hat-l"], ["--device", "cpu", "--precision", "bfloat16"]):
+                          ["--model-precision", "hat-l"], ["--device", "cpu", "--precision", "bfloat16"],
+                          ["--hat-window-batch", "-1"], ["--hat-window-batch", "4097"],
+                          ["--hat-window-batch", "1.5"], ["--hat-attention-backend", "math"],
+                          ["--hat-window-batch", "0", "--hat-attention-backend", "sdpa"],
+                          ["--device", "cpu", "--hat-attention-backend", "sdpa"]):
                 with self.subTest(flags=flags), patch("picax_lan.cli.JobStore") as factory, redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as error: main(base + flags)
                     self.assertEqual(error.exception.code, 2)
@@ -235,6 +245,44 @@ class StartupTests(unittest.TestCase):
                 store_factory.assert_not_called()
 
 
+class HATOptionsTests(unittest.TestCase):
+    def test_options_and_original_path_require_no_heavy_imports(self):
+        from picax_lan.hat_memory import install, validate_options
+        for count in (0, 1, 64, 128, 512, 4096):
+            validate_options(count, "eager")
+        validate_options(128, "sdpa")
+        for count, backend in ((True, "eager"), (1.5, "eager"), (-1, "eager"), (4097, "eager"),
+                               ("128", "eager"), (0, "sdpa"), (128, "math")):
+            with self.subTest(count=count, backend=backend), self.assertRaises(ValueError):
+                validate_options(count, backend)
+        with patch.dict(sys.modules, {"torch": None, "spandrel": None}), \
+             patch("picax_lan.hat_memory.version", side_effect=AssertionError("Original path must not inspect packages")):
+            self.assertIsNone(install(object(), 0, "eager"))
+
+    def test_diagnostics_log_sizes_and_memory_not_titles_or_content(self):
+        from picax_lan.inference import Predictor
+        predictor = Predictor.__new__(Predictor)
+        predictor.settings = {"device": "cpu", "diagnostics": True}
+        predictor.descriptor = MODELS[0]
+        predictor.metadata = {"precision": "bfloat16", "attentionWindowBatch": 128, "attentionBackend": "eager"}
+        predictor.torch = Mock()
+        self.assertEqual(predictor.memory_snapshot(), {})
+        predictor.torch.assert_not_called()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            predictor.diagnostic("pageStart", {"width": 960, "height": 1616, "chapterTitle": "private title"},
+                                 {"allocatedBytes": 123})
+        value = json.loads(output.getvalue().removeprefix("LAN inference "))
+        self.assertEqual(value["memory"], {"allocatedBytes": 123})
+        self.assertEqual((value["width"], value["height"], value["windowBatch"]), (960, 1616, 128))
+        self.assertNotIn("private title", output.getvalue())
+        self.assertNotIn("chapterTitle", value)
+        predictor.settings["diagnostics"] = False
+        with redirect_stdout(io.StringIO()) as quiet:
+            predictor.diagnostic("pageStart", {"width": 1, "height": 1})
+        self.assertEqual(quiet.getvalue(), "")
+
+
 class InferenceContractTests(unittest.TestCase):
     """Mock only the inference boundary; never import Torch, NumPy or Pillow."""
 
@@ -243,12 +291,16 @@ class InferenceContractTests(unittest.TestCase):
 
     def test_startup_precision_support_without_vram_estimates(self):
         from picax_lan.inference import Predictor
-        cases = [(model, None, True, True, "cuda") for model in MODELS]
-        cases += [(MODELS[0], "bfloat16", model_bf16, gpu_bf16, device)
+        cases = [(model, None, True, True, "cuda", 128, "eager") for model in MODELS]
+        cases += [(MODELS[0], "bfloat16", model_bf16, gpu_bf16, device, 128, "eager")
                   for model_bf16, gpu_bf16, device in ((True, True, "cuda"), (False, True, "cuda"),
                                                       (True, False, "cuda"), (True, True, "cpu"))]
-        for model, precision, model_bf16, gpu_bf16, device in cases:
-            with self.subTest(model=model.id, precision=precision, model_bf16=model_bf16, gpu_bf16=gpu_bf16, device=device):
+        cases += [(MODELS[0], "bfloat16", True, True, "cuda", 0, "eager"),
+                  (MODELS[0], "bfloat16", True, True, "cuda", 64, "sdpa"),
+                  (MODELS[0], None, True, True, "cpu", 64, "sdpa")]
+        for model, precision, model_bf16, gpu_bf16, device, window_batch, backend in cases:
+            with self.subTest(model=model.id, precision=precision, model_bf16=model_bf16, gpu_bf16=gpu_bf16,
+                              device=device, window_batch=window_batch, backend=backend):
                 torch = MagicMock()
                 torch.__version__ = "test-only"
                 torch.version.cuda = "test-only"
@@ -269,21 +321,42 @@ class InferenceContractTests(unittest.TestCase):
                            "spandrel": SimpleNamespace(ImageModelDescriptor=descriptor_type, ModelLoader=Mock(return_value=loader),
                                                        canonicalize_state_dict=lambda value: value)}
                 settings = {"model_id": model.id, "device": device, "noncommercial": True,
+                            "hat_window_batch": window_batch, "hat_attention_backend": backend,
                             "weights": {model.id: "not-a-real-checkpoint"}, "maximum_pixels": 8_000_000}
                 if precision is not None:
                     settings["precisions"] = {model.id: precision}
                 contract = SimpleNamespace(checked_weight_bytes=Mock(return_value=b"test-only"))
                 supported = ["float32"] + (["bfloat16"] if device == "cuda" and model_bf16 and gpu_bf16 else [])
+                scheduler = SimpleNamespace(metadata=Mock(return_value={
+                    "attentionImplementation": "mock-bounded-hat", "attentionWindowBatch": window_batch,
+                    "attentionBackend": backend})) if window_batch else None
                 with patch.dict(sys.modules, modules), \
+                     patch("picax_lan.inference.install", return_value=scheduler) as installer, \
                      patch("picax_lan.inference.trusted_tooling", return_value=(contract, SimpleNamespace())):
                     if (precision or "float32") not in supported:
                         with self.assertRaisesRegex(RuntimeError, "no implicit precision fallback"): Predictor(settings)
                         detected.model.eval.assert_not_called()
+                        installer.assert_not_called()
+                        continue
+                    if device == "cpu" and backend == "sdpa":
+                        with self.assertRaisesRegex(RuntimeError, "Fused HAT SDPA requires CUDA"): Predictor(settings)
+                        detected.model.eval.assert_not_called()
+                        installer.assert_not_called()
                         continue
                     predictor = Predictor(settings)
                 self.assertEqual(predictor.metadata["maximumInputPixels"], 8_000_000)
                 self.assertEqual(predictor.metadata["precision"], precision or "float32")
                 self.assertEqual(predictor.metadata["supportedPrecisions"], supported)
+                if model.architecture == "HAT":
+                    installer.assert_called_once_with(detected.model.eval.return_value.to.return_value, window_batch, backend)
+                    self.assertEqual(predictor.metadata["attentionImplementation"],
+                                     "mock-bounded-hat" if window_batch else "spandrel-original")
+                    self.assertEqual(predictor.metadata["attentionWindowBatch"], window_batch)
+                    self.assertEqual(predictor.metadata["attentionBackend"], backend)
+                else:
+                    installer.assert_not_called()
+                    self.assertIsNone(predictor.hat_memory)
+                    self.assertNotIn("attentionImplementation", predictor.metadata)
                 detected.model.eval.return_value.to.assert_called_once_with(device=device, dtype=getattr(torch, precision or "float32"))
                 detected.model.float.assert_not_called()
                 torch.cuda.mem_get_info.assert_not_called()
@@ -316,7 +389,8 @@ class InferenceContractTests(unittest.TestCase):
                 predictor.torch.from_numpy.return_value.to.assert_called_once_with(device="cuda", dtype=predictor.torch.float32)
                 predictor.torch.cuda.reset_peak_memory_stats.assert_called_once_with()
                 predictor.torch.cuda.mem_get_info.assert_not_called()
-                predictor.torch.cuda.memory_reserved.assert_not_called()
+                predictor.torch.cuda.memory_reserved.assert_called_once_with()
+                predictor.torch.cuda.empty_cache.assert_not_called()
                 pw, ph = padded_dimensions(page["width"], page["height"], model.alignment)
                 self.assertEqual(predictor.full_page.pad_reflect.call_args.args[2:], (2000, 3000, pw, ph))
 
@@ -330,11 +404,14 @@ class InferenceContractTests(unittest.TestCase):
                 page.update(width=1280, height=1864)
                 predictor = SimpleNamespace(metadata={"precision": precision}, descriptor=MODELS[0],
                     torch=SimpleNamespace(cuda=SimpleNamespace(OutOfMemoryError=self.CUDAOutOfMemoryError)),
+                    memory_snapshot=Mock(return_value={"allocatedBytes": 123}),
+                    diagnostic=Mock(side_effect=RuntimeError("simulated diagnostics failure")),
                     predict=Mock(side_effect=failure))
                 connection = Mock()
                 connection.recv.return_value = {"source": "source.png", "destination": "result.part", "page": page, "spec": body}
                 with patch("picax_lan.inference.Predictor", return_value=predictor):
-                    worker_main(connection, {"device": "cuda"})
+                    worker_main(connection, {"device": "cuda", "diagnostics": True})
+                predictor.diagnostic.assert_called_once_with("error", page, {"allocatedBytes": 123})
                 self.assertEqual(connection.send.call_args_list[0].args[0], {"ready": True, "metadata": predictor.metadata})
                 error = connection.send.call_args_list[1].args[0]["error"]
                 if isinstance(failure, self.CUDAOutOfMemoryError):
@@ -350,17 +427,23 @@ class InferenceContractTests(unittest.TestCase):
         from picax_lan.inference import Predictor
         body = spec(MODELS[0]); body["precision"] = "bfloat16"
         page = body["pages"][0]
+        page.update(width=63, height=65)  # Crop native padding and span three output bands.
         predictor = Predictor.__new__(Predictor)
         predictor.descriptor = MODELS[0]
         predictor.settings = {"device": "cuda", "maximum_side": 4096, "maximum_pixels": 8_000_000}
         predictor.np, predictor.torch = MagicMock(), MagicMock()
+        predictor.hat_memory = SimpleNamespace(metadata=lambda: {"attentionWindowBatch": 128, "attentionMaxWindows": 128})
+        for name, value in (("memory_allocated", 123), ("memory_reserved", 456),
+                            ("max_memory_allocated", 789), ("max_memory_reserved", 1024)):
+            getattr(predictor.torch.cuda, name).return_value = value
+        predictor.torch.cuda.Event.return_value.elapsed_time.return_value = 1250.0
         predictor.dtype = predictor.torch.bfloat16
         predictor.torch.inference_mode.side_effect = nullcontext
         predictor.torch.isfinite.return_value.all.return_value.item.return_value = True
         predictor.metadata = result(body)
         predictor.full_page = SimpleNamespace(pad_reflect=MagicMock())
         output = MagicMock()
-        output.shape = (1, 3, 256, 256)
+        output.shape = (1, 3, 512, 256)
         predictor.model = Mock(return_value=output)
         image = MagicMock()
         image.open.return_value.__enter__.return_value.mode = "RGB"
@@ -368,19 +451,43 @@ class InferenceContractTests(unittest.TestCase):
         destination.stat.return_value.st_size = predictor.metadata["bytes"]
         with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}), \
              patch("picax_lan.inference.validate_png"), \
-             patch("picax_lan.inference.png_dimensions", return_value=(128, 128)), \
+             patch("picax_lan.inference.png_dimensions", return_value=(126, 130)), \
              patch("picax_lan.inference.digest_file", side_effect=[page["sha256"], predictor.metadata["sha256"]]):
             value = predictor.predict(Path("mock-input.png"), destination, page, body)
         self.assertEqual(value["precision"], "bfloat16")
+        self.assertEqual(value["attentionWindowBatch"], 128)
+        self.assertEqual(value["modelSeconds"], 1.25)
+        self.assertEqual(value["peakAllocatedBytes"], 789)
+        self.assertEqual(value["peakReservedBytes"], 1024)
+        self.assertEqual(set(value["memoryStages"]), {"pageStart", "modelEnd", "outputReleased"})
+        for stage in value["memoryStages"].values():
+            self.assertEqual(stage, {"allocatedBytes": 123, "reservedBytes": 456,
+                                     "peakAllocatedBytes": 789, "peakReservedBytes": 1024})
+        self.assertIsInstance(value["workerPID"], int)
+        self.assertGreaterEqual(value["postprocessSeconds"], 0)
+        predictor.torch.cuda.Event.assert_has_calls([call(enable_timing=True), call(enable_timing=True)], any_order=True)
+        predictor.torch.cuda.Event.return_value.synchronize.assert_called_once_with()
+        predictor.torch.cuda.synchronize.assert_not_called()
+        predictor.torch.cuda.empty_cache.assert_not_called()
         predictor.torch.from_numpy.return_value.to.assert_called_once_with(device="cuda", dtype=predictor.torch.bfloat16)
+        self.assertEqual(output.__getitem__.call_args_list, [
+            call((0, slice(None), slice(start, end), slice(None, 252)))
+            for start, end in ((0, 128), (128, 256), (256, 260))])
         cropped = output.__getitem__.return_value.detach.return_value
-        cropped.cpu.assert_called_once_with()
+        self.assertEqual(cropped.cpu.call_count, 3)
         cropped.float.assert_not_called()  # Never allocate a full-page FP32 copy on CUDA.
         cpu = cropped.cpu.return_value
-        cpu.float.assert_called_once_with()
+        self.assertEqual(cpu.float.call_count, 3)
         cpu.numpy.assert_not_called()  # BF16 is not sent directly to NumPy.
-        cpu.float.return_value.clamp_.assert_called_once_with(0, 1)
-        cpu.float.return_value.clamp_.return_value.numpy.assert_called_once_with()
+        cpu.float.return_value.clamp_.assert_has_calls([call(0, 1)] * 3, any_order=True)
+        self.assertEqual(cpu.float.return_value.clamp_.return_value.numpy.call_count, 3)
+        predictor.np.empty.assert_called_once_with((260, 252, 3), dtype=predictor.np.uint8)
+        self.assertEqual(predictor.np.rint.call_count, 3)
+        self.assertEqual(predictor.np.clip.call_count, 3)
+        for operation in (predictor.np.rint, predictor.np.clip):
+            for entry in operation.call_args_list:
+                self.assertIs(entry.args[0], entry.kwargs["out"])
+        image.fromarray.return_value.resize.assert_called_once_with((126, 130), image.Resampling.LANCZOS)
         image.fromarray.return_value.resize.return_value.save.assert_called_once_with(destination, format="PNG")
         body["precision"] = "float32"
         with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}):

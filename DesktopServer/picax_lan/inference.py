@@ -1,8 +1,11 @@
 """Real eager JaNai inference; heavyweight imports stay inside the worker."""
 import importlib.util
+import json
+import os
 import time
 from pathlib import Path
 
+from .hat_memory import DEFAULT_WINDOW_BATCH, install, validate_options
 from .models import LICENSE, SOURCE, configured_precision, get_model
 from .protocol import (MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS, MAX_PIXELS,
                        ProtocolError, digest_file, padded_dimensions, png_dimensions, validate_result)
@@ -31,6 +34,20 @@ def validate_png(path, expected):
         image.load()
         if image.size != expected:
             raise ProtocolError("Invalid PNG", 422)
+
+
+def quantize_output(result, width, height, native, np, rows=128):
+    """Bound CPU FP32 temporaries to a row band; keep the original PNG rounding."""
+    pixels = np.empty((height * native, width * native, 3), dtype=np.uint8)
+    for start in range(0, height * native, rows):
+        end = min(start + rows, height * native)
+        band = result[0, :, start:end, :width * native].detach().cpu().float().clamp_(0, 1).numpy()
+        band *= 255.0
+        np.rint(band, out=band)
+        np.clip(band, 0, 255, out=band)
+        pixels[start:end] = band.transpose(1, 2, 0)
+        del band
+    return pixels
 
 
 class Predictor:
@@ -78,7 +95,13 @@ class Predictor:
             raise RuntimeError("Unsupported device")
         if precision not in supported_precisions:
             raise RuntimeError(f"{model.name} on {device} does not support {precision}; no implicit precision fallback")
+        window_batch = settings.get("hat_window_batch", DEFAULT_WINDOW_BATCH)
+        backend = settings.get("hat_attention_backend", "eager")
+        validate_options(window_batch, backend)
+        if device != "cuda" and backend == "sdpa":
+            raise RuntimeError("Fused HAT SDPA requires CUDA; select the eager backend for CPU diagnostics")
         self.model = detected.model.eval().to(device=device, dtype=self.dtype)
+        self.hat_memory = install(self.model, window_batch, backend) if model.architecture == "HAT" else None
         self.metadata = {
             # Decoder/transport capacity only; do not turn a startup free-VRAM
             # estimate into an input veto on the phone or the server.
@@ -90,6 +113,25 @@ class Predictor:
             "cudaVersion": str(torch.version.cuda or "none"),
             "license": LICENSE, "sourceURL": SOURCE, "mode": "fullPage",
         }
+        if model.architecture == "HAT":
+            self.metadata.update(self.hat_memory.metadata() if self.hat_memory else {
+                "attentionImplementation": "spandrel-original", "attentionWindowBatch": 0,
+                "attentionBackend": "eager", "sdpaBackends": []})
+
+    def memory_snapshot(self):
+        if self.settings["device"] != "cuda":
+            return {}
+        cuda = self.torch.cuda
+        return {"allocatedBytes": cuda.memory_allocated(), "reservedBytes": cuda.memory_reserved(),
+                "peakAllocatedBytes": cuda.max_memory_allocated(), "peakReservedBytes": cuda.max_memory_reserved()}
+
+    def diagnostic(self, phase, page, memory=None):
+        if self.settings.get("diagnostics"):
+            entry = {"phase": phase, "pid": os.getpid(), "width": page["width"], "height": page["height"],
+                     "precision": self.metadata["precision"], "modelID": self.descriptor.id,
+                     "windowBatch": self.metadata.get("attentionWindowBatch"),
+                     "backend": self.metadata.get("attentionBackend"), "memory": memory or {}}
+            print("LAN inference " + json.dumps(entry, ensure_ascii=False), flush=True)
 
     def predict(self, source, destination, page, spec):
         from PIL import Image
@@ -109,9 +151,12 @@ class Predictor:
             raise RuntimeError("Page exceeds the configured input decoder limit")
         if width * height * scale**2 > MAX_OUTPUT_PIXELS:
             raise RuntimeError("Delivered image exceeds the phone's receive limits")
-        if self.settings["device"] == "cuda":
+        cuda = self.settings["device"] == "cuda"
+        if cuda:
             # Attempt the actual single-page inference; no predicted VRAM veto.
             torch.cuda.reset_peak_memory_stats()
+        memory = {"pageStart": self.memory_snapshot()}
+        self.diagnostic("pageStart", page, memory["pageStart"])
         with Image.open(source) as image:
             if image.mode == "RGBA":
                 background = Image.new("RGB", image.size, "white")
@@ -121,28 +166,50 @@ class Predictor:
         array = self.full_page.pad_reflect(np, array, width, height, pw, ph)[None]
         with torch.inference_mode():
             tensor = torch.from_numpy(array).to(device=self.settings["device"], dtype=self.dtype)
+            del array
+            if cuda:
+                model_start, model_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                model_start.record()
+            model_started = time.monotonic()
             result = self.model(tensor)
+            if cuda:
+                model_end.record()
             if tuple(result.shape) != (1, 3, ph * native, pw * native) or not bool(torch.isfinite(result).all().item()):
                 raise RuntimeError("Invalid/nonfinite native model output")
-            # NumPy cannot consume BF16 directly. Convert only after the GPU-to-CPU
-            # copy, and quantize PNG pixels in FP32 for either inference dtype.
-            pixels = result[0, :, :height * native, :width * native].detach().cpu().float().clamp_(0, 1).numpy()
+            model_wall_seconds = time.monotonic() - model_started
+            if cuda:
+                # Boundary only; never synchronize within an attention chunk.
+                model_end.synchronize()
+                model_seconds = model_start.elapsed_time(model_end) / 1000.0
+            else:
+                model_seconds = model_wall_seconds
+            memory["modelEnd"] = self.memory_snapshot()
+            self.diagnostic("modelEnd", page, memory["modelEnd"])
+            postprocess_started = time.monotonic()
+            # BF16 -> CPU -> FP32 only within a bounded band. Never allocate a
+            # full-page FP32 CUDA output or several full-page NumPy temporaries.
+            pixels = quantize_output(result, width, height, native, np)
             del result, tensor
-        pixels = np.rint(pixels.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
+        memory["outputReleased"] = self.memory_snapshot()
+        self.diagnostic("outputReleased", page, memory["outputReleased"])
         image = Image.fromarray(pixels)
         if scale < native:
             image = image.resize((width * scale, height * scale), Image.Resampling.LANCZOS)
         image.save(destination, format="PNG")
         if png_dimensions(destination, MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS) != (width * scale, height * scale):
             raise RuntimeError("Encoded result dimensions mismatch")
+        postprocess_seconds = time.monotonic() - postprocess_started
         metadata = dict(self.metadata)
-        if self.settings["device"] == "cuda":
-            torch.cuda.synchronize()
-            metadata.update({"peakAllocatedBytes": torch.cuda.max_memory_allocated(),
-                             "peakReservedBytes": torch.cuda.max_memory_reserved()})
+        if self.hat_memory is not None:
+            metadata.update(self.hat_memory.metadata())
+        if cuda:
+            metadata.update({"peakAllocatedBytes": memory["outputReleased"]["peakAllocatedBytes"],
+                             "peakReservedBytes": memory["outputReleased"]["peakReservedBytes"]})
         metadata.update({"width": width * scale, "height": height * scale,
                          "deliveryScale": scale, "downsampling": "lanczos" if scale < native else "none",
-                         "paddedWidth": pw, "paddedHeight": ph,
+                         "paddedWidth": pw, "paddedHeight": ph, "workerPID": os.getpid(),
+                         "modelSeconds": model_seconds, "modelWallSeconds": model_wall_seconds,
+                         "postprocessSeconds": postprocess_seconds, "memoryStages": memory,
                          "bytes": destination.stat().st_size, "sha256": digest_file(destination),
                          "seconds": time.monotonic() - started})
         return validate_result(metadata, spec, page)
@@ -167,6 +234,11 @@ def worker_main(connection, settings):
             metadata = predictor.predict(Path(work["source"]), Path(work["destination"]), work["page"], work["spec"])
             connection.send({"result": metadata})
         except Exception as error:
+            if settings.get("diagnostics"):
+                try:
+                    predictor.diagnostic("error", work["page"], predictor.memory_snapshot())
+                except Exception:
+                    pass  # Diagnostics must never hide the original allocation/error.
             if settings["device"] == "cuda" and isinstance(error, predictor.torch.cuda.OutOfMemoryError):
                 page = work["page"]
                 precision = {"float32": "FP32", "bfloat16": "BF16"}[predictor.metadata["precision"]]

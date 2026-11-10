@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from .jobs import JobStore
+from .hat_memory import BACKENDS, DEFAULT_WINDOW_BATCH, validate_options
 from .models import MODELS, PRECISIONS
 from .protocol import MAX_PIXELS, MAX_SIDE, local_address
 
@@ -23,6 +24,10 @@ def main(argv=None):
                         help="Default inference precision; explicit phone job selections override this")
     parser.add_argument("--model-precision", action="append", default=[], metavar="MODEL=PRECISION",
                         help="Per-model default, e.g. hat-l=bfloat16; repeatable, last override wins")
+    parser.add_argument("--hat-window-batch", type=int, default=DEFAULT_WINDOW_BATCH,
+                        help="HAT internal attention windows per batch (default: 128; 0: original diagnostic path)")
+    parser.add_argument("--hat-attention-backend", choices=BACKENDS, default="eager",
+                        help="HAT bounded attention backend; sdpa is opt-in and requires fused CUDA support")
     parser.add_argument("--maximum-side", type=int, default=4096)
     parser.add_argument("--maximum-pixels", type=int, default=MAX_PIXELS)
     parser.add_argument("--timeout", type=int, default=300)
@@ -35,9 +40,13 @@ def main(argv=None):
     parser.add_argument("--pair", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--accept-noncommercial-license", action="store_true")
     parser.add_argument("--no-discovery", action="store_true")
-    parser.add_argument("--diagnostics", action="store_true", help="Log HTTP route/status, without request bodies or query strings")
+    parser.add_argument("--diagnostics", action="store_true", help="Log HTTP route/status and inference memory stages, without titles, bodies or query strings")
     parser.add_argument("--cleanup", action="store_true", help="Remove expired inactive jobs and exit")
     args = parser.parse_args(argv)
+    try:
+        validate_options(args.hat_window_batch, args.hat_attention_backend)
+    except ValueError as error:
+        parser.error(str(error))
     if not 1 <= args.retention_hours <= 720:
         parser.error("retention must be 1..720 hours")
     if not 1 <= args.job_quota_gib <= args.total_quota_gib:
@@ -62,6 +71,8 @@ def main(argv=None):
         precisions[ALIASES[alias].id] = precision
     if args.device == "cpu" and any(value != "float32" for value in precisions.values()):
         parser.error("Low-precision inference requires --device cuda; CPU diagnostics use float32")
+    if args.device == "cpu" and args.hat_attention_backend == "sdpa":
+        parser.error("Fused HAT SDPA requires --device cuda")
     weights = {ALIASES[key].id: str((args.weights_dir / ALIASES[key].file).resolve()) for key in args.models}
     for path in weights.values():
         if not Path(path).is_file():
@@ -69,6 +80,7 @@ def main(argv=None):
     settings = {"weights": weights, "precisions": precisions, "device": args.device, "noncommercial": True,
                 "maximum_side": args.maximum_side, "maximum_pixels": args.maximum_pixels,
                 "timeout": args.timeout, "retention": args.retention_hours * 3600,
+                "hat_window_batch": args.hat_window_batch, "hat_attention_backend": args.hat_attention_backend,
                 "diagnostics": args.diagnostics}
     from .identity import Advertisement, connection_url
     from .server import create_app
@@ -93,6 +105,8 @@ def main(argv=None):
         qr.print_ascii(invert=True)
         print("GPU models load on startup; check their readiness in PicaX.")
         print("Inference defaults: " + ", ".join(f"{alias}={precisions[ALIASES[alias].id]}" for alias in args.models))
+        if "hat-l" in args.models:
+            print(f"HAT attention: {args.hat_window_batch} windows/batch, {args.hat_attention_backend}; full-page context retained (0: original diagnostic implementation).")
         if any(value != "float32" for value in precisions.values()):
             print("Low-precision defaults require an updated phone app; older apps reject the capabilities response.")
         if not args.no_discovery:

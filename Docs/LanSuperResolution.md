@@ -54,12 +54,30 @@ DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pi
 - 新手机在“电脑模型 / 回传倍率”下显示“推理精度”。选择 **FP32** 或 **BF16** 后提交，选择会写入手机任务日志与发送给电脑的清单；任务列表显示该任务的固定精度。切换选择只影响新任务，不改变已排队、重试或恢复中的任务。
 - 通用 CLI 不传新参数时仍默认 FP32。`--precision bfloat16` 修改所有所选模型的默认值；`--model-precision hat-l=bfloat16` 只覆盖 HAT-L，可重复传入，后面的同模型值覆盖前面的。它们控制启动加载精度与手机初始选项，**手机对新任务的显式选择优先**。
 - 只开放 `float32` / `bfloat16`，本轮不开放 FP16。BF16 要求 CUDA 硬件支持且 Spandrel descriptor 声明支持；CPU 诊断仅支持 FP32。不支持时明确报错，不自动换精度。`ready` 表示选定默认精度的模型加载与身份校验成功，不保证任意尺寸能执行。
-- 电脑同一时间只驻留一个 GPU worker；模型或精度变化时先释放旧进程，再按任务选择加载。输入张量与模型使用相同 dtype；输出先复制到 CPU，再转 FP32 量化为原有 8-bit RGB PNG，避免将 BF16 直接交给 NumPy，也避免在 GPU 上额外分配整页 FP32 副本。FP32 仍关闭 TF32；未加入 autocast、窗口分批或 SDPA 改写。
+- 电脑同一时间只驻留一个 GPU worker；模型或精度变化时先释放旧进程，再按任务选择加载。输入张量与模型使用相同 dtype；输出按受限行带先复制到 CPU，再转 FP32 量化为原有 8-bit RGB PNG，避免将 BF16 直接交给 NumPy，也避免在 GPU 上额外分配整页 FP32 副本。FP32 仍关闭 TF32；未加入 autocast。HAT 内部窗口分批见下节，其他模型不安装该适配器。
 - 权重文件名中的 `bf16` / `fp16` 不等于实际存储 dtype。本机 HAT-L、FDAT-XL、FDAT-M 的 safetensors 文件头显示浮点张量均为 F32；运行时才按选定 dtype 转换。既有 modelID 中的 `-float32` 是历史身份标识，**不再代表任务的实际执行精度**；modelID、文件和 SHA-256 均保持不变，实际精度看任务和结果的 `precision`。
 - **兼容性**：缺少 `precision` 的旧任务始终按 FP32 执行，与新 CLI 默认值无关。新手机连接旧电脑服务时只显示 FP32，省略新清单字段以维持旧协议。旧手机仍强制每个模型的能力精度为 FP32，任何模型默认 BF16 都会使它拒绝**整份能力响应**，即使该模型尚未就绪；需更新 IPA，或将电脑所有模型默认值改回 FP32。
-- 本次不做 BF16/FP32 数值画质对比或本机真实 GPU 验证，也未在 Windows 上构建 IPA / 运行 XCTest。下方数据均为历史 FP32；**800×1129 原生 4× 在 24GB 上能否跑通仍未实测，不作保证**。
+- 下方实测表均为历史 FP32 数据，不是本次改动的新实测。HAT 优化有独立的 Actions CPU 数值对照；**CPU 测试不能证明真实权重在 CUDA/BF16 上的画质、吞吐或显存效果**，这些仍需单独授权后验证。本次不在 Windows 上构建 IPA / 运行 XCTest。
 
 只开放**逐页整图推理**，每次模型调用处理一页，不把整本漫画拼成一张图。不自动退回之前存在上下文/接缝问题的 128 像素分块，不缩小原图或更换模型，也不保证所有页面能处理。手机不按模型专属输入像素数、对齐后像素数或启动时显存估算拦截输入；只检查回传图片的接收范围和上传文件大小，电脑另检查输入解码/传输限制。模型越重不意味着文字、网点或线条一定更忠实。请用自己的少量页面确认画质。
+
+### HAT-L 内部窗口分批（电脑端）
+
+目标是继续运行**同一 HAT-L、同一权重、同一精度和原生 4×**，降低中间张量峰值，而不是换模型、缩图或设置一个更早拒绝任务的显存上限。
+
+- 默认 `--hat-window-batch 128 --hat-attention-backend eager`。只对固定的 Spandrel 0.4.2 HAT 实例安装适配器，不修改第三方包或全局类；结构/版本不匹配明确报错。`--hat-window-batch 0` 显式选择原版，仅供**小图对照诊断**，不是失败时自动退回的路径。
+- 普通/移位注意力按原窗口顺序分批执行 QKV、原始缩放、relative-position bias、有限值 `0 / -100` mask、softmax 和投影；全页稠密 shift mask 改为同一分区规则的紧凑标签，每批再展开。多图 batch 仍按各图窗口数正确对应 mask。
+- OCAB 保留整页 norm/QKV，只在当前批次提取原来的重叠 K/V。使用 `Tensor.unfold` 的网格**视图**，先取有限窗口再物化，不生成整页 `nn.Unfold` 展开结果；边缘仍是原 OCAB 的**零填充**。
+- 整页卷积、全局通道平均池化、移位/反移位、残差、MLP 和上采样不变；外侧反射填充、64 对齐和输出裁切不变。**不是把漫画切块后各自超分再拼接**，没有删去原来任何 query 可见的 K/V。
+- 以 16×16 query、24×24 K/V、6 heads、BF16 为例，128 个窗口的一个 OCAB score 约 216 MiB；这只是单个临时张量，不是总显存预测。全页特征和上采样依然随页面增大。64/128/256/512 哪个更快须实测，不能认定越小越快。
+- `--hat-attention-backend sdpa` 是**可选实验路径**：保留 bias/mask，以原始 scale 将 head_dim 30 零填充到 32 后裁回；根据真实参数检查并强制一个支持的 fused CUDA backend。明确禁用 MATH 回退；不支持时提示使用 eager，不自动换模型/精度。没有真实 CUDA 数值与性能证据前，不将其设为默认或宣称为 FlashAttention。
+- 输出按最多 128 行搬到 CPU 转 FP32、clamp/round/量化，填入预分配 uint8 缓冲，避免多份整页 FP32/NumPy 临时副本；仍校验完整原生输出形状与有限值，保留原 PNG 舍入和 Lanczos 回传逻辑。
+
+结果新增可选字段：`attentionImplementation`、`attentionWindowBatch`、`attentionBackend`、`sdpaBackends`、`workerPID`、`modelSeconds`（CUDA 事件计时，CPU 为墙钟）、`modelWallSeconds`（模型调用及结果有限值检查的墙钟）、`postprocessSeconds`（输出传输/量化/编码），以及 `memoryStages.pageStart/modelEnd/outputReleased` 的 current/peak allocated/reserved。注意力窗口/KV 最大批次记录的是该 worker 观察到的高水位。`--diagnostics` 同时打印简短阶段内存日志，不记录漫画标题或图片内容；错误时尽力记录内存，不掩盖原错误。
+
+allocated 包含在 reserved 内，两者不能相加，也不等于 WDDM 的物理专用/共享驻留量。输出释放后的 reserved 不回零可以是正常缓存；不默认逐页 `empty_cache()` 或重载模型。窗口循环内没有主机日志、`.item()` 或 CUDA 同步，计时只在页级边界同步。
+
+**部署与兼容性**：这部分不改手机协议、数据库或 Swift，已经支持 HTTP/精度选择的现有 IPA 可继续使用，**不需要为显存优化重新打 IPA**。更新源码不会替换已经运行的 worker；应在任务完成并确认可以中断服务后手动重启电脑服务。尚未通过另行授权的真实 GPU 验证前，不承诺大页一定能装入专用显存或具体加速倍数。
 
 ### 权重与来源
 
@@ -189,4 +207,20 @@ DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\validate_transport.py
 
 `validate_local.py --source <你自己的页面>` 可替换生成图，不修改源文件。输出 PNG 的“不同于 Lanczos”仅是排除假 AI 的执行检查，不代表更好看。
 
-CI 的轻量 Windows/Linux HTTP 回归不加载模型；Swift/XCTest 由既有 iPhone Actions 构建运行。真实 CUDA 不会在每次 push 自动测试，也不会默认在用户本机运行。
+HAT 优化的 CPU 小模型数值对照由独立 Actions job 运行，无权重、无 CUDA，不在本机默认运行：
+
+```text
+python -I -B -X utf8 DesktopServer/tests/test_hat_memory.py
+```
+
+覆盖普通/移位注意力、紧凑 mask、跨图 batch、尾批、矩形页/零填充、16/24 窗口及 head_dim 30、小型完整 HAT、参数不变、输出量化和 fused 路径的受控模拟。FP32 对照采用 `atol=rtol=2e-5`；另观察实际 eager matmul/gather 的批次边界，并禁止调用全页 `nn.Unfold`。受控 SDPA 模拟不代表真实 CUDA backend 已运行。
+
+真实 BF16/显存/速度测试仅在**另行授权且没有其他 GPU 任务**时运行；例如比较指定尺寸，并在同一个 worker 内重复/交替尺寸（输出目录每次必须新/空）：
+
+```bat
+DesktopServer\.venv\Scripts\python.exe -I -B -X utf8 DesktopServer\validate_local.py --weights-dir D:\PicaX-weights --output-dir D:\PicaX-hat-b128 --models hat-l --precision bfloat16 --hat-window-batch 128 --hat-attention-backend eager --size 960x1315 --size 960x1583 --size 960x1601 --size 960x1616 --repeat 2 --accept-noncommercial-license
+```
+
+`--size` 可重复指定，生成诊断图；不能与 `--source` 同时使用。每种尺寸逐一验证可选回传倍率，`--repeat` 重复整个序列且不重载模型。所有结果写入 `report.json`，包含实际精度、实现、阶段计时与内存。先做小图原版（`--hat-window-batch 0`）与优化版输出对照；真实 BF16 PNG 初始目标为最大误差 ≤2/255、平均误差 ≤0.1/255，不通过就修实现，而不是放宽门槛。之后只用优化实现比较批次 64/128/256/512，结合专用/共享显存和进程内存判断是否消除了溢出及是否真正提速；allocated/reserved 本身不能证明共享内存归零。
+
+CI 的轻量 Windows/Linux HTTP 回归不加载模型；独立 HAT job 只运行 CPU 小模型数值回归；Swift/XCTest 由既有 iPhone Actions 构建运行。真实 CUDA 不会在每次 push 自动测试，也不会默认在用户本机运行。

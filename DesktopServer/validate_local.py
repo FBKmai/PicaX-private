@@ -14,6 +14,8 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from picax_lan.cli import ALIASES
+from picax_lan.hat_memory import BACKENDS, DEFAULT_WINDOW_BATCH, validate_options
+from picax_lan.models import PRECISIONS
 from picax_lan.inference import worker_main
 from picax_lan.protocol import digest_file, page_id, validate_spec, validate_result
 
@@ -59,6 +61,16 @@ def stop(process, connection):
     connection.close()
 
 
+def dimensions(value):
+    try:
+        width, height = (int(part) for part in value.lower().split("x"))
+    except (ValueError, TypeError):
+        raise argparse.ArgumentTypeError("Expected WIDTHxHEIGHT")
+    if not 1 <= width <= 4096 or not 1 <= height <= 4096 or width * height > 8_000_000:
+        raise argparse.ArgumentTypeError("Diagnostic size exceeds the input decoder limits")
+    return width, height
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights-dir", type=Path, required=True)
@@ -66,16 +78,36 @@ def main():
     parser.add_argument("--models", nargs="+", choices=list(ALIASES), default=["fdat-m", "fdat-xl", "hat-l"])
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--source", type=Path)
+    parser.add_argument("--precision", choices=PRECISIONS, default="float32")
+    parser.add_argument("--hat-window-batch", type=int, default=DEFAULT_WINDOW_BATCH)
+    parser.add_argument("--hat-attention-backend", choices=BACKENDS, default="eager")
+    parser.add_argument("--size", action="append", type=dimensions, default=[], metavar="WIDTHxHEIGHT",
+                        help="Generated diagnostic sizes; repeat to alternate sizes in the same worker")
+    parser.add_argument("--repeat", type=int, default=1, help="Repeat the size sequence without reloading the worker")
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--accept-noncommercial-license", action="store_true", required=True)
     args = parser.parse_args()
+    try:
+        validate_options(args.hat_window_batch, args.hat_attention_backend)
+    except ValueError as error:
+        parser.error(str(error))
+    if not 1 <= args.repeat <= 100 or not 10 <= args.timeout <= 3600:
+        parser.error("--repeat must be 1..100 and --timeout 10..3600")
+    if args.source and args.size:
+        parser.error("Choose either --source or --size")
+    if args.device == "cpu" and (args.precision != "float32" or args.hat_attention_backend == "sdpa"):
+        parser.error("CPU diagnostics require float32 and eager")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         parser.error("Output directory must be new or empty")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    report = {"kind": "real-model-execution-not-perceptual-quality", "device": args.device, "models": []}
+    report = {"kind": "real-model-execution-not-perceptual-quality", "device": args.device,
+              "precision": args.precision, "hatWindowBatch": args.hat_window_batch,
+              "hatAttentionBackend": args.hat_attention_backend, "repeat": args.repeat, "models": []}
     weights = {ALIASES[key].id: str((args.weights_dir / ALIASES[key].file).resolve()) for key in args.models}
     settings = {"weights": weights, "device": args.device, "noncommercial": True,
-                "maximum_side": 4096, "maximum_pixels": 8_000_000, "timeout": args.timeout}
+                "precisions": {key: args.precision for key in weights},
+                "hat_window_batch": args.hat_window_batch, "hat_attention_backend": args.hat_attention_backend,
+                "diagnostics": True, "maximum_side": 4096, "maximum_pixels": 8_000_000, "timeout": args.timeout}
     for alias in args.models:
         model = ALIASES[alias]
         entry = {"modelID": model.id, "checkpointSHA256": model.sha256, "cases": []}
@@ -95,12 +127,15 @@ def main():
             if model.scale == 4:
                 cases.append((256, 384, 4))
             cases.append((512, 768, 2) if alias == "hat-l" else (1000, 1500, 2))
+            if args.size:
+                cases = [(width, height, scale) for width, height in args.size for scale in model.delivery_scales]
             if args.source:
                 from PIL import Image
                 with Image.open(args.source) as image:
                     cases = [(image.width, image.height, scale) for scale in model.delivery_scales]
+            cases *= args.repeat
             for number, (width, height, scale) in enumerate(cases):
-                name = "%s-%dx%d-%dx" % (alias, width, height, scale)
+                name = "%s-%dx%d-%dx-%04d" % (alias, width, height, scale, number)
                 source, destination = args.output_dir / (name + "-input.png"), args.output_dir / (name + "-output.png")
                 case = {"input": [width, height], "deliveryScale": scale, "passed": False}
                 entry["cases"].append(case)
@@ -114,7 +149,7 @@ def main():
                         "width": width, "height": height, "bytes": source.stat().st_size, "sha256": digest_file(source)}
                 spec = {"version": 1, "jobID": str(uuid.uuid4()), "sourceRecordID": "local-diagnostic", "title": "PicaX GPU execution check",
                         "modelID": model.id, "modelSHA256": model.sha256, "nativeScale": model.scale,
-                        "deliveryScale": scale, "mode": "fullPage", "pages": [page]}
+                        "deliveryScale": scale, "precision": args.precision, "mode": "fullPage", "pages": [page]}
                 try:
                     validate_spec(spec, 4096, 8_000_000)
                     parent.send({"source": str(source.resolve()), "destination": str(destination.resolve()), "page": page, "spec": spec})
