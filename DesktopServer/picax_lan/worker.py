@@ -1,4 +1,4 @@
-"""Supervise a single spawned GPU process; release it when switching models."""
+"""Supervise one GPU process; reload when switching models or precision."""
 import logging
 import multiprocessing
 import os
@@ -6,7 +6,7 @@ import threading
 import time
 
 from .inference import worker_main
-from .models import get_model
+from .models import configured_precision
 from .protocol import (MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS, digest_file, png_dimensions,
                        validate_result)
 
@@ -15,7 +15,7 @@ class Worker:
     def __init__(self, store, settings):
         self.store, self.settings = store, settings
         self.stop_event = threading.Event()
-        self.process = self.connection = self.current_model = None
+        self.process = self.connection = self.current_model = self.current_precision = None
         self.info = {"ready": False, "error": "Model worker is starting"}
         self.model_states = {key: {"ready": False, "error": "Not checked yet"} for key in settings["weights"]}
         self.thread = threading.Thread(target=self.run, name="PicaX-SR-worker", daemon=True)
@@ -30,7 +30,7 @@ class Worker:
 
     def terminate(self):
         process, self.process = self.process, None
-        self.current_model = None
+        self.current_model = self.current_precision = None
         if process:
             if process.is_alive():
                 process.terminate()
@@ -42,13 +42,16 @@ class Worker:
             self.connection.close()
             self.connection = None
 
-    def launch(self, model_id):
+    def launch(self, model_id, precision=None):
+        precision = precision if precision is not None else configured_precision(self.settings, model_id)
         self.terminate()
         if self.stop_event.is_set():
             return False
         context = multiprocessing.get_context("spawn")
         parent, child = context.Pipe()
         settings = dict(self.settings, model_id=model_id)
+        settings["precisions"] = dict(self.settings.get("precisions", {}))
+        settings["precisions"][model_id] = precision
         process = context.Process(target=worker_main, args=(child, settings), daemon=True)
         self.process, self.connection = process, parent
         self.info = {"ready": False, "error": "Loading and verifying " + model_id}
@@ -59,15 +62,19 @@ class Worker:
             while not self.stop_event.is_set() and time.monotonic() < deadline:
                 if parent.poll(0.25):
                     self.info = parent.recv()
+                    if self.info.get("ready") and self.info.get("metadata", {}).get("precision") != precision:
+                        self.info = {"ready": False, "error": "Worker loaded a different inference precision"}
                     self.model_states[model_id] = dict(self.info)
                     if self.settings.get("diagnostics"):
                         logging.getLogger("uvicorn.error").info(
-                            "LAN model model=%s ready=%s maximum_pixels=%s",
+                            "LAN model model=%s ready=%s precision=%s maximum_pixels=%s",
                             model_id, bool(self.info.get("ready")),
+                            self.info.get("metadata", {}).get("precision"),
                             self.info.get("metadata", {}).get("maximumInputPixels"),
                         )
                     if self.info.get("ready"):
                         self.current_model = model_id
+                        self.current_precision = precision
                         return True
                     self.terminate()
                     return False
@@ -95,11 +102,14 @@ class Worker:
                 job_id, page = work
                 spec = self.store.spec(job_id)
                 model_id = spec["modelID"]
+                # A missing field is always legacy FP32, independent of new defaults.
+                precision = spec.get("precision", "float32")
                 source = self.store.path(job_id, page["id"], "source.png")
                 temporary = self.store.path(job_id, page["id"], "result.part")
                 try:
-                    if self.current_model != model_id or not self.process or not self.process.is_alive():
-                        if not self.launch(model_id):
+                    if (self.current_model != model_id or self.current_precision != precision
+                            or not self.process or not self.process.is_alive()):
+                        if not self.launch(model_id, precision):
                             raise RuntimeError(self.info.get("error", "Model unavailable"))
                     self.connection.send({"source": str(source), "destination": str(temporary), "page": page, "spec": spec})
                     deadline = time.monotonic() + self.settings["timeout"]

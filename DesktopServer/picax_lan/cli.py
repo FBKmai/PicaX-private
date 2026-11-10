@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from .jobs import JobStore
-from .models import MODELS
+from .models import MODELS, PRECISIONS
 from .protocol import MAX_PIXELS, MAX_SIDE, local_address
 
 ALIASES = dict(zip(("hat-l", "dat2", "fdat-xl", "fdat-m"), MODELS))
@@ -19,6 +19,10 @@ def main(argv=None):
     parser.add_argument("--weights-dir", type=Path)
     parser.add_argument("--models", nargs="+", choices=list(ALIASES), default=["fdat-xl"])
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    parser.add_argument("--precision", choices=PRECISIONS, default="float32",
+                        help="Default inference precision; explicit phone job selections override this")
+    parser.add_argument("--model-precision", action="append", default=[], metavar="MODEL=PRECISION",
+                        help="Per-model default, e.g. hat-l=bfloat16; repeatable, last override wins")
     parser.add_argument("--maximum-side", type=int, default=4096)
     parser.add_argument("--maximum-pixels", type=int, default=MAX_PIXELS)
     parser.add_argument("--timeout", type=int, default=300)
@@ -50,11 +54,19 @@ def main(argv=None):
     host = local_address(args.host)
     if not 1 <= args.port <= 65535 or not 64 <= args.maximum_side <= MAX_SIDE or not 4096 <= args.maximum_pixels <= MAX_PIXELS or not 10 <= args.timeout <= 3600:
         parser.error("Invalid port, image budget or timeout")
+    precisions = {ALIASES[key].id: args.precision for key in args.models}
+    for declaration in args.model_precision:
+        alias, separator, precision = declaration.partition("=")
+        if not separator or alias not in args.models or precision not in PRECISIONS:
+            parser.error("--model-precision must be SELECTED_MODEL={float32,bfloat16}")
+        precisions[ALIASES[alias].id] = precision
+    if args.device == "cpu" and any(value != "float32" for value in precisions.values()):
+        parser.error("Low-precision inference requires --device cuda; CPU diagnostics use float32")
     weights = {ALIASES[key].id: str((args.weights_dir / ALIASES[key].file).resolve()) for key in args.models}
     for path in weights.values():
         if not Path(path).is_file():
             parser.error("Missing local checkpoint: " + path)
-    settings = {"weights": weights, "device": args.device, "noncommercial": True,
+    settings = {"weights": weights, "precisions": precisions, "device": args.device, "noncommercial": True,
                 "maximum_side": args.maximum_side, "maximum_pixels": args.maximum_pixels,
                 "timeout": args.timeout, "retention": args.retention_hours * 3600,
                 "diagnostics": args.diagnostics}
@@ -80,6 +92,9 @@ def main(argv=None):
         qr.make(fit=True)
         qr.print_ascii(invert=True)
         print("GPU models load on startup; check their readiness in PicaX.")
+        print("Inference defaults: " + ", ".join(f"{alias}={precisions[ALIASES[alias].id]}" for alias in args.models))
+        if any(value != "float32" for value in precisions.values()):
+            print("Low-precision defaults require an updated phone app; older apps reject the capabilities response.")
         if not args.no_discovery:
             try:
                 advertisement = Advertisement(host, args.port, store.server_id)

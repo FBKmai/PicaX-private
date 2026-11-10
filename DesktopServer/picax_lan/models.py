@@ -8,8 +8,17 @@ from dataclasses import dataclass
 
 SOURCE = "https://github.com/the-database/MangaJaNai/releases/tag/3.0.0"
 LICENSE = "CC-BY-NC-4.0"
+PRECISIONS = ("float32", "bfloat16")
 REGISTRY_SOURCE = ("https://github.com/imxieyi/waifu2x-ios-model-converter/blob/"
                    "68e3f51517e04433164c09d8505a409e26477905/known_models.yaml")
+
+
+def configured_precision(settings, model_id):
+    """Default offered to new phone jobs; legacy jobs remain float32."""
+    precision = settings.get("precisions", {}).get(model_id, "float32")
+    if precision not in PRECISIONS:
+        raise ValueError("Unsupported inference precision: " + str(precision))
+    return precision
 
 
 @dataclass(frozen=True)
@@ -26,7 +35,10 @@ class Model:
     def delivery_scales(self):
         return (2, 4) if self.scale == 4 else (2,)
 
-    def capability(self, maximum_side, maximum_pixels):
+    def capability(self, maximum_side, maximum_pixels, precision="float32", supported_precisions=None):
+        supported = list(supported_precisions) if supported_precisions is not None else [precision]
+        if precision not in PRECISIONS or precision not in supported or any(value not in PRECISIONS for value in supported):
+            raise ValueError("Invalid model precision capability")
         return {"id": self.id, "name": self.name, "sha256": self.sha256,
                 "nativeScale": self.scale, "deliveryScales": list(self.delivery_scales),
                 "alignment": self.alignment, "minimumSide": 64,
@@ -34,7 +46,8 @@ class Model:
                 # Wire compatibility: this is the configured decoder limit,
                 # never a model-specific ceiling or a prediction of free VRAM.
                 "maximumInputPixels": maximum_pixels,
-                "precision": "float32", "mode": "fullPage", "license": LICENSE,
+                "precision": precision, "supportedPrecisions": supported,
+                "mode": "fullPage", "license": LICENSE,
                 "sourceURL": SOURCE}
 
 

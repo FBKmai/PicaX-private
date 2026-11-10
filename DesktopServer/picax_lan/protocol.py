@@ -6,7 +6,7 @@ import re
 import struct
 import uuid
 
-from .models import LICENSE, MODELS, SOURCE as MODEL_SOURCE, get_model
+from .models import LICENSE, MODELS, PRECISIONS, SOURCE as MODEL_SOURCE, get_model
 
 VERSION = 1
 # Compatibility names for the previously verified mobile baseline.
@@ -93,7 +93,13 @@ def page_id(chapter, page):
 
 
 def validate_spec(body, maximum_side=MAX_SIDE, maximum_pixels=MAX_PIXELS):
-    exact_keys(body, ("version", "jobID", "sourceRecordID", "title", "modelID", "modelSHA256", "nativeScale", "deliveryScale", "mode", "pages"))
+    keys = ("version", "jobID", "sourceRecordID", "title", "modelID", "modelSHA256", "nativeScale", "deliveryScale", "mode", "pages")
+    # Optional for legacy clients/jobs; new phone jobs pin their chosen precision.
+    if isinstance(body, dict) and "precision" in body:
+        keys += ("precision",)
+    exact_keys(body, keys)
+    if "precision" in body and body["precision"] not in PRECISIONS:
+        raise ProtocolError("Unsupported job precision", 409)
     if body["version"] != VERSION or type(body["version"]) is not int:
         raise ProtocolError("Unsupported protocol version", 409)
     identifier(body["jobID"])
@@ -163,10 +169,12 @@ def validate_result(result, spec, page):
     scale = spec["deliveryScale"]
     if not isinstance(result, dict):
         raise ProtocolError("Missing result metadata", 422)
+    if spec.get("precision", "float32") not in PRECISIONS:
+        raise ProtocolError("Unsupported job precision", 422)
     expected = {"modelID": model.id, "modelSHA256": model.sha256,
                 "nativeScale": model.scale, "deliveryScale": scale,
                 "width": page["width"] * scale, "height": page["height"] * scale,
-                "precision": "float32", "mode": "fullPage", "engine": "PyTorch",
+                "precision": spec.get("precision", "float32"), "mode": "fullPage", "engine": "PyTorch",
                 "downsampling": "lanczos" if scale < model.scale else "none"}
     if any(result.get(key) != value or (type(value) is int and type(result.get(key)) is not int)
            for key, value in expected.items()):

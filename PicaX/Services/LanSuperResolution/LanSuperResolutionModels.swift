@@ -17,6 +17,14 @@ nonisolated enum LanSRContract {
     static let maximumInputBytes = 64 * 1024 * 1024
     static let maximumOutputBytes = 128 * 1024 * 1024
     static let maximumOutputPixels = 32_000_000
+    static let precisions: Set<String> = ["float32", "bfloat16"]
+    static func precisionLabel(_ value: String) -> String {
+        switch value {
+        case "float32": "FP32"
+        case "bfloat16": "BF16"
+        default: value
+        }
+    }
     static let models: [String: (sha: String, scale: Int)] = [
         "illustrationjanai-v3detail-hat-l-4x-float32": ("38c00c9ff871ae292617ae1127edc150f81c4e0f8f98685e48ff9c9cd87fba3b", 4),
         "illustrationjanai-v3denoise-dat2-4x-float32": ("430d5e58053be88d250b6ee2c1016a19f919baafb9b6bda0f45c14b54453fb12", 4),
@@ -135,13 +143,19 @@ nonisolated struct LanSRModelCapability: Codable, Identifiable, Sendable {
     let mode: String
     let ready: Bool
     let error: String?
+    // Missing on older servers and in existing journals.
+    var supportedPrecisions: [String]? = nil
+    var selectablePrecisions: [String] { supportedPrecisions ?? ["float32"] }
 
     func validate() throws {
         guard let known = LanSRContract.models[id], known.sha == sha256, known.scale == nativeScale,
               !deliveryScales.isEmpty, Set(deliveryScales).isSubset(of: nativeScale == 4 ? [2, 4] : [2]),
               [16, 64].contains(alignment), minimumSide == 64,
               (64...8192).contains(maximumSide), (4096...8_000_000).contains(maximumInputPixels),
-              precision == "float32", mode == "fullPage" else {
+              LanSRContract.precisions.contains(precision), mode == "fullPage",
+              !selectablePrecisions.isEmpty, selectablePrecisions.contains(precision),
+              Set(selectablePrecisions).count == selectablePrecisions.count,
+              Set(selectablePrecisions).isSubset(of: LanSRContract.precisions) else {
             throw LanSRError.message("电脑模型配置与手机允许列表不匹配。")
         }
     }
@@ -191,6 +205,7 @@ nonisolated struct LanSRJobSpec: Codable, Sendable {
     let deliveryScale: Int
     let mode: String
     let pages: [LanSRPage]
+    var precision: String? = nil
 }
 
 nonisolated struct LanSRResult: Codable, Sendable {
@@ -221,7 +236,8 @@ nonisolated struct LanSRResult: Codable, Sendable {
               (1...LanSRContract.maximumOutputBytes).contains(bytes), LanSRContract.isSHA(sha256),
               width > 0, height > 0, max(width, height) <= 16384,
               width * height <= LanSRContract.maximumOutputPixels,
-              engine == "PyTorch", ["cuda", "cpu"].contains(device), precision == "float32", mode == "fullPage",
+              engine == "PyTorch", ["cuda", "cpu"].contains(device),
+              LanSRContract.precisions.contains(precision), precision == (spec.precision ?? "float32"), mode == "fullPage",
               license == "CC-BY-NC-4.0", sourceURL == "https://github.com/the-database/MangaJaNai/releases/tag/3.0.0",
               downsampling == (deliveryScale < nativeScale ? "lanczos" : "none"), seconds.isFinite, seconds >= 0 else {
             throw LanSRError.message("电脑结果的模型、倍率或尺寸校验失败，未导入。")
@@ -275,6 +291,7 @@ struct LanSRLocalJob: Codable, Identifiable {
     let pageCounts: [Int]
     let model: LanSRModelCapability
     let deliveryScale: Int
+    var precision: String? = nil
     var spec: LanSRJobSpec?
     var prepared: [LanSRPage] = []
     var sourceURLs: [String: String] = [:]
@@ -301,6 +318,9 @@ struct LanSRLocalJob: Codable, Identifiable {
             throw LanSRError.message("局域网任务日志中的章节或页数无效，已停止恢复。")
         }
         try model.validate()
+        if !model.selectablePrecisions.contains(precision ?? "float32") {
+            throw LanSRError.message("局域网任务日志中的推理精度不受模型支持，已停止恢复。")
+        }
         for page in prepared {
             guard chapters.indices.contains(page.chapterIndex),
                   (0..<pageCounts[page.chapterIndex]).contains(page.pageIndex),
@@ -314,6 +334,7 @@ struct LanSRLocalJob: Codable, Identifiable {
             guard spec.version == 1, spec.jobID == id, spec.sourceRecordID == sourceRecordID,
                   spec.modelID == model.id, spec.modelSHA256 == model.sha256,
                   spec.nativeScale == model.nativeScale, spec.deliveryScale == deliveryScale,
+                  spec.precision == precision,
                   spec.mode == "fullPage", spec.pages.count == pageCounts.reduce(0, +),
                   spec.pages == prepared.sorted(by: { $0.id < $1.id }) else {
                 throw LanSRError.message("局域网任务日志中的协议清单不匹配。")

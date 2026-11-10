@@ -3,7 +3,7 @@ import importlib.util
 import time
 from pathlib import Path
 
-from .models import LICENSE, SOURCE, get_model
+from .models import LICENSE, SOURCE, configured_precision, get_model
 from .protocol import (MAX_INPUT_BYTES, MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS, MAX_PIXELS,
                        ProtocolError, digest_file, padded_dimensions, png_dimensions, validate_result)
 
@@ -54,6 +54,9 @@ class Predictor:
         if requirements.square or not requirements.check(64, 64) or model.alignment % requirements.multiple_of:
             raise RuntimeError("Checkpoint size requirements differ from the declared protocol")
         self.np, self.torch, self.settings = np, torch, settings
+        precision = configured_precision(settings, model.id)
+        self.dtype = getattr(torch, precision)
+        supported_precisions = ["float32"]
         device = settings["device"]
         if device == "cuda":
             if not torch.cuda.is_available():
@@ -66,19 +69,24 @@ class Predictor:
             torch.backends.cudnn.allow_tf32 = False
             torch.backends.cudnn.benchmark = False
             name = torch.cuda.get_device_name()
+            if detected.supports_bfloat16 and torch.cuda.is_bf16_supported(including_emulation=False):
+                supported_precisions.append("bfloat16")
         elif device == "cpu":
             torch.set_num_threads(min(4, torch.get_num_threads()))
             name = "CPU (explicit diagnostic backend)"
         else:
             raise RuntimeError("Unsupported device")
-        self.model = detected.model.float().eval().to(device)
+        if precision not in supported_precisions:
+            raise RuntimeError(f"{model.name} on {device} does not support {precision}; no implicit precision fallback")
+        self.model = detected.model.eval().to(device=device, dtype=self.dtype)
         self.metadata = {
             # Decoder/transport capacity only; do not turn a startup free-VRAM
             # estimate into an input veto on the phone or the server.
             "maximumInputPixels": min(settings["maximum_pixels"], MAX_PIXELS),
             "modelID": model.id, "modelSHA256": model.sha256, "nativeScale": model.scale,
             "engine": "PyTorch", "device": device, "deviceName": name,
-            "precision": "float32", "torchVersion": str(torch.__version__),
+            "precision": precision, "supportedPrecisions": supported_precisions,
+            "torchVersion": str(torch.__version__),
             "cudaVersion": str(torch.version.cuda or "none"),
             "license": LICENSE, "sourceURL": SOURCE, "mode": "fullPage",
         }
@@ -89,6 +97,8 @@ class Predictor:
         started = time.monotonic()
         if spec["modelID"] != model.id or spec["modelSHA256"] != model.sha256 or spec["nativeScale"] != model.scale or spec["deliveryScale"] not in model.delivery_scales:
             raise RuntimeError("Job model contract changed")
+        if spec.get("precision", "float32") != self.metadata["precision"]:
+            raise RuntimeError("Job precision differs from the loaded worker; no implicit precision fallback")
         scale, native = spec["deliveryScale"], model.scale
         width, height = page["width"], page["height"]
         validate_png(source, (width, height))
@@ -110,11 +120,13 @@ class Predictor:
             array = np.asarray(image.convert("RGB"), dtype=np.float32).transpose(2, 0, 1) / 255.0
         array = self.full_page.pad_reflect(np, array, width, height, pw, ph)[None]
         with torch.inference_mode():
-            tensor = torch.from_numpy(array).to(self.settings["device"])
+            tensor = torch.from_numpy(array).to(device=self.settings["device"], dtype=self.dtype)
             result = self.model(tensor)
             if tuple(result.shape) != (1, 3, ph * native, pw * native) or not bool(torch.isfinite(result).all().item()):
                 raise RuntimeError("Invalid/nonfinite native model output")
-            pixels = result[0, :, :height * native, :width * native].clamp(0, 1).detach().cpu().numpy()
+            # NumPy cannot consume BF16 directly. Convert only after the GPU-to-CPU
+            # copy, and quantize PNG pixels in FP32 for either inference dtype.
+            pixels = result[0, :, :height * native, :width * native].detach().cpu().float().clamp_(0, 1).numpy()
             del result, tensor
         pixels = np.rint(pixels.transpose(1, 2, 0) * 255.0).clip(0, 255).astype(np.uint8)
         image = Image.fromarray(pixels)
@@ -157,8 +169,9 @@ def worker_main(connection, settings):
         except Exception as error:
             if settings["device"] == "cuda" and isinstance(error, predictor.torch.cuda.OutOfMemoryError):
                 page = work["page"]
+                precision = {"float32": "FP32", "bfloat16": "BF16"}[predictor.metadata["precision"]]
                 message = (f"CUDA 显存实际不足：{predictor.descriptor.name} 处理单页 "
-                           f"{page['width']}×{page['height']}，原生 {predictor.descriptor.scale}×、FP32。"
+                           f"{page['width']}×{page['height']}，原生 {predictor.descriptor.scale}×、{precision}。"
                            "这是实际推理分配失败，不是输入像素预估拦截；未缩图、未分块、未换模型。"
                            f" {str(error)[:256]}")
             else:

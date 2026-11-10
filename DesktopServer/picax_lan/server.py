@@ -5,7 +5,7 @@ import logging
 import time
 
 from .inference import validate_png
-from .models import MODELS
+from .models import MODELS, configured_precision
 from .protocol import (VERSION, MAX_JSON, MAX_INPUT_BYTES, MAX_OUTPUT_BYTES,
                        MAX_OUTPUT_PIXELS, MAX_OUTPUT_SIDE, ProtocolError, exact_keys,
                        validate_spec)
@@ -99,7 +99,9 @@ def create_app(store, worker, settings):
             if model.id not in settings["weights"]:
                 continue
             state = worker.model_states.get(model.id, {})
-            capability = model.capability(settings["maximum_side"], settings["maximum_pixels"])
+            precision = configured_precision(settings, model.id)
+            supported = state.get("metadata", {}).get("supportedPrecisions", [precision])
+            capability = model.capability(settings["maximum_side"], settings["maximum_pixels"], precision, supported)
             models.append(dict(capability, ready=bool(state.get("ready")), error=state.get("error")))
         ready = [model for model in models if model["ready"]]
         default = next((model["id"] for model in ready if "fdat-xl" in model["id"]), ready[0]["id"] if ready else None)
@@ -117,6 +119,9 @@ def create_app(store, worker, settings):
         state = worker.model_states.get(body["modelID"], {})
         if body["modelID"] not in settings["weights"] or not state.get("ready"):
             raise ProtocolError("Selected model is not configured and verified", 503)
+        supported = state.get("metadata", {}).get("supportedPrecisions", ["float32"])
+        if body.get("precision", "float32") not in supported:
+            raise ProtocolError("Selected model/device does not support the requested precision", 409)
         return await asyncio.to_thread(store.create, owner, body, settings["maximum_side"], settings["maximum_pixels"])
 
     @app.get("/v1/jobs/{job_id}")

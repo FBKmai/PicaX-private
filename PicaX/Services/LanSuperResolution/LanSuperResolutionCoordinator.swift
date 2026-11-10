@@ -63,12 +63,17 @@ final class LanSuperResolutionCoordinator: ObservableObject {
         errorMessage = nil
     }
 
-    func enqueue(records: [DownloadRecord], model: LanSRModelCapability, scale: Int) throws {
+    func enqueue(records: [DownloadRecord], model: LanSRModelCapability, scale: Int, precision: String) throws {
         guard journalAvailable else { throw LanSRError.message("任务日志无法恢复，未创建新任务。请先保留日志并排查。") }
         guard let server, !records.isEmpty, model.ready, model.deliveryScales.contains(scale) else {
             throw LanSRError.message("请先连接电脑并选择已就绪的模型。")
         }
         try model.validate()
+        guard model.selectablePrecisions.contains(precision) else {
+            throw LanSRError.message("当前电脑模型不支持所选推理精度。")
+        }
+        // Older servers reject unknown spec keys, so retain their legacy wire shape.
+        let requestedPrecision = model.supportedPrecisions == nil ? nil : precision
         let before = jobs
         var reserved: [String] = []
         do {
@@ -85,7 +90,7 @@ final class LanSuperResolutionCoordinator: ObservableObject {
                 jobs.append(LanSRLocalJob(id: UUID().uuidString.lowercased(), serverID: server.serverID,
                     sourceRecordID: record.id, title: record.item.title, chapters: chapters.map(\.chapter),
                     sourceChapterIndexes: chapters.map(\.index), pageCounts: chapters.map(\.pageCount),
-                    model: model, deliveryScale: scale))
+                    model: model, deliveryScale: scale, precision: requestedPrecision))
             }
             try LanSRJournal.save(jobs)
         } catch {
@@ -227,7 +232,8 @@ final class LanSuperResolutionCoordinator: ObservableObject {
         current = try job(id)
         let spec = LanSRJobSpec(version: 1, jobID: id, sourceRecordID: current.sourceRecordID, title: current.title,
             modelID: current.model.id, modelSHA256: current.model.sha256, nativeScale: current.model.nativeScale,
-            deliveryScale: current.deliveryScale, mode: "fullPage", pages: current.prepared.sorted { $0.id < $1.id })
+            deliveryScale: current.deliveryScale, mode: "fullPage", pages: current.prepared.sorted { $0.id < $1.id },
+            precision: current.precision)
         guard try JSONEncoder().encode(spec).count <= 2 * 1024 * 1024 else { throw LanSRError.message("任务清单超过 2 MiB。") }
         try change(id) { $0.spec = spec }
     }

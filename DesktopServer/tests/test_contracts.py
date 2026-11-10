@@ -11,7 +11,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 import uuid
 import zlib
 
@@ -48,7 +48,7 @@ def result(body, page=None):
     return {"modelID": body["modelID"], "modelSHA256": body["modelSHA256"], "nativeScale": body["nativeScale"],
             "deliveryScale": scale, "width": page["width"] * scale, "height": page["height"] * scale,
             "bytes": len(output), "sha256": hashlib.sha256(output).hexdigest(), "engine": "PyTorch", "device": "cpu",
-            "deviceName": "explicit test fixture; no AI was run", "precision": "float32", "torchVersion": "test-only",
+            "deviceName": "explicit test fixture; no AI was run", "precision": body.get("precision", "float32"), "torchVersion": "test-only",
             "cudaVersion": "none", "license": LICENSE, "sourceURL": SOURCE, "mode": "fullPage",
             "downsampling": "lanczos" if scale < body["nativeScale"] else "none", "seconds": 1.0}
 
@@ -60,6 +60,21 @@ class ProtocolTests(unittest.TestCase):
                 body = spec(model, scale)
                 self.assertIs(validate_spec(body), body)
                 validate_result(result(body), body, body["pages"][0])
+
+    def test_job_precision_is_optional_but_results_must_match(self):
+        for precision in (None, "float32", "bfloat16"):
+            body = spec()
+            if precision is not None:
+                body["precision"] = precision
+            self.assertIs(validate_spec(body), body)
+            value = result(body)
+            self.assertEqual(value["precision"], precision or "float32")
+            validate_result(value, body, body["pages"][0])
+            value["precision"] = "bfloat16" if value["precision"] == "float32" else "float32"
+            with self.assertRaises(ProtocolError): validate_result(value, body, body["pages"][0])
+        for precision in ("float16", "auto", None, True, 16, [], {}):
+            body = spec(); body["precision"] = precision
+            with self.subTest(precision=precision), self.assertRaises(ProtocolError): validate_spec(body)
 
     def test_manifest_version_is_not_boolean(self):
         body = spec(); body["version"] = True
@@ -167,13 +182,14 @@ class StartupTests(unittest.TestCase):
                 run = Mock()
                 output = io.StringIO()
                 with patch.dict(sys.modules, {"uvicorn": SimpleNamespace(run=run), "qrcode": SimpleNamespace(QRCode=Mock())}), \
-                     patch.object(worker_module, "Worker", return_value=worker), \
+                     patch.object(worker_module, "Worker", return_value=worker) as worker_factory, \
                      patch("picax_lan.cli.JobStore", wraps=JobStore) as store_factory, \
                      patch("picax_lan.server.create_app", return_value="http-app"), redirect_stdout(output):
                     main(["--host", "192.168.5.8", "--weights-dir", str(root), "--data-dir", str(root / "data"),
                           "--no-discovery", "--accept-noncommercial-license"] + flags)
                 self.assertEqual(store_factory.call_args.kwargs,
                                  {"job_quota": job_gib * 1024**3, "total_quota": total_gib * 1024**3})
+                self.assertEqual(worker_factory.call_args.args[1]["precisions"], {MODELS[-2].id: "float32"})
                 worker.start.assert_called_once()
                 run.assert_called_once()
                 self.assertEqual(run.call_args.args, ("http-app",))
@@ -181,6 +197,32 @@ class StartupTests(unittest.TestCase):
                 self.assertIn("http://192.168.5.8:18443", output.getvalue())
                 self.assertNotIn("pairingSecret", output.getvalue())
                 self.assertFalse((root / "data" / "identity").exists())
+
+    def test_cli_precision_overrides_and_invalid_selections(self):
+        from picax_lan.cli import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for model in (MODELS[0], MODELS[-2]):
+                (root / model.file).touch()  # No real weights are loaded.
+            base = ["--host", "192.168.5.8", "--weights-dir", str(root), "--data-dir", str(root / "data"),
+                    "--models", "hat-l", "fdat-xl", "--no-discovery", "--accept-noncommercial-license"]
+            for flags, expected in (
+                (["--model-precision", "hat-l=bfloat16"], {MODELS[0].id: "bfloat16", MODELS[-2].id: "float32"}),
+                (["--precision", "bfloat16", "--model-precision", "hat-l=bfloat16", "--model-precision", "hat-l=float32"],
+                 {MODELS[0].id: "float32", MODELS[-2].id: "bfloat16"}),
+            ):
+                worker = SimpleNamespace(thread=SimpleNamespace(ident=None), start=Mock())
+                with patch.dict(sys.modules, {"uvicorn": SimpleNamespace(run=Mock()), "qrcode": SimpleNamespace(QRCode=Mock())}), \
+                     patch("picax_lan.worker.Worker", return_value=worker) as factory, \
+                     patch("picax_lan.server.create_app", return_value="http-app"), redirect_stdout(io.StringIO()):
+                    main(base + flags)
+                self.assertEqual(factory.call_args.args[1]["precisions"], expected)
+            for flags in (["--model-precision", "hat-l=float16"], ["--model-precision", "fdat-m=bfloat16"],
+                          ["--model-precision", "hat-l"], ["--device", "cpu", "--precision", "bfloat16"]):
+                with self.subTest(flags=flags), patch("picax_lan.cli.JobStore") as factory, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error: main(base + flags)
+                    self.assertEqual(error.exception.code, 2)
+                    factory.assert_not_called()
 
     def test_invalid_disk_quotas_rejected_before_storage_is_opened(self):
         from picax_lan.cli import main
@@ -199,20 +241,26 @@ class InferenceContractTests(unittest.TestCase):
     class CUDAOutOfMemoryError(RuntimeError):
         pass
 
-    def test_startup_does_not_derive_input_limit_from_free_vram(self):
+    def test_startup_precision_support_without_vram_estimates(self):
         from picax_lan.inference import Predictor
-        for model in MODELS:
-            with self.subTest(model=model.id):
+        cases = [(model, None, True, True, "cuda") for model in MODELS]
+        cases += [(MODELS[0], "bfloat16", model_bf16, gpu_bf16, device)
+                  for model_bf16, gpu_bf16, device in ((True, True, "cuda"), (False, True, "cuda"),
+                                                      (True, False, "cuda"), (True, True, "cpu"))]
+        for model, precision, model_bf16, gpu_bf16, device in cases:
+            with self.subTest(model=model.id, precision=precision, model_bf16=model_bf16, gpu_bf16=gpu_bf16, device=device):
                 torch = MagicMock()
                 torch.__version__ = "test-only"
                 torch.version.cuda = "test-only"
                 torch.cuda.is_available.return_value = True
                 torch.cuda.get_device_capability.return_value = (8, 0)
                 torch.cuda.get_device_name.return_value = "Mock GPU; no model loaded"
+                torch.cuda.is_bf16_supported.return_value = gpu_bf16
+                torch.get_num_threads.return_value = 4
                 torch.cuda.mem_get_info.side_effect = AssertionError("No startup VRAM estimate allowed")
                 descriptor_type = type("TestDescriptor", (SimpleNamespace,), {})
                 detected = descriptor_type(architecture=SimpleNamespace(id=model.architecture), scale=model.scale,
-                    input_channels=3, output_channels=3, model=MagicMock(),
+                    input_channels=3, output_channels=3, model=MagicMock(), supports_bfloat16=model_bf16,
                     size_requirements=SimpleNamespace(square=False, check=Mock(return_value=True), multiple_of=model.alignment))
                 loader = SimpleNamespace(load_from_state_dict=Mock(return_value=detected))
                 safetensors = SimpleNamespace(load=Mock(return_value={}))
@@ -220,15 +268,24 @@ class InferenceContractTests(unittest.TestCase):
                            "safetensors": SimpleNamespace(torch=safetensors), "safetensors.torch": safetensors,
                            "spandrel": SimpleNamespace(ImageModelDescriptor=descriptor_type, ModelLoader=Mock(return_value=loader),
                                                        canonicalize_state_dict=lambda value: value)}
-                settings = {"model_id": model.id, "device": "cuda", "noncommercial": True,
+                settings = {"model_id": model.id, "device": device, "noncommercial": True,
                             "weights": {model.id: "not-a-real-checkpoint"}, "maximum_pixels": 8_000_000}
+                if precision is not None:
+                    settings["precisions"] = {model.id: precision}
                 contract = SimpleNamespace(checked_weight_bytes=Mock(return_value=b"test-only"))
+                supported = ["float32"] + (["bfloat16"] if device == "cuda" and model_bf16 and gpu_bf16 else [])
                 with patch.dict(sys.modules, modules), \
                      patch("picax_lan.inference.trusted_tooling", return_value=(contract, SimpleNamespace())):
+                    if (precision or "float32") not in supported:
+                        with self.assertRaisesRegex(RuntimeError, "no implicit precision fallback"): Predictor(settings)
+                        detected.model.eval.assert_not_called()
+                        continue
                     predictor = Predictor(settings)
                 self.assertEqual(predictor.metadata["maximumInputPixels"], 8_000_000)
-                self.assertEqual(predictor.metadata["precision"], "float32")
-                detected.model.float.assert_called_once_with()
+                self.assertEqual(predictor.metadata["precision"], precision or "float32")
+                self.assertEqual(predictor.metadata["supportedPrecisions"], supported)
+                detected.model.eval.return_value.to.assert_called_once_with(device=device, dtype=getattr(torch, precision or "float32"))
+                detected.model.float.assert_not_called()
                 torch.cuda.mem_get_info.assert_not_called()
 
     def test_large_page_reaches_actual_model_without_vram_estimate(self):
@@ -241,6 +298,8 @@ class InferenceContractTests(unittest.TestCase):
                 predictor.descriptor = model
                 predictor.settings = {"device": "cuda", "maximum_side": 4096, "maximum_pixels": 8_000_000}
                 predictor.np, predictor.torch = MagicMock(), MagicMock()
+                predictor.metadata = {"precision": "float32"}
+                predictor.dtype = predictor.torch.float32
                 predictor.torch.inference_mode.side_effect = nullcontext
                 predictor.torch.cuda.mem_get_info.side_effect = AssertionError("No per-page VRAM estimate allowed")
                 predictor.full_page = SimpleNamespace(pad_reflect=MagicMock())
@@ -254,6 +313,7 @@ class InferenceContractTests(unittest.TestCase):
                     with self.assertRaises(self.CUDAOutOfMemoryError):
                         predictor.predict(source, destination, page, body)
                 predictor.model.assert_called_once_with(predictor.torch.from_numpy.return_value.to.return_value)
+                predictor.torch.from_numpy.return_value.to.assert_called_once_with(device="cuda", dtype=predictor.torch.float32)
                 predictor.torch.cuda.reset_peak_memory_stats.assert_called_once_with()
                 predictor.torch.cuda.mem_get_info.assert_not_called()
                 predictor.torch.cuda.memory_reserved.assert_not_called()
@@ -262,11 +322,13 @@ class InferenceContractTests(unittest.TestCase):
 
     def test_cuda_allocation_failure_is_reported_as_actual_single_page_oom(self):
         from picax_lan.inference import worker_main
-        for failure in (self.CUDAOutOfMemoryError("test allocation failure"), RuntimeError("test invalid output")):
-            with self.subTest(error=type(failure).__name__):
+        for failure, precision in ((self.CUDAOutOfMemoryError("test allocation failure"), "float32"),
+                                   (self.CUDAOutOfMemoryError("test allocation failure"), "bfloat16"),
+                                   (RuntimeError("test invalid output"), "float32")):
+            with self.subTest(error=type(failure).__name__, precision=precision):
                 body = spec(MODELS[0]); page = body["pages"][0]
                 page.update(width=1280, height=1864)
-                predictor = SimpleNamespace(metadata={"test": True}, descriptor=MODELS[0],
+                predictor = SimpleNamespace(metadata={"precision": precision}, descriptor=MODELS[0],
                     torch=SimpleNamespace(cuda=SimpleNamespace(OutOfMemoryError=self.CUDAOutOfMemoryError)),
                     predict=Mock(side_effect=failure))
                 connection = Mock()
@@ -276,12 +338,91 @@ class InferenceContractTests(unittest.TestCase):
                 self.assertEqual(connection.send.call_args_list[0].args[0], {"ready": True, "metadata": predictor.metadata})
                 error = connection.send.call_args_list[1].args[0]["error"]
                 if isinstance(failure, self.CUDAOutOfMemoryError):
-                    for fragment in ("显存实际不足", "1280×1864", "原生 4×", "FP32", "不是输入像素预估拦截", "未缩图、未分块、未换模型"):
+                    label = "BF16" if precision == "bfloat16" else "FP32"
+                    for fragment in ("显存实际不足", "1280×1864", "原生 4×", label, "不是输入像素预估拦截", "未缩图、未分块、未换模型"):
                         self.assertIn(fragment, error)
                 else:
                     self.assertEqual(error, "RuntimeError: test invalid output")
                 connection.close.assert_called_once_with()
                 connection.recv.assert_called_once_with()
+
+    def test_bf16_input_and_cpu_float32_png_boundary(self):
+        from picax_lan.inference import Predictor
+        body = spec(MODELS[0]); body["precision"] = "bfloat16"
+        page = body["pages"][0]
+        predictor = Predictor.__new__(Predictor)
+        predictor.descriptor = MODELS[0]
+        predictor.settings = {"device": "cuda", "maximum_side": 4096, "maximum_pixels": 8_000_000}
+        predictor.np, predictor.torch = MagicMock(), MagicMock()
+        predictor.dtype = predictor.torch.bfloat16
+        predictor.torch.inference_mode.side_effect = nullcontext
+        predictor.torch.isfinite.return_value.all.return_value.item.return_value = True
+        predictor.metadata = result(body)
+        predictor.full_page = SimpleNamespace(pad_reflect=MagicMock())
+        output = MagicMock()
+        output.shape = (1, 3, 256, 256)
+        predictor.model = Mock(return_value=output)
+        image = MagicMock()
+        image.open.return_value.__enter__.return_value.mode = "RGB"
+        destination = Mock()
+        destination.stat.return_value.st_size = predictor.metadata["bytes"]
+        with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}), \
+             patch("picax_lan.inference.validate_png"), \
+             patch("picax_lan.inference.png_dimensions", return_value=(128, 128)), \
+             patch("picax_lan.inference.digest_file", side_effect=[page["sha256"], predictor.metadata["sha256"]]):
+            value = predictor.predict(Path("mock-input.png"), destination, page, body)
+        self.assertEqual(value["precision"], "bfloat16")
+        predictor.torch.from_numpy.return_value.to.assert_called_once_with(device="cuda", dtype=predictor.torch.bfloat16)
+        cropped = output.__getitem__.return_value.detach.return_value
+        cropped.cpu.assert_called_once_with()
+        cropped.float.assert_not_called()  # Never allocate a full-page FP32 copy on CUDA.
+        cpu = cropped.cpu.return_value
+        cpu.float.assert_called_once_with()
+        cpu.numpy.assert_not_called()  # BF16 is not sent directly to NumPy.
+        cpu.float.return_value.clamp_.assert_called_once_with(0, 1)
+        cpu.float.return_value.clamp_.return_value.numpy.assert_called_once_with()
+        image.fromarray.return_value.resize.return_value.save.assert_called_once_with(destination, format="PNG")
+        body["precision"] = "float32"
+        with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}):
+            with self.assertRaisesRegex(RuntimeError, "Job precision differs"):
+                predictor.predict(Path("mock-input.png"), destination, page, body)
+        predictor.model.assert_called_once()
+
+    def test_supervisor_reloads_precision_and_keeps_legacy_jobs_fp32(self):
+        from picax_lan.worker import Worker
+        model = MODELS[0]
+        bodies = [spec(model) for _ in range(4)]
+        for body, precision in zip(bodies, ("bfloat16", "float32", None, "bfloat16")):
+            if precision is not None:
+                body["precision"] = precision
+        with tempfile.TemporaryDirectory() as directory:
+            store = Mock()
+            store.spec.side_effect = {body["jobID"]: body for body in bodies}.__getitem__
+            store.path.side_effect = lambda job, page, name: Path(directory) / (job + "-" + page + "-" + name)
+            store.next_page.side_effect = [(body["jobID"], body["pages"][0]) for body in bodies]
+            store.state.return_value = "running"
+            for body in bodies:
+                store.path(body["jobID"], body["pages"][0]["id"], "result.part").write_bytes(png(128, 128))
+            connection = Mock()
+            connection.poll.return_value = True
+            connection.recv.side_effect = [{"result": result(body)} for body in bodies]
+            process = Mock()
+            process.is_alive.return_value = True
+            worker = Worker(store, {"weights": {model.id: "mock"}, "precisions": {model.id: "bfloat16"}, "timeout": 10})
+            worker.stop_event = Mock()
+            worker.stop_event.is_set.return_value = False
+            worker.stop_event.wait.side_effect = [False] * len(bodies) + [True]
+            def launch(model_id, precision=None):
+                worker.current_model = model_id
+                worker.current_precision = precision or "bfloat16"
+                worker.process, worker.connection = process, connection
+                return True
+            worker.launch = Mock(side_effect=launch)
+            worker.run()
+            self.assertEqual(worker.launch.call_args_list, [call(model.id), call(model.id, "float32"), call(model.id, "bfloat16")])
+            self.assertEqual([entry.kwargs["result"]["precision"] for entry in store.finish_page.call_args_list],
+                             ["bfloat16", "float32", "float32", "bfloat16"])
+            self.assertEqual([entry.args[0]["spec"] for entry in connection.send.call_args_list], bodies)
 
     def test_worker_process_handles_each_page_in_separate_predict_call(self):
         from picax_lan.inference import worker_main
@@ -329,6 +470,15 @@ class StorageTests(unittest.TestCase):
         with self.assertRaises(ProtocolError): self.store.create(self.other, self.body, 8192, 8_000_000)
         changed = copy.deepcopy(self.body); changed["title"] = "changed"
         with self.assertRaises(ProtocolError): self.store.create(self.owner, changed, 8192, 8_000_000)
+
+    def test_selected_precision_survives_recovery_and_cannot_change_in_place(self):
+        body = spec(); body["precision"] = "bfloat16"
+        self.store.create(self.owner, body, 8192, 8_000_000)
+        self.store.recover()
+        self.assertEqual(self.store.spec(body["jobID"])["precision"], "bfloat16")
+        changed = copy.deepcopy(body); changed["precision"] = "float32"
+        with self.assertRaises(ProtocolError): self.store.create(self.owner, changed, 8192, 8_000_000)
+        self.assertNotIn("precision", self.store.spec(self.body["jobID"]))  # Legacy spec stays unchanged.
 
     def test_incomplete_upload_cannot_commit(self):
         with self.assertRaises(ProtocolError): self.store.commit(self.body["jobID"], self.owner)

@@ -27,6 +27,7 @@ struct LanSuperResolutionView: View {
     @State private var abandonJob: LanSRLocalJob?
     @State private var selectedModelID = ""
     @State private var deliveryScale = 2
+    @State private var selectedPrecision = "float32"
     @State private var isConnecting = false
     @State private var didSubmit = false
     @State private var localError: String?
@@ -93,6 +94,7 @@ struct LanSuperResolutionView: View {
         .onReceive(coordinator.$capabilities) { updateSelection($0) }
         .onChange(of: selectedModelID) { _ in
             if selectedModel?.deliveryScales.contains(deliveryScale) != true { deliveryScale = 2 }
+            if let model = selectedModel { selectedPrecision = model.precision }
         }
         .task {
             coordinator.resume()
@@ -160,8 +162,23 @@ struct LanSuperResolutionView: View {
                         Picker("回传倍率", selection: $deliveryScale) {
                             ForEach(model.deliveryScales, id: \.self) { scale in Text("\(scale)×").tag(scale) }
                         }
-                        Text("原生 \(model.nativeScale)× · FP32 · 整页推理\n电脑每次单独处理一页，不拼接整本，也不分块。手机不按显存估算拦截输入；实际显存不足由电脑报告。回传图片仍受接收大小和超时限制。")
+                        Picker("推理精度", selection: $selectedPrecision) {
+                            ForEach(model.selectablePrecisions, id: \.self) { precision in
+                                Text(LanSRContract.precisionLabel(precision)).tag(precision)
+                            }
+                        }
+                        Text("原生 \(model.nativeScale)× · \(LanSRContract.precisionLabel(selectedPrecision)) · 整页推理\n电脑每次单独处理一页，不拼接整本，也不分块。手机不按显存估算拦截输入；实际显存不足由电脑报告。回传图片仍受接收大小和超时限制。")
                             .font(.caption).foregroundStyle(.secondary)
+                        if model.supportedPrecisions == nil {
+                            Text("电脑端尚未提供精度选择；更新电脑服务后可选择 BF16。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else if model.selectablePrecisions.contains("bfloat16") {
+                            Text("BF16 通常可降低显存占用；选择仅用于新任务，已有任务精度不变。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("当前模型或电脑设备仅支持 FP32 推理。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                         if deliveryScale < model.nativeScale {
                             Text("先运行原生 \(model.nativeScale)× AI，再以 Lanczos 缩到 \(deliveryScale)× 回传；不是用普通放大代替 AI。")
                                 .font(.caption).foregroundStyle(.secondary)
@@ -195,12 +212,12 @@ struct LanSuperResolutionView: View {
             Button(didSubmit ? "已加入电脑任务" : "发送到电脑超分") {
                 guard !records.isEmpty, let model = selectedModel else { return }
                 do {
-                    try coordinator.enqueue(records: records, model: model, scale: deliveryScale)
+                    try coordinator.enqueue(records: records, model: model, scale: deliveryScale, precision: selectedPrecision)
                     didSubmit = true
                     onSubmitted?()
                 } catch { localError = error.localizedDescription }
             }
-            .disabled(records.isEmpty || didSubmit || selectedModel == nil || isConnecting)
+            .disabled(records.isEmpty || didSubmit || selectedModel?.selectablePrecisions.contains(selectedPrecision) != true || isConnecting)
         } header: { Text("手动提交") }
         footer: { Text("仅处理本次所选下载，不改变“下载后自动超分”的手机本地处理设置。准备和上传时请保持 App 在前台，直到任务显示“输入已完整提交”。") }
     }
@@ -212,7 +229,7 @@ struct LanSuperResolutionView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(job.title).font(.headline)
                     Text("\(job.phase) · 已收取 \(job.imported.count)/\(job.pageCounts.reduce(0, +)) 页").font(.subheadline)
-                    Text("\(job.model.name) · 回传 \(job.deliveryScale)×").font(.caption).foregroundStyle(.secondary)
+                    Text("\(job.model.name) · \(LanSRContract.precisionLabel(job.precision ?? "float32")) · 回传 \(job.deliveryScale)×").font(.caption).foregroundStyle(.secondary)
                     if !job.message.isEmpty { Text(job.message).font(.caption).foregroundStyle(.secondary) }
                     if job.submitted && !job.finished { Text("电脑已接受完整输入，手机可以离开此页面。").font(.caption).foregroundStyle(.secondary) }
                     if job.finished {
@@ -255,11 +272,20 @@ struct LanSuperResolutionView: View {
         catch { localError = error.localizedDescription }
     }
     private func updateSelection(_ capabilities: LanSRCapabilities?) {
-        guard let capabilities else { selectedModelID = ""; deliveryScale = 2; return }
+        guard let capabilities else {
+            selectedModelID = ""; deliveryScale = 2; selectedPrecision = "float32"
+            return
+        }
         if !capabilities.models.contains(where: { $0.id == selectedModelID && $0.ready }) {
             selectedModelID = capabilities.models.first { $0.id == capabilities.defaultModelID && $0.ready }?.id
                 ?? capabilities.models.first(where: \.ready)?.id ?? ""
             deliveryScale = 2
+            selectedPrecision = capabilities.models.first { $0.id == selectedModelID }?.precision ?? "float32"
+        }
+        // A normal refresh must not overwrite a still-valid phone selection.
+        if let model = capabilities.models.first(where: { $0.id == selectedModelID && $0.ready }),
+           !model.selectablePrecisions.contains(selectedPrecision) {
+            selectedPrecision = model.precision
         }
     }
 }

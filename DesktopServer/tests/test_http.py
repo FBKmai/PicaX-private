@@ -54,6 +54,27 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(data["defaultModelID"], MODELS[-2].id)
         self.assertTrue(all(model["maximumInputPixels"] == self.settings["maximum_pixels"] for model in data["models"]))
 
+    def test_phone_precision_selection_and_legacy_jobs(self):
+        model = MODELS[0]
+        self.settings["precisions"] = {model.id: "bfloat16"}
+        self.worker.model_states[model.id]["metadata"] = {
+            "precision": "float32", "supportedPrecisions": ["float32", "bfloat16"]}
+        code, data = self.request("GET", "/v1/capabilities")
+        self.assertEqual(code, 200)
+        capability = next(value for value in data["models"] if value["id"] == model.id)
+        self.assertEqual(capability["precision"], "bfloat16")  # Default is not the last worker dtype.
+        self.assertEqual(capability["supportedPrecisions"], ["float32", "bfloat16"])
+        for precision in (None, "float32", "bfloat16"):
+            body = spec(model)
+            if precision is not None:
+                body["precision"] = precision
+            code, data = self.request("POST", "/v1/jobs", body)
+            self.assertEqual(code, 200, data)
+            self.assertEqual(self.store.spec(body["jobID"]), body)
+        self.worker.model_states[model.id]["metadata"]["supportedPrecisions"] = ["float32"]
+        body = spec(model); body["precision"] = "bfloat16"
+        self.assertEqual(self.request("POST", "/v1/jobs", body)[0], 409)
+
     def test_large_page_manifest_is_not_rejected_by_model_or_startup_vram_ceiling(self):
         # Manifests only; do not create large images or run inference.
         for model in (MODELS[0], MODELS[-2]):

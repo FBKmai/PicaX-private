@@ -6,27 +6,30 @@ final class LanSuperResolutionTests: XCTestCase {
     private let jobID = "11111111-1111-4111-8111-111111111111"
     private let serverID = "22222222-2222-4222-8222-222222222222"
 
-    private func model(native: Int = 4, inputPixels: Int = 4_000_000, maximumSide: Int = 4096) throws -> LanSRModelCapability {
+    private func model(native: Int = 4, inputPixels: Int = 4_000_000, maximumSide: Int = 4096,
+                       precision: String = "float32", supportedPrecisions: [String]? = nil) throws -> LanSRModelCapability {
         let id = native == 4 ? "illustrationjanai-v3detail-fdat-xl-4x-float32" : "illustrationjanai-v3detail-fdat-m-2x-float32"
         let known = try XCTUnwrap(LanSRContract.models[id])
         return LanSRModelCapability(id: id, name: "Test", sha256: known.sha, nativeScale: known.scale,
             deliveryScales: native == 4 ? [2, 4] : [2], alignment: 16, minimumSide: 64,
-            maximumSide: maximumSide, maximumInputPixels: inputPixels, precision: "float32", mode: "fullPage", ready: true, error: nil)
+            maximumSide: maximumSide, maximumInputPixels: inputPixels, precision: precision, mode: "fullPage", ready: true, error: nil,
+            supportedPrecisions: supportedPrecisions)
     }
     private func page() -> LanSRPage {
         LanSRPage(id: "e0000-p0000", chapterIndex: 0, chapterTitle: "Chapter", pageIndex: 0,
                   width: 256, height: 384, bytes: 100, sha256: String(repeating: "a", count: 64))
     }
-    private func spec(scale: Int = 2) throws -> LanSRJobSpec {
+    private func spec(scale: Int = 2, precision: String? = nil) throws -> LanSRJobSpec {
         let model = try model()
         return LanSRJobSpec(version: 1, jobID: jobID, sourceRecordID: "source", title: "Test",
-            modelID: model.id, modelSHA256: model.sha256, nativeScale: 4, deliveryScale: scale, mode: "fullPage", pages: [page()])
+            modelID: model.id, modelSHA256: model.sha256, nativeScale: 4, deliveryScale: scale, mode: "fullPage", pages: [page()],
+            precision: precision)
     }
-    private func result(scale: Int = 2, width: Int? = nil, hash: String? = nil) throws -> LanSRResult {
+    private func result(scale: Int = 2, width: Int? = nil, hash: String? = nil, precision: String = "float32") throws -> LanSRResult {
         let model = try model()
         return LanSRResult(modelID: model.id, modelSHA256: model.sha256, nativeScale: 4, deliveryScale: scale,
             width: width ?? 256 * scale, height: 384 * scale, bytes: 100, sha256: hash ?? String(repeating: "b", count: 64),
-            engine: "PyTorch", device: "cuda", deviceName: "Test GPU", precision: "float32", torchVersion: "test",
+            engine: "PyTorch", device: "cuda", deviceName: "Test GPU", precision: precision, torchVersion: "test",
             cudaVersion: "test", license: "CC-BY-NC-4.0", sourceURL: "https://github.com/the-database/MangaJaNai/releases/tag/3.0.0",
             mode: "fullPage", downsampling: scale == 2 ? "lanczos" : "none", seconds: 1)
     }
@@ -90,6 +93,29 @@ final class LanSuperResolutionTests: XCTestCase {
         XCTAssertThrowsError(try result(width: 1024).validate(spec: spec(), page: page()))
         XCTAssertThrowsError(try result(hash: "invalid").validate(spec: spec(), page: page()))
     }
+    func testPrecisionCapabilitiesAndLegacyWireShape() throws {
+        let legacy = try JSONDecoder().decode(LanSRModelCapability.self, from: JSONEncoder().encode(model()))
+        XCTAssertNil(legacy.supportedPrecisions)
+        XCTAssertEqual(legacy.selectablePrecisions, ["float32"])
+        XCTAssertNoThrow(try legacy.validate())
+        let current = try model(precision: "bfloat16", supportedPrecisions: ["float32", "bfloat16"])
+        XCTAssertNoThrow(try current.validate())
+        XCTAssertEqual(current.selectablePrecisions, ["float32", "bfloat16"])
+        XCTAssertThrowsError(try model(precision: "bfloat16").validate())
+        for supported in [[], ["float32", "float16"], ["float32", "float32"]] {
+            XCTAssertThrowsError(try model(supportedPrecisions: supported).validate())
+        }
+        let oldWire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(spec())) as? [String: Any])
+        XCTAssertNil(oldWire["precision"])
+        let newWire = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(spec(precision: "bfloat16"))) as? [String: Any])
+        XCTAssertEqual(newWire["precision"] as? String, "bfloat16")
+    }
+    func testResultPrecisionMustMatchPinnedJob() throws {
+        try result(precision: "bfloat16").validate(spec: spec(precision: "bfloat16"), page: page())
+        XCTAssertThrowsError(try result().validate(spec: spec(precision: "bfloat16"), page: page()))
+        XCTAssertThrowsError(try result(precision: "bfloat16").validate(spec: spec(), page: page()))
+        XCTAssertThrowsError(try result(precision: "float16").validate(spec: spec(precision: "float16"), page: page()))
+    }
     func testPageValidationIgnoresCachedPCInputAndVRAMEstimates() throws {
         let cached = try model(inputPixels: 400_000, maximumSide: 64)
         for (width, height) in [(1280, 1864), (2000, 3000), (2000, 4000), (8192, 1)] {
@@ -139,8 +165,30 @@ final class LanSuperResolutionTests: XCTestCase {
         let decoded = try JSONDecoder().decode(LanSRLocalJob.self, from: JSONEncoder().encode(job))
         try decoded.validateJournal()
         XCTAssertEqual(decoded.sourceChapterIndexes, [9])
+        XCTAssertNil(decoded.precision)
+        XCTAssertNil(decoded.spec?.precision)
         XCTAssertFalse(decoded.submitted)
         job.prepared.append(page())
+        XCTAssertThrowsError(try job.validateJournal())
+    }
+    func testJournalPersistsSelectedPrecisionIndependentlyOfDefault() throws {
+        var job = LanSRLocalJob(id: jobID, serverID: serverID, sourceRecordID: "source", title: "Test",
+            chapters: [ComicChapter(id: "chapter", title: "Chapter", subtitle: nil)],
+            sourceChapterIndexes: [0], pageCounts: [1],
+            model: try model(supportedPrecisions: ["float32", "bfloat16"]), deliveryScale: 2, precision: "bfloat16")
+        job.prepared = [page()]
+        job.spec = try spec(precision: "bfloat16")
+        job.sourceURLs[page().id] = "picax-download/test/page.png"
+        job.results[page().id] = try result(precision: "bfloat16")
+        try job.validateJournal()
+        let decoded = try JSONDecoder().decode(LanSRLocalJob.self, from: JSONEncoder().encode(job))
+        try decoded.validateJournal()
+        XCTAssertEqual(decoded.model.precision, "float32")
+        XCTAssertEqual(decoded.precision, "bfloat16")
+        XCTAssertEqual(decoded.spec?.precision, "bfloat16")
+        job.precision = "float32"
+        XCTAssertThrowsError(try job.validateJournal())
+        job.precision = "float16"
         XCTAssertThrowsError(try job.validateJournal())
     }
     func testCachedInputEstimateDoesNotPreventJournalRecovery() throws {

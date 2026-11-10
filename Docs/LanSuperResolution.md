@@ -5,7 +5,7 @@
 - 下载库多选**已下载的漫画图片** → **电脑超分**，或在“设置 → 下载 → 局域网电脑超分”输入电脑地址/扫码连接、查看任务。
 - 保留“本机超分”和下载后自动超分；自动超分仍在手机运行，不会悄悄改到电脑。
 - 结果独立保存到“下载 → 超分”，不覆盖源下载。可沿用下载库的阅读、ZIP 和 PDF 导出。ZIP 附带模型来源/许可说明，完整任务还附每页推理元数据；PDF 只包含图片页。
-- 电脑使用真实 PyTorch/CUDA 模型，没有普通插值冒充 AI、隐式 CPU 回退或失败后换模型。
+- 电脑使用真实 PyTorch/CUDA 模型，手机可为新任务选择 **FP32 / BF16**（以模型与显卡公布的支持项为准），没有普通插值冒充 AI、隐式 CPU/精度回退或失败后换模型。
 - 参考 LANDrop 的发现、配对和独立传输思路；**不是 LANDrop 协议实现，不与 LANDrop 互通，也不要求安装 LANDrop**。
 - 当前连接采用**局域网 HTTP 直连**，不使用证书、口令或一次性配对。旧版 HTTPS 手机包需要更新；不能只重启电脑端就让旧包改用 HTTP。
 - 原版 HTTPS 链路曾在 Windows 上实测；改版不重复跑大模型测试。手机端编译、XCTest 和 IPA 状态以对应 Actions 运行及交付报告为准；iPhone 真机跨局域网端到端仍待验证。
@@ -28,12 +28,12 @@
 D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\launchers\start-picax-server.cmd
 ```
 
-双击上述文件即可启动并显示长期有效的连接地址/二维码。保持终端运行；Ctrl+C 停止。无需配对，不会生成或读取证书；启动脚本已启用简短的请求状态日志。
+双击上述文件即可启动并显示长期有效的连接地址/二维码。保持终端运行；Ctrl+C 停止。无需配对，不会生成或读取证书；启动脚本已启用简短的请求状态日志，并将 HAT-L 的新任务默认精度设为 BF16（其他模型仍为 FP32）。**这需要安装带精度选择的新 IPA**；修改文件本身不会重启已运行的服务。
 
 也可在仓库目录的 Windows 终端执行：
 
 ```bat
-DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pic" --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --job-quota-gib 32 --total-quota-gib 64 --diagnostics --accept-noncommercial-license
+DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pic" --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --model-precision hat-l=bfloat16 --job-quota-gib 32 --total-quota-gib 64 --diagnostics --accept-noncommercial-license
 ```
 
 若 Windows 弹出网络访问询问，仅允许你信任的**专用网络**。程序不会自动修改防火墙、开启公网端口、UPnP 或端口转发。手机和电脑须能互相访问同一局域网；访客 Wi-Fi/AP 隔离可能阻止连接。
@@ -47,7 +47,17 @@ DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pi
 | `fdat-m` | IllustrationJaNai V3detail FDAT-M unshuffle | 2× | 2× | 快速档、手机模型对照基线 |
 | `dat2` | IllustrationJaNai V3denoise DAT2 | 4× | 2× / 4× | 允许列表候选；本机未下载/验证，不会显示为已就绪 |
 
-默认回传 **2×**。4× 模型回传 2× 时，先运行真实原生 4× AI，再用 Lanczos 缩小到 2×；并非普通放大代替 AI。FP16/BF16 是部分上游**存储**格式，当前推理统一 FP32，关闭 TF32；未默认启用半精度或编译优化。
+默认回传 **2×**。4× 模型回传 2× 时，先运行真实原生 4× AI，再用 Lanczos 缩小到 2×；并非普通放大代替 AI。
+
+### FP32 / BF16 选择
+
+- 新手机在“电脑模型 / 回传倍率”下显示“推理精度”。选择 **FP32** 或 **BF16** 后提交，选择会写入手机任务日志与发送给电脑的清单；任务列表显示该任务的固定精度。切换选择只影响新任务，不改变已排队、重试或恢复中的任务。
+- 通用 CLI 不传新参数时仍默认 FP32。`--precision bfloat16` 修改所有所选模型的默认值；`--model-precision hat-l=bfloat16` 只覆盖 HAT-L，可重复传入，后面的同模型值覆盖前面的。它们控制启动加载精度与手机初始选项，**手机对新任务的显式选择优先**。
+- 只开放 `float32` / `bfloat16`，本轮不开放 FP16。BF16 要求 CUDA 硬件支持且 Spandrel descriptor 声明支持；CPU 诊断仅支持 FP32。不支持时明确报错，不自动换精度。`ready` 表示选定默认精度的模型加载与身份校验成功，不保证任意尺寸能执行。
+- 电脑同一时间只驻留一个 GPU worker；模型或精度变化时先释放旧进程，再按任务选择加载。输入张量与模型使用相同 dtype；输出先复制到 CPU，再转 FP32 量化为原有 8-bit RGB PNG，避免将 BF16 直接交给 NumPy，也避免在 GPU 上额外分配整页 FP32 副本。FP32 仍关闭 TF32；未加入 autocast、窗口分批或 SDPA 改写。
+- 权重文件名中的 `bf16` / `fp16` 不等于实际存储 dtype。本机 HAT-L、FDAT-XL、FDAT-M 的 safetensors 文件头显示浮点张量均为 F32；运行时才按选定 dtype 转换。既有 modelID 中的 `-float32` 是历史身份标识，**不再代表任务的实际执行精度**；modelID、文件和 SHA-256 均保持不变，实际精度看任务和结果的 `precision`。
+- **兼容性**：缺少 `precision` 的旧任务始终按 FP32 执行，与新 CLI 默认值无关。新手机连接旧电脑服务时只显示 FP32，省略新清单字段以维持旧协议。旧手机仍强制每个模型的能力精度为 FP32，任何模型默认 BF16 都会使它拒绝**整份能力响应**，即使该模型尚未就绪；需更新 IPA，或将电脑所有模型默认值改回 FP32。
+- 本次不做 BF16/FP32 数值画质对比或本机真实 GPU 验证，也未在 Windows 上构建 IPA / 运行 XCTest。下方数据均为历史 FP32；**800×1129 原生 4× 在 24GB 上能否跑通仍未实测，不作保证**。
 
 只开放**逐页整图推理**，每次模型调用处理一页，不把整本漫画拼成一张图。不自动退回之前存在上下文/接缝问题的 128 像素分块，不缩小原图或更换模型，也不保证所有页面能处理。手机不按模型专属输入像素数、对齐后像素数或启动时显存估算拦截输入；只检查回传图片的接收范围和上传文件大小，电脑另检查输入解码/传输限制。模型越重不意味着文字、网点或线条一定更忠实。请用自己的少量页面确认画质。
 
@@ -65,9 +75,9 @@ DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\fetch_models.py --mod
 
 需要代理时，在当前终端设置 `HTTPS_PROXY=http://127.0.0.1:7890`。服务的推理不需要访问互联网，不接收手机上传的模型、Python 代码或 pickle。
 
-## 本机真实验证结果
+## 历史本机 FP32 真实验证结果
 
-诊断图包含文字、细线和彩色区域；不是用户漫画，不构成主观画质或文字保真度认证。单 GPU worker 串行运行；每个模型在独立 spawn 进程加载。没有 CPU 回退。
+诊断图包含文字、细线和彩色区域；不是用户漫画，不构成主观画质或文字保真度认证。以下均是既有 FP32 报告，**不是本次 BF16 改造的新实测**。单 GPU worker 串行运行；每个模型在独立 spawn 进程加载。没有 CPU 回退。
 
 | 模型 | 输入 | 回传 | 推理/编码等总耗时 | PyTorch 峰值 allocated |
 |---|---|---|---:|---:|
@@ -93,7 +103,7 @@ D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-first\report.json
 D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-https\report.json
 ```
 
-这些历史实测不是输入尺寸硬上限。本次已移除模型专属像素上限、原生中间结果像素上限，以及启动时/每页执行前的显存估算拒绝。能力字段 `maximumInputPixels` 仅表示配置的输入解码上限，不代表显存预测或成功保证；手机也不依据旧任务缓存中的该字段拒绝页面。实际 CUDA 分配失败时，错误会明确说明模型、单页尺寸、原生倍率和 FP32，并区分“实际显存不足”与输入解码/回传限制；worker 会被终止，后续页重新加载，不会缩图、分块或换模型。本次只做轻量回归，未重新实测大图 GPU 推理。
+这些历史实测不是输入尺寸硬上限。本次已移除模型专属像素上限、原生中间结果像素上限，以及启动时/每页执行前的显存估算拒绝。能力字段 `maximumInputPixels` 仅表示配置的输入解码上限，不代表显存预测或成功保证；手机也不依据旧任务缓存中的该字段拒绝页面。实际 CUDA 分配失败时，错误会明确说明模型、单页尺寸、原生倍率和实际 FP32/BF16 精度，并区分“实际显存不足”与输入解码/回传限制；worker 会被终止，后续页重新加载，不会缩图、分块或换模型。本次只做轻量回归，未重新实测大图 GPU 推理。
 
 ## 新机器安装
 
@@ -134,7 +144,7 @@ DesktopServer\start-server.cmd --data-dir "D:\折腾\picax\pic" --cleanup --rete
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | GET | `/` | 无需认证的服务状态页，供手机浏览器排查连接 |
-| GET | `/v1/capabilities` | 已配置/校验模型、解码/传输限制、默认回传倍率 |
+| GET | `/v1/capabilities` | 已配置/校验模型、可选推理精度、解码/传输限制、默认回传倍率 |
 | POST | `/v1/jobs` | 幂等创建完整任务清单 |
 | PUT | `/v1/jobs/{id}/pages/{page}` | 逐页规范化 RGB PNG |
 | POST | `/v1/jobs/{id}/commit` | 输入完整后入队 |
@@ -146,6 +156,8 @@ DesktopServer\start-server.cmd --data-dir "D:\折腾\picax\pic" --cleanup --rete
 
 任务 UUID、固定 `e0000-p0000` 页 ID、紧凑章节/连续页索引，不能传任意文件路径。清单最多 2 MiB/4096 页，输入 PNG 64 MiB/800 万原始像素，输入单边默认 4096（可通过 `--maximum-side` 配置至 8192，包含模型对齐后边长）；输出 128 MiB/3200 万像素/单边 16384。模型对齐只用于整页边缘填充与裁切，不额外限制原生中间结果像素或预估显存。最多 8 个活跃任务。每个查询/收取/操作均校验任务归属。
 
+能力项 `precision` 是该模型配置的默认值，`supportedPrecisions` 是当前架构/设备支持的选择列表。新任务清单可带 `precision: "float32"` / `"bfloat16"`，作为不可变任务身份的一部分；旧清单缺字段时固定为 `float32`。结果的 `precision` 必须与清单完全匹配，不能只因属于允许集合就接受。除此之外仍保留 v1 HTTP 路径、RGB PNG、SHA-256 和持久化后 ACK，SQLite 无需新增列。
+
 ### 磁盘配额与 HTTP 507
 
 - 通用启动默认单任务预估配额 **8 GiB**、全部保留任务合计 **16 GiB**；可用 `--job-quota-gib 32 --total-quota-gib 64` 调整，要求两者为正整数且单任务不大于总配额。本机上文的双击启动文件已配置为 **32 / 64 GiB**。
@@ -156,10 +168,15 @@ DesktopServer\start-server.cmd --data-dir "D:\折腾\picax\pic" --cleanup --rete
 
 ## 验证命令
 
-轻量 stdlib 回归，不加载模型：
+轻量 stdlib 回归，不导入 Torch、NumPy、Pillow 或加载模型：
 
 ```bat
 python -I -B DesktopServer\tests\test_contracts.py
+```
+
+HTTP 传输集成回归（使用已安装的 FastAPI/Pillow 等传输依赖，不加载模型，供 CI 运行）：
+
+```bat
 DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\tests\test_http.py
 ```
 
