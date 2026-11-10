@@ -31,9 +31,12 @@ class AttentionBounds(TorchDispatchMode):
         if func is torch.ops.aten.index.Tensor and args[0].ndim == 6:
             self.gathers.append(output.shape[0])
             self.test.assertLessEqual(output.shape[0], self.windows)
-        if func is torch.ops.aten.bmm.default and tuple(output.shape[-2:]) == (self.query, self.key):
-            self.scores.append(output.shape[0] // self.heads)
-            self.test.assertLessEqual(output.shape[0], self.windows * self.heads)
+        # inference_mode can expose aten.matmul directly instead of its bmm
+        # decomposition. Observe either, including the explicit head dimension.
+        if func in (torch.ops.aten.matmul.default, torch.ops.aten.bmm.default) and tuple(output.shape[-2:]) == (self.query, self.key):
+            windows = output.numel() // (self.heads * self.query * self.key)
+            self.scores.append(windows)
+            self.test.assertLessEqual(windows, self.windows)
         return output
 
 
