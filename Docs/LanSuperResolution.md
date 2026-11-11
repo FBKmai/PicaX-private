@@ -1,226 +1,254 @@
-# 局域网电脑 AI 超分
+# 局域网电脑 AI 超分：Windows 部署与排障
 
-## 范围与状态
+[项目首页](../README.md) · [开发指南](Development.md) · [架构与协议](Architecture.md) · [HAT 优化与实测](HATOptimization.md) · [安全说明](../SECURITY.md)
 
-- 下载库多选**已下载的漫画图片** → **电脑超分**，或在“设置 → 下载 → 局域网电脑超分”输入电脑地址/扫码连接、查看任务。
-- 保留“本机超分”和下载后自动超分；自动超分仍在手机运行，不会悄悄改到电脑。
-- 结果独立保存到“下载 → 超分”，不覆盖源下载。可沿用下载库的阅读、ZIP 和 PDF 导出。ZIP 附带模型来源/许可说明，完整任务还附每页推理元数据；PDF 只包含图片页。
-- 电脑使用真实 PyTorch/CUDA 模型，手机可为新任务选择 **FP32 / BF16**（以模型与显卡公布的支持项为准），没有普通插值冒充 AI、隐式 CPU/精度回退或失败后换模型。
-- 参考 LANDrop 的发现、配对和独立传输思路；**不是 LANDrop 协议实现，不与 LANDrop 互通，也不要求安装 LANDrop**。
-- 当前连接采用**局域网 HTTP 直连**，不使用证书、口令或一次性配对。旧版 HTTPS 手机包需要更新；不能只重启电脑端就让旧包改用 HTTP。
-- 原版 HTTPS 链路曾在 Windows 上实测；改版不重复跑大模型测试。手机端编译、XCTest 和 IPA 状态以对应 Actions 运行及交付报告为准；iPhone 真机跨局域网端到端仍待验证。
+本教程从全新 Windows 环境开始，部署本仓库的**优化版 HAT-L / BF16 / 原生 4×**，再用手机提交已下载漫画。所有 IP、磁盘和目录都由你自己选择；不需要维护者的私人启动文件。
 
-## 当前电脑已经装好的环境
+> 服务使用明文 HTTP，无认证、没有 TLS 或密码。仅限自己信任的局域网；不要开放公网、路由器端口转发、UPnP 或公共隧道。手机和电脑都要信任该网络中的其他设备。安全边界见 [SECURITY.md](../SECURITY.md)。
 
-2026-11-09 本地安装到隔离目录，没有改全局 Python、PATH、注册表或防火墙：
+<a id="requirements"></a>
+## 1. 准备环境
 
-- Python 3.11.18：`D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\python`
-- 项目环境：`DesktopServer\.venv`
-- 权重：`D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights`
-- 本机任务数据库、上传原图和超分结果：`D:\折腾\picax\pic`。本机启动文件显式传入该路径，不再使用 C 盘默认数据目录。
-- PyTorch `2.11.0+cu128`、CUDA 12.8、Spandrel 0.4.2。
-- GPU：RTX 5090 D v2，24455 MiB；驱动 616.64。
-- 本机局域网地址：`192.168.5.8`（变化后修改启动地址，并在手机输入新地址即可；不用重新生成证书）。
+| 项目 | 要求 |
+|---|---|
+| 系统 | Windows x64；当前真实 GPU 验证环境为 Windows 11 |
+| Python | **CPython 3.11 x64**；不是 3.9、3.12 或 ARM64 |
+| GPU | NVIDIA CUDA GPU；BF16 必须同时得到硬件和模型 descriptor 支持，不以软件模拟代替 |
+| 驱动 | 支持固定的 PyTorch 2.11.0 / CUDA 12.8 wheel；Blackwell 必须使用支持该架构的驱动与 wheel |
+| 内存/显存 | 全页模型仍随尺寸增长。实测显卡为 RTX 5090 D v2 / 24455 MiB，系统约 30.8 GiB RAM；**没有据此声称最低配置或任意大图保证** |
+| 磁盘 | CUDA Torch wheel 约 2.6 GiB，环境/缓存还需额外数 GiB；权重及上传/输出目录需要另留空间 |
+| 网络 | 首次安装/下载权重需要互联网；推理不访问互联网。手机和电脑之间必须能建立 TCP 连接 |
+| 手机 | 安装支持当前 HTTP 与 FP32/BF16 选择的 PicaX；[获取手机包](../README.md#获取手机-app) |
 
-已配置的快捷启动文件：
+不需要单独安装 CUDA Toolkit 或 cuDNN 来替代所固定的 PyTorch wheel；仍需要兼容的 NVIDIA 驱动。此依赖文件**只用于 Windows x64 / Python 3.11**，不要复用手机 Core ML 的 macOS 环境。
 
-```text
-D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\launchers\start-picax-server.cmd
+其他 NVIDIA 显卡可以按设备实际支持项尝试 FP32/BF16，但没有覆盖全部设备的性能/稳定性证据。Linux/macOS/AMD 电脑 GPU 不在本教程验证范围内；`--device cpu` 仅为显式 FP32 诊断，不是自动回退。
+
+以下命令在 **Windows PowerShell** 中执行。代码块里的 `D:\PicaX-data` 等是可自行更改的示例，不要求机器存在 D 盘。`$LanIP` 必须改成这台电脑的实际局域网 IPv4 地址，不能原样复制示例 IP。
+
+<a id="install"></a>
+## 2. 获取包含优化的源码
+
+先安装 [Git for Windows](https://git-scm.com/downloads/win) 和可信来源的 [Python for Windows](https://www.python.org/downloads/windows/)（选择 **3.11 x64**，不要直接用其他主次版本）。NVIDIA 驱动可从[官方驱动入口](https://www.nvidia.com/en-us/drivers/)获取；用 `nvidia-smi` 核对显卡和驱动，显示的 CUDA Version 是驱动支持上限，不等于当前 Python wheel 的 CUDA 版本。在你选定的源码父目录执行：
+
+```powershell
+git clone --branch iphone-duo-ios27 https://github.com/FBKmai/PicaX-private.git
+cd PicaX-private
+git rev-parse --short HEAD
+git merge-base --is-ancestor 60e5c374e208f53563653c950f3324a249151789 HEAD
 ```
 
-双击上述文件即可启动并显示长期有效的连接地址/二维码。保持终端运行；Ctrl+C 停止。无需配对，不会生成或读取证书；启动脚本已启用简短的请求状态日志，并将 HAT-L 的新任务默认精度设为 BF16（其他模型仍为 FP32）。**这需要安装带精度选择的新 IPA**；修改文件本身不会重启已运行的服务。
+最后一条退出码应为 `0`，表示包含已验证的 HAT 优化；命令成功时不输出文本。默认分支是 `iphone-duo-ios27`，不要按上游 README 克隆到另一个仓库，也不要使用本仓库旧 `main` 作为优化版入口。
 
-也可在仓库目录的 Windows 终端执行：
+不要只复制 `DesktopServer` 子目录：运行时还会使用仓库内受信任的 `BuildScripts/SuperResolution/convert.py` 和 `full_page.py` 中的权重校验与反射填充辅助逻辑；**电脑推理不执行 Core ML 转换**。
 
-```bat
-DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pic" --weights-dir "D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\weights" --models fdat-xl hat-l fdat-m --model-precision hat-l=bfloat16 --job-quota-gib 32 --total-quota-gib 64 --diagnostics --accept-noncommercial-license
-```
+## 3. 创建独立 Python 环境
 
-若 Windows 弹出网络访问询问，仅允许你信任的**专用网络**。程序不会自动修改防火墙、开启公网端口、UPnP 或端口转发。手机和电脑须能互相访问同一局域网；访客 Wi-Fi/AP 隔离可能阻止连接。
+确认位于仓库根目录：
 
-## 模型与倍率
-
-| CLI 名称 | 模型 | 原生倍率 | 可选回传 | 定位 |
-|---|---|---:|---|---|
-| `fdat-xl` | IllustrationJaNai V3detail FDAT-XL | 4× | 2× / 4× | 默认，已实测普通漫画页尺寸 |
-| `hat-l` | IllustrationJaNai V3detail HAT-L | 4× | 2× / 4× | 高显存细节档；单页实际显存不足时明确报错 |
-| `fdat-m` | IllustrationJaNai V3detail FDAT-M unshuffle | 2× | 2× | 快速档、手机模型对照基线 |
-| `dat2` | IllustrationJaNai V3denoise DAT2 | 4× | 2× / 4× | 允许列表候选；本机未下载/验证，不会显示为已就绪 |
-
-默认回传 **2×**。4× 模型回传 2× 时，先运行真实原生 4× AI，再用 Lanczos 缩小到 2×；并非普通放大代替 AI。
-
-### FP32 / BF16 选择
-
-- 新手机在“电脑模型 / 回传倍率”下显示“推理精度”。选择 **FP32** 或 **BF16** 后提交，选择会写入手机任务日志与发送给电脑的清单；任务列表显示该任务的固定精度。切换选择只影响新任务，不改变已排队、重试或恢复中的任务。
-- 通用 CLI 不传新参数时仍默认 FP32。`--precision bfloat16` 修改所有所选模型的默认值；`--model-precision hat-l=bfloat16` 只覆盖 HAT-L，可重复传入，后面的同模型值覆盖前面的。它们控制启动加载精度与手机初始选项，**手机对新任务的显式选择优先**。
-- 只开放 `float32` / `bfloat16`，本轮不开放 FP16。BF16 要求 CUDA 硬件支持且 Spandrel descriptor 声明支持；CPU 诊断仅支持 FP32。不支持时明确报错，不自动换精度。`ready` 表示选定默认精度的模型加载与身份校验成功，不保证任意尺寸能执行。
-- 电脑同一时间只驻留一个 GPU worker；模型或精度变化时先释放旧进程，再按任务选择加载。输入张量与模型使用相同 dtype；输出按受限行带先复制到 CPU，再转 FP32 量化为原有 8-bit RGB PNG，避免将 BF16 直接交给 NumPy，也避免在 GPU 上额外分配整页 FP32 副本。FP32 仍关闭 TF32；未加入 autocast。HAT 内部窗口分批见下节，其他模型不安装该适配器。
-- 权重文件名中的 `bf16` / `fp16` 不等于实际存储 dtype。本机 HAT-L、FDAT-XL、FDAT-M 的 safetensors 文件头显示浮点张量均为 F32；运行时才按选定 dtype 转换。既有 modelID 中的 `-float32` 是历史身份标识，**不再代表任务的实际执行精度**；modelID、文件和 SHA-256 均保持不变，实际精度看任务和结果的 `precision`。
-- **兼容性**：缺少 `precision` 的旧任务始终按 FP32 执行，与新 CLI 默认值无关。新手机连接旧电脑服务时只显示 FP32，省略新清单字段以维持旧协议。旧手机仍强制每个模型的能力精度为 FP32，任何模型默认 BF16 都会使它拒绝**整份能力响应**，即使该模型尚未就绪；需更新 IPA，或将电脑所有模型默认值改回 FP32。
-- 下方实测表均为历史 FP32 数据，不是本次改动的新实测。HAT 优化有独立的 Actions CPU 数值对照；**CPU 测试不能证明真实权重在 CUDA/BF16 上的画质、吞吐或显存效果**，这些仍需单独授权后验证。本次不在 Windows 上构建 IPA / 运行 XCTest。
-
-只开放**逐页整图推理**，每次模型调用处理一页，不把整本漫画拼成一张图。不自动退回之前存在上下文/接缝问题的 128 像素分块，不缩小原图或更换模型，也不保证所有页面能处理。手机不按模型专属输入像素数、对齐后像素数或启动时显存估算拦截输入；只检查回传图片的接收范围和上传文件大小，电脑另检查输入解码/传输限制。模型越重不意味着文字、网点或线条一定更忠实。请用自己的少量页面确认画质。
-
-### HAT-L 内部窗口分批（电脑端）
-
-目标是继续运行**同一 HAT-L、同一权重、同一精度和原生 4×**，降低中间张量峰值，而不是换模型、缩图或设置一个更早拒绝任务的显存上限。
-
-- 默认 `--hat-window-batch 128 --hat-attention-backend eager`。只对固定的 Spandrel 0.4.2 HAT 实例安装适配器，不修改第三方包或全局类；结构/版本不匹配明确报错。`--hat-window-batch 0` 显式选择原版，仅供**小图对照诊断**，不是失败时自动退回的路径。
-- 普通/移位注意力按原窗口顺序分批执行原始缩放、QK、relative-position bias、有限值 `0 / -100` mask、softmax 和 V 聚合；全页稠密 shift mask 改为同一分区规则的紧凑标签，每批再展开。**QKV 与输出投影保留原版完整 GEMM 形状**，避免 BF16 CUDA 在行数分批后选择不同矩阵内核而改变舍入；只将二次规模的注意力分批。多图 batch 仍按各图窗口数正确对应 mask。
-- OCAB 保留整页 norm/QKV，只在当前批次提取原来的重叠 K/V。使用 `Tensor.unfold` 的网格**视图**，先取有限窗口再物化，不生成整页 `nn.Unfold` 展开结果；边缘仍是原 OCAB 的**零填充**。
-- 整页卷积、全局通道平均池化、移位/反移位、残差、MLP 和上采样不变；外侧反射填充、64 对齐和输出裁切不变。**不是把漫画切块后各自超分再拼接**，没有删去原来任何 query 可见的 K/V。
-- 以 16×16 query、24×24 K/V、6 heads、BF16 为例，128 个窗口的一个 OCAB score 约 216 MiB；这只是单个临时张量，不是总显存预测。全页特征和上采样依然随页面增大。64/128/256/512 哪个更快须实测，不能认定越小越快。
-- `--hat-attention-backend sdpa` 是**可选实验路径**：保留 bias/mask，以原始 scale 将 head_dim 30 零填充到 32 后裁回；根据真实参数检查并强制一个支持的 fused CUDA backend。明确禁用 MATH 回退；不支持时提示使用 eager，不自动换模型/精度。没有真实 CUDA 数值与性能证据前，不将其设为默认或宣称为 FlashAttention。
-- 输出按最多 128 行搬到 CPU 转 FP32、clamp/round/量化，填入预分配 uint8 缓冲，避免多份整页 FP32/NumPy 临时副本；仍校验完整原生输出形状与有限值，保留原 PNG 舍入和 Lanczos 回传逻辑。
-
-结果新增可选字段：`attentionImplementation`、`attentionWindowBatch`、`attentionBackend`、`sdpaBackends`、`workerPID`、`modelSeconds`（CUDA 事件计时，CPU 为墙钟）、`modelWallSeconds`（模型调用及结果有限值检查的墙钟）、`postprocessSeconds`（输出传输/量化/编码），以及 `memoryStages.pageStart/modelEnd/outputReleased` 的 current/peak allocated/reserved。注意力窗口/KV 最大批次记录的是该 worker 观察到的高水位。`--diagnostics` 同时打印简短阶段内存日志，不记录漫画标题或图片内容；错误时尽力记录内存，不掩盖原错误。
-
-allocated 包含在 reserved 内，两者不能相加，也不等于 WDDM 的物理专用/共享驻留量。输出释放后的 reserved 不回零可以是正常缓存；不无条件逐页 `empty_cache()` 或重载模型。真实混合尺寸 CUDA 对照发现，闲置池也可能累计并长期占用 WDDM shared，因此优化 HAT 在页尾编码结束后只在 **reserved 超过设备物理显存的 80%，且至少 1 GiB 为闲置缓存**时释放空闲块；普通缓存继续复用，模型仍驻留。这个条件只维护缓存，**不是 80% 显存分配上限，也不拦截输入或更改模型/精度**；仍可能出现单页期间的共享内存峰值。触发时记录 `cacheMaintenance`（耗时、释放字节、前后快照）和 `memoryStages.cacheReleased`，总页耗时包含清理成本；不触发时这两个可选字段省略。窗口循环内没有主机日志、`.item()` 或 CUDA 同步，计时只在页级边界同步。
-
-**部署与兼容性**：这部分不改手机协议、数据库或 Swift，已经支持 HTTP/精度选择的现有 IPA 可继续使用，**不需要为显存优化重新打 IPA**。更新源码不会替换已经运行的 worker；应在任务完成并确认可以中断服务后手动重启电脑服务。尚未通过另行授权的真实 GPU 验证前，不承诺大页一定能装入专用显存或具体加速倍数。
-
-### 权重与来源
-
-来源：[the-database / MangaJaNai 3.0.0](https://github.com/the-database/MangaJaNai/releases/tag/3.0.0)。全部仅限 **CC-BY-NC-4.0 非商业用途**；作者 the-database。[许可全文](https://creativecommons.org/licenses/by-nc/4.0/)。应用不提交权重到 git。
-
-固定文件名、架构、倍率和 SHA-256 位于 `DesktopServer/picax_lan/models.py`，手机允许列表位于 `LanSuperResolutionModels.swift`，Python 回归测试比较二者。个体权重散列最初来自固定版本的第三方[转换器模型注册表](https://github.com/imxieyi/waifu2x-ios-model-converter/blob/68e3f51517e04433164c09d8505a409e26477905/known_models.yaml)，不是声称上游作者签名。下载工具还核对 GitHub release API 提供的上游归档 SHA-256，再核对归档内每个指定权重。
-
-下载示例（目标必须为新/空目录；不解压或运行归档中的脚本）：
-
-```bat
-DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\fetch_models.py --models fdat-xl hat-l fdat-m --destination D:\PicaX-weights --download-parent D:\PicaX-downloads --accept-noncommercial-license
-```
-
-需要代理时，在当前终端设置 `HTTPS_PROXY=http://127.0.0.1:7890`。服务的推理不需要访问互联网，不接收手机上传的模型、Python 代码或 pickle。
-
-## 历史本机 FP32 真实验证结果
-
-诊断图包含文字、细线和彩色区域；不是用户漫画，不构成主观画质或文字保真度认证。以下均是既有 FP32 报告，**不是本次 BF16 改造的新实测**。单 GPU worker 串行运行；每个模型在独立 spawn 进程加载。没有 CPU 回退。
-
-| 模型 | 输入 | 回传 | 推理/编码等总耗时 | PyTorch 峰值 allocated |
-|---|---|---|---:|---:|
-| FDAT-M | 1000×1500 | 2000×3000 | 0.781 秒 | 2.48 GiB |
-| FDAT-XL | 1000×1500 | 2000×3000 | 15.859 秒 | 14.62 GiB |
-| FDAT-XL | 256×384 | 1024×1536 | 0.547 秒 | 1.04 GiB |
-| HAT-L | 512×768 | 1024×1536 | 4.297 秒 | 14.76 GiB |
-| HAT-L | 256×384 | 1024×1536 | 1.047 秒 | 3.81 GiB |
-
-测试还覆盖各模型 128×192 → 256×384。PyTorch allocated 不含桌面显示/其他进程的所有显存，不等于整机 GPU 总占用，也不是大图的保证。
-
-历史版本的 HTTPS → SQLite → CUDA → 收取 → SHA-256 → ACK 链路另测了 FDAT-XL（以下不是本次 HTTP 改版的重新实测）：
-
-- 连续两张 1000×1500 → 2000×3000，分别约 12.125 / 11.281 秒推理，证明后续页面不会因可复用的 PyTorch 缓存被误拒。
-- 256×384 → 1024×1536 原生 4× 回传。
-- 单次配对、叶证书 SHA-256 pin、上传原图、完整提交、真实 GPU worker、下载解码、散列、持久化 ACK、存储恢复全部通过。
-- 测试仅监听回环地址，不改防火墙，不等同于 iPhone/真实 Wi-Fi 的端到端测试。
-
-完整报告和 PNG：
-
-```text
-D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-first\report.json
-D:\折腾\picax\PicaX-LAN-runtime.7sd1c8sq\validation-https\report.json
-```
-
-这些历史实测不是输入尺寸硬上限。本次已移除模型专属像素上限、原生中间结果像素上限，以及启动时/每页执行前的显存估算拒绝。能力字段 `maximumInputPixels` 仅表示配置的输入解码上限，不代表显存预测或成功保证；手机也不依据旧任务缓存中的该字段拒绝页面。实际 CUDA 分配失败时，错误会明确说明模型、单页尺寸、原生倍率和实际 FP32/BF16 精度，并区分“实际显存不足”与输入解码/回传限制；worker 会被终止，后续页重新加载，不会缩图、分块或换模型。本次只做轻量回归，未重新实测大图 GPU 推理。
-
-## 新机器安装
-
-需要 CPython **3.11 x64**、兼容 Blackwell 的 NVIDIA 驱动和足够磁盘空间（当前 CUDA wheel 约 2.6 GiB，安装和缓存还需额外数 GiB）。不要安装到全局环境，也不要复用 macOS Core ML 的依赖。
-
-```bat
+```powershell
+py -3.11 -c "import sys, struct; print(sys.version); print(struct.calcsize('P') * 8)"
 py -3.11 -m venv DesktopServer\.venv
-DesktopServer\.venv\Scripts\python.exe -I -m pip install -r DesktopServer\requirements-windows-cu128.txt
+$Py = (Resolve-Path .\DesktopServer\.venv\Scripts\python.exe).Path
+& $Py -I -m pip install -r DesktopServer\requirements-windows-cu128.txt
+& $Py -I -m pip check
 ```
 
-直接依赖固定版本，Torch/Torchvision 的官方 Windows wheel URL 带 SHA-256；`requirements-transport.txt` 不是完整的传递依赖 hash 锁文件。无 CUDA 时启动报错，不默认改用 CPU。`--device cpu` 仅为显式诊断用。
+检查第一条输出为 Python 3.11 和 `64`，安装与 `pip check` 均成功再继续。无需激活环境，因此也不必修改 PowerShell 的脚本执行策略。
 
-## 连接、传输与恢复
+依赖固定 PyTorch `2.11.0+cu128`、torchvision `0.26.0+cu128`、Spandrel `0.4.2`。Torch/Torchvision 的官方 wheel URL 带 SHA-256；其他直接依赖固定版本，但**这不是完整的传递依赖 hash 锁文件**。不要自行升级 Spandrel 后继续声称已验证 HAT 适配器兼容。
 
-1. 启动电脑服务。在新版 PicaX 的“局域网电脑超分”输入 `192.168.5.8:18443`，或扫描电脑二维码，直接连接。
-2. 手机和电脑都必须使用这一版 HTTP 连接方式。旧 IPA 的 HTTPS/配对流程不能连接新服务，需要重装新版 IPA。
-3. 排查网络时，可先用手机浏览器打开 `http://192.168.5.8:18443/`，出现 `status: ok` 就说明手机能访问服务端口。电脑能 ping 通手机，并不能证明反向 TCP 端口可达。
+## 4. 下载并核验权重
 
-- 不再使用 TLS、自签名证书、证书指纹、一次性密钥、5 分钟有效期、bearer token 或配对确认。二维码只包含 HTTP 地址，重启服务后仍可使用。
-- **没有加密或访问口令**。任何能访问该端口的设备都能调用服务，只在自己的可信局域网运行，不要开放公网/端口转发。
-- Bonjour `_picax-sr._tcp` 仅用于发现附近名称；扫码或输入 IP 不依赖发现服务。
-- iOS 只对私有/链路本地 IP 网段放行 HTTP，不全局关闭 ATS。传输仍使用独立 ephemeral URLSession，不继承漫画源代理、Cookie、认证或缓存。
-- 手机本地仅保存电脑地址与任务分组 ID，不再保存新口令或 pin；旧版已保存的地址/任务分组 ID 可以沿用。
-- `X-PicaX-Client-ID` 只是区分手机任务的普通标签，**不是身份认证**，无需注册或令牌。
-- 页级恢复、大小和像素上限、PNG 解码、文件完整性与不覆盖原图的保护保留。手机进入后台只暂停传输，不取消电脑任务；完整上传并 commit 后电脑独立运行。
-- 结果原子落盘、更新 SQLite 后才 ACK；重复收取不重复计数。本机自动超分仍不会删除远程部分结果。
-- 同一电脑换 IP 时修改电脑启动参数，再在手机输入新地址即可继续原任务。电脑 ID 仅用于防止把旧任务错误地发给另一台电脑，不作证书认证。
-- 明确取消需要电脑确认；电脑丢失/任务过期时可放弃本机跟踪，不删除已收取页。
+代码许可证是 MPL-2.0；下列权重来自 the-database 的 [MangaJaNai 3.0.0](https://github.com/the-database/MangaJaNai/releases/tag/3.0.0)，适用 [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/)。请先阅读并确认适用于你的非商业用途，再使用确认参数。仓库不包含权重，也不接受手机上传任意模型。
 
-通用 CLI 默认数据目录仍为 `%LOCALAPPDATA%\PicaX-LAN`；**这台电脑已经迁移到 `D:\折腾\picax\pic`，须使用上面的双击启动文件或显式传入 `--data-dir`，否则会打开另一套空库**。旧版 `identity` 和客户端令牌记录不再被读取，不必删除或重建。闲置任务默认保留 24 小时，`--retention-hours 168` 可延长到一周；启动时会清理过期任务。以下手动清理会删除该目录内过期任务及其图片，只在确认需要清理并停止服务后运行：
+先只下载 HAT-L，验证整个部署链路后再按需增加其他模型。修改下面路径，权重目标必须新建或为空，下载目录与源码、任务数据目录分开：
 
-```bat
-DesktopServer\start-server.cmd --data-dir "D:\折腾\picax\pic" --cleanup --retention-hours 24
+```powershell
+$Weights = 'D:\PicaX-weights'
+$Downloads = 'D:\PicaX-model-downloads'
+$Data = 'D:\PicaX-data'
+& $Py -I -B DesktopServer\fetch_models.py --models hat-l --destination $Weights --download-parent $Downloads --accept-noncommercial-license
 ```
 
-## 协议概览（v1）
-
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| GET | `/` | 无需认证的服务状态页，供手机浏览器排查连接 |
-| GET | `/v1/capabilities` | 已配置/校验模型、可选推理精度、解码/传输限制、默认回传倍率 |
-| POST | `/v1/jobs` | 幂等创建完整任务清单 |
-| PUT | `/v1/jobs/{id}/pages/{page}` | 逐页规范化 RGB PNG |
-| POST | `/v1/jobs/{id}/commit` | 输入完整后入队 |
-| GET | `/v1/jobs/{id}` | 查询页面进度/元数据 |
-| GET | `/v1/jobs/{id}/pages/{page}/result` | 完整结果 PNG，不支持 Range |
-| POST | `/v1/jobs/{id}/pages/{page}/ack` | 手机持久化后确认 SHA-256 |
-| POST | `/v1/jobs/{id}/retry` | 仅重试失败页 |
-| POST | `/v1/jobs/{id}/cancel` | 明确取消 |
-
-任务 UUID、固定 `e0000-p0000` 页 ID、紧凑章节/连续页索引，不能传任意文件路径。清单最多 2 MiB/4096 页，输入 PNG 64 MiB/800 万原始像素，输入单边默认 4096（可通过 `--maximum-side` 配置至 8192，包含模型对齐后边长）；输出 128 MiB/3200 万像素/单边 16384。模型对齐只用于整页边缘填充与裁切，不额外限制原生中间结果像素或预估显存。最多 8 个活跃任务。每个查询/收取/操作均校验任务归属。
-
-能力项 `precision` 是该模型配置的默认值，`supportedPrecisions` 是当前架构/设备支持的选择列表。新任务清单可带 `precision: "float32"` / `"bfloat16"`，作为不可变任务身份的一部分；旧清单缺字段时固定为 `float32`。结果的 `precision` 必须与清单完全匹配，不能只因属于允许集合就接受。除此之外仍保留 v1 HTTP 路径、RGB PNG、SHA-256 和持久化后 ACK，SQLite 无需新增列。
-
-### 磁盘配额与 HTTP 507
-
-- 通用启动默认单任务预估配额 **8 GiB**、全部保留任务合计 **16 GiB**；可用 `--job-quota-gib 32 --total-quota-gib 64` 调整，要求两者为正整数且单任务不大于总配额。本机上文的双击启动文件已配置为 **32 / 64 GiB**。
-- 配额不是 PNG 实际压缩大小：逐页预留 `2 × 输入 PNG 字节数 + 输出宽 × 输出高 × 4 + 64 KiB`，包含重复上传临时文件和保守的输出空间。因此几百页漫画即使源文件不大，也可能超过旧版 8 GiB 单任务上限。
-- **单任务超限**时，即使清空全部旧任务也不会解决；需拆分任务或增大 `--job-quota-gib`。**总配额超限**才与旧任务占用有关；已收取和取消的任务在文件被清理前仍计入配额，仅在手机移除记录不会释放电脑空间。
-- 仍会单独检查数据所在磁盘的实际剩余空间，并保留至少 128 MiB 余量。增大配额不会绕过实际空间检查，也不改变解码/传输限制或实际显存容量；调整配额本身不会删除旧图片，启动时原有的过期任务清理规则仍适用。
-- HTTP 507 分别显示单任务预估/上限、总预留/上限或实际磁盘剩余空间，不再一律提示清理旧任务。修改配额或更新电脑代码后需重启服务，手机 IPA 不用更新。
-
-## 验证命令
-
-轻量 stdlib 回归，不导入 Torch、NumPy、Pillow 或加载模型：
-
-```bat
-python -I -B DesktopServer\tests\test_contracts.py
-```
-
-HTTP 传输集成回归（使用已安装的 FastAPI/Pillow 等传输依赖，不加载模型，供 CI 运行）：
-
-```bat
-DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\tests\test_http.py
-```
-
-显式真实模型验证（只在授权后运行；输出目录必须新/空）：
-
-```bat
-DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\validate_local.py --weights-dir D:\PicaX-weights --output-dir D:\PicaX-local-check --models fdat-m fdat-xl hat-l --accept-noncommercial-license
-DesktopServer\.venv\Scripts\python.exe -I -B DesktopServer\validate_transport.py --weights-dir D:\PicaX-weights --output-dir D:\PicaX-https-check --model fdat-xl --accept-noncommercial-license
-```
-
-`validate_local.py --source <你自己的页面>` 可替换生成图，不修改源文件。输出 PNG 的“不同于 Lanczos”仅是排除假 AI 的执行检查，不代表更好看。
-
-HAT 优化的 CPU 小模型数值对照由独立 Actions job 运行，无权重、无 CUDA，不在本机默认运行：
+成功应看到 `Verified illustrationjanai-v3detail-hat-l-4x-float32`，权重目录包含：
 
 ```text
-python -I -B -X utf8 DesktopServer/tests/test_hat_memory.py
+4x_IllustrationJaNai_V3detail_HAT_L_28k_bf16.safetensors
+provenance.json
 ```
 
-覆盖普通/移位注意力、紧凑 mask、跨图 batch、尾批、矩形页/零填充、16/24 窗口及 head_dim 30、小型完整 HAT、参数不变、输出量化和 fused 路径的受控模拟。FP32 对照采用 `atol=rtol=2e-5`；另观察实际 eager matmul/gather 的批次边界，并禁止调用全页 `nn.Unfold`。受控 SDPA 模拟不代表真实 CUDA backend 已运行。
+HAT-L 文件 SHA-256：
 
-真实 BF16/显存/速度测试仅在**另行授权且没有其他 GPU 任务**时运行；例如比较指定尺寸，并在同一个 worker 内重复/交替尺寸（输出目录每次必须新/空）：
-
-```bat
-DesktopServer\.venv\Scripts\python.exe -I -B -X utf8 DesktopServer\validate_local.py --weights-dir D:\PicaX-weights --output-dir D:\PicaX-hat-b128 --models hat-l --precision bfloat16 --hat-window-batch 128 --hat-attention-backend eager --size 960x1315 --size 960x1583 --size 960x1601 --size 960x1616 --repeat 2 --accept-noncommercial-license
+```text
+38c00c9ff871ae292617ae1127edc150f81c4e0f8f98685e48ff9c9cd87fba3b
 ```
 
-`--size` 可重复指定，生成诊断图；不能与 `--source` 同时使用。每种尺寸逐一验证可选回传倍率，`--repeat` 重复整个序列且不重载模型。所有结果写入 `report.json`，包含实际精度、实现、阶段计时与内存。先做小图原版（`--hat-window-batch 0`）与优化版输出对照；真实 BF16 PNG 初始目标为最大误差 ≤2/255、平均误差 ≤0.1/255，不通过就修实现，而不是放宽门槛。之后只用优化实现比较批次 64/128/256/512，结合专用/共享显存和进程内存判断是否消除了溢出及是否真正提速；allocated/reserved 本身不能证明共享内存归零。
+下载器只取固定发布归档中的允许列表文件，不运行归档代码；先校验归档 hash，再校验单个权重 hash，并写入来源记录。个体权重 hash 最初来自固定的第三方注册表，**不是上游作者签名**。下载中断后若目标目录已有部分文件，不要覆盖、删除或绕过核验；检查后换一个新的空目标目录重试。
 
-CI 的轻量 Windows/Linux HTTP 回归不加载模型；独立 HAT job 只运行 CPU 小模型数值回归；Swift/XCTest 由既有 iPhone Actions 构建运行。真实 CUDA 不会在每次 push 自动测试，也不会默认在用户本机运行。
+如果你自己的网络需要代理，可在当前 PowerShell 显式设置 `$env:HTTPS_PROXY = 'http://你的代理地址:端口'`；不需要代理就跳过。此教程不要求特定代理端口，不把任何人的本机代理当公共服务。
+
+<a id="start"></a>
+## 5. 启动优化版 HAT-L
+
+用 `ipconfig` 查看连接手机所在网络的网卡 IPv4 地址，例如 `192.168.1.10`。服务要求实际的私有/链路本地 IP，不使用 `0.0.0.0`、`localhost`、主机名或公网 IP 作为启动地址。
+
+沿用上一步变量，在仓库根目录执行：
+
+```powershell
+$LanIP = '192.168.1.10' # 必须换成自己的电脑地址
+.\DesktopServer\start-server.cmd --host $LanIP --weights-dir $Weights --data-dir $Data --models hat-l --model-precision hat-l=bfloat16 --hat-window-batch 128 --hat-attention-backend eager --job-quota-gib 32 --total-quota-gib 128 --retention-hours 168 --diagnostics --accept-noncommercial-license
+```
+
+- 这是长期运行的前台服务，保留此终端。没有注册系统服务、计划任务或开机自动启动。
+- HAT 默认窗口批次 `128` / backend `eager` 已是优化路径；上面显式写出便于核对。不要将 `0` 当成“自动选择”，`0` 会使用原版高峰值路径。
+- 上面磁盘配额 `32 / 128 GiB` 与保留 `168` 小时都是教程示例，不是显存限制或预分配这些磁盘空间。按实际数据盘容量选择；创建任务时还会检查实际剩余空间。
+- 看到连接 URL、二维码和 `HAT attention: 128 windows/batch, eager`，只说明服务启动到该阶段；模型会异步加载，须继续检查 `ready`。
+- 设备不支持 BF16 时明确失败，不会换模型或静默降精度。若你决定使用 FP32，明确改为 `--model-precision hat-l=float32`，并接受不同的性能/内存特性。
+- Windows 若询问网络权限，仅允许可信的**专用网络**。程序不会自动修改防火墙、驱动、注册表、频率或功耗上限。
+
+关闭并重新打开 PowerShell 后，`$Py`、`$Weights`、`$Data`、`$LanIP` 等变量需要重新设置。可把自己确认过的启动命令放进个人脚本，**不要把私人目录、日志或连接信息提交仓库**。
+
+## 6. 检查服务和模型是否就绪
+
+在第二个 PowerShell 窗口把地址换成自己的电脑，执行只读请求：
+
+```powershell
+$Base = 'http://192.168.1.10:18443'
+Invoke-RestMethod "$Base/"
+(Invoke-RestMethod "$Base/v1/capabilities").models | Format-Table id, ready, precision, supportedPrecisions, error -AutoSize
+```
+
+预期：
+
+- `/` 返回 `status = ok`、`transport = http` 和 `serverID`。
+- HAT-L 的 `ready = True`、默认 `precision = bfloat16`，`supportedPrecisions` 包含 `bfloat16`。
+- 刚启动时 `Not checked yet` / `ready=False` 可能是仍在加载；等待片刻再查。持续失败时看 `error` 和终端，不要以 HTTP 200 代替模型就绪。
+
+`capabilities` 不包含全部推理诊断字段。HAT 是否实际以优化实现执行，要看下一步**成功页面的结果元数据**，不是从 `ready` 推断任意尺寸必过。
+
+## 7. 手机连接并验证第一张结果
+
+1. 安装[兼容手机包](../README.md#获取手机-app)，在系统设置中允许 PicaX 访问本地网络。
+2. 手机与电脑接入同一可信局域网；关闭访客/AP 隔离。不同网段只有在实际路由和访问策略允许时才可互通。
+3. 先在手机浏览器打开上一步的 `$Base` 地址；看到 `status: ok`，才证明手机能访问电脑的端口。电脑能 ping 手机不等于反向 TCP 可达。
+4. PicaX → **设置 → 下载 → 局域网电脑超分**，输入电脑地址或扫描终端二维码。二维码只有地址，不是秘密凭证。
+5. 下载库多选一个小的已下载漫画/章节 → **电脑超分**。选择 HAT-L、BF16，以及希望的回传倍率；要复现本文目标请选择 **4×**。默认回传为 2×，需要主动改为 4×。
+6. 等全部上传并 commit 后，电脑逐页串行处理。结果进入“下载 → 超分”的独立记录，原下载保持不变。
+
+第一张成功页的结果元数据应包含以下值（这不是完整 JSON 响应示例）：
+
+```json
+{
+  "modelID": "illustrationjanai-v3detail-hat-l-4x-float32",
+  "precision": "bfloat16",
+  "nativeScale": 4,
+  "deliveryScale": 4,
+  "attentionImplementation": "hat-window-batched-v2",
+  "attentionWindowBatch": 128,
+  "attentionBackend": "eager",
+  "mode": "fullPage"
+}
+```
+
+可在自己的任务查询 `GET /v1/jobs/{jobID}` 的 `pages[].result` 核对；使用手机任务时需发送相同的 `X-PicaX-Client-ID` 分组值。完整导出的超分 ZIP 还附 `LAN-SuperResolution.json` 每页元数据；PDF 只包含图片。`--diagnostics` 终端也会显示页级精度/窗口批次/阶段内存，但不会打印漫画标题或内容。
+
+不要仅看文件名里的 `bf16`、modelID 的 `-float32` 后缀或输出比原图大就判断精度/模型。完整说明见下节。
+
+<a id="models"></a>
+## 模型、倍率与精度
+
+| CLI 别名 | 模型 | 原生倍率 | 回传倍率 | 验证状态 |
+|---|---|---:|---|---|
+| `hat-l` | IllustrationJaNai V3detail HAT-L | 4× | 2× / 4× | 默认内部窗口分批；真实 BF16/4× 测试见 [HAT 说明](HATOptimization.md) |
+| `fdat-xl` | IllustrationJaNai V3detail FDAT-XL | 4× | 2× / 4× | 既有本机 FP32 普通页验证；不安装 HAT 适配器 |
+| `fdat-m` | IllustrationJaNai V3detail FDAT-M unshuffle | 2× | 2× | 既有本机 FP32 验证；不安装 HAT 适配器 |
+| `dat2` | IllustrationJaNai V3denoise DAT2 | 4× | 2× / 4× | 允许列表候选，未在该真实 GPU 环境下载/验证 |
+
+4× 模型回传 2× 时，先以完整原图运行原生 4× AI，再以 Lanczos 缩到 2×；不会因此把模型计算也变成 2×。模型更重不保证文字/网点更忠实，请先用自己有权处理的少量页面确认画质。
+
+- 通用 CLI 不指定时默认模型 `fdat-xl`、默认 FP32；本教程显式选 HAT-L/BF16。
+- `--precision bfloat16` 改所有所选模型默认值；`--model-precision hat-l=bfloat16` 只覆盖该模型。手机的新任务显式选择优先，精度固定在任务清单内；改选择只影响新任务。
+- CPU 只接受 FP32。CUDA BF16 还需硬件与 descriptor 支持；不提供隐式 CPU/精度回退。
+- modelID 的 `-float32` 是历史身份后缀，实际精度看任务/结果的 `precision`。checkpoint 文件名的 `bf16` / `fp16` 也不能代替实际执行精度；已核验的 HAT/FDAT 文件浮点权重存储为 F32，运行时转换。
+- 修改同一任务的模型、倍率或精度不是重试；需要创建新任务。旧清单缺少 `precision` 时始终按 FP32 执行。
+
+增加模型时可在**另一个新的空权重目录**执行 `fetch_models.py --models hat-l fdat-xl fdat-m`（补上与第 4 步相同的目标、下载目录和许可参数），然后用这个目录和相同的 `--models` 列表重启。不要在已有非空目录直接重跑下载器，也不要启动列表中没有下载的模型。
+
+<a id="compatibility"></a>
+## 手机与电脑版本兼容
+
+| 组合 | 行为/处理 |
+|---|---|
+| 当前 HTTP/精度选择手机 + 当前电脑 | 推荐组合；可按设备公布项选 FP32/BF16 |
+| 旧 HTTPS/配对手机 + HTTP 电脑 | 不兼容，需要更新手机；重启电脑不能把旧手机协议改成 HTTP |
+| HTTP 但没有精度选择的旧手机 + BF16 默认电脑 | 可能拒绝整份能力响应；更新手机，或显式把电脑全部模型默认值恢复 FP32 |
+| 当前手机 + 较旧的无精度字段电脑 | 只显示 FP32，省略新任务精度字段以保持旧协议；不等于电脑已有 HAT 优化 |
+| 旧任务缺 `precision` | 固定 FP32，不受新 CLI 默认 BF16 影响 |
+
+**HAT 内存优化本身不更改手机协议/SQLite 列，不需要为此重新打 IPA。** 只需已具备 HTTP 和精度选择的手机包。电脑超分不依赖手机内置 Core ML 模型。
+
+<a id="operations"></a>
+## 升级、停止、恢复与备份
+
+1. 优先等当前任务完成再升级。记录自己的启动命令、权重/数据目录、保留时长与配额；不要只保存示例。
+2. 用 Ctrl+C 停止服务并确认进程退出。**主动停止时在途页面可能标为失败，需要在手机重试失败页**；异常退出留下的未提交页通常由下一次 `recover()` 重新排队，不承诺任何停止方式都零重算。
+3. 停止后，完整备份自己的数据目录（SQLite 及任务文件，包含仍存在的 WAL/SHM），不要只复制正在写入的数据库主文件。备份不应上传公开仓库。
+4. 工作区干净、没有自己的未保存改动时，执行：
+
+```powershell
+git switch iphone-duo-ios27
+git pull --ff-only origin iphone-duo-ios27
+```
+
+5. 只有依赖文件改变才在原虚拟环境重新安装对应依赖并 `pip check`；不要为了源码升级重新下载相同权重或创建新的生产数据目录。
+6. 按**原来的 `--data-dir`** 和其他个人参数重启。换数据目录会得到另一套任务库和 serverID，手机可能认为是另一台电脑；换 IP 则仍可用同一数据目录重连。
+
+CLI 默认数据目录是 `%LOCALAPPDATA%\PicaX-LAN`，默认保留 **24 小时**。本教程显式选独立数据目录与 168 小时，避免依赖隐含位置。服务启动时清理超过保留期且非 queued/running 的任务，**包括已收取、取消、部分失败或未上传完成的闲置任务**。ACK 不会立即删除电脑文件。
+
+确有需要才在停止服务、核对目录、备份之后执行手动清理；它会永久删除所选目录中的过期任务和图片：
+
+```powershell
+.\DesktopServer\start-server.cmd --data-dir $Data --cleanup --retention-hours 168
+```
+
+不要直接修改 SQLite 状态来恢复任务，也不要用 `JobStore` 构造器做只读检查；初始化、恢复和清理都可能写入数据或删除文件。
+
+手机进入后台只暂停传输，不取消已经完整提交的电脑任务。回到前台继续收取；手机持久化并核对结果 SHA-256 后才发 ACK。明确取消需要电脑确认；丢失电脑/任务过期时可放弃本机跟踪，但这不等于远程任务已取消。
+
+<a id="limits"></a>
+## 容量与配额
+
+- 清单最多 2 MiB / 4096 页，最多 8 个活跃任务。
+- 输入 PNG 最多 64 MiB、800 万原始像素；单边默认 4096（包含模型对齐后边长，可用 `--maximum-side` 配到 8192）。
+- 回传 PNG 最多 128 MiB、3200 万像素、单边 16384。它是手机接收限制，不是原生中间结果的显存预测。
+- 通用磁盘配额默认单任务 **8 GiB**、总计 **16 GiB**；教程显式使用 32 / 128。每页预留 `2 × 输入 PNG 字节 + 输出宽 × 输出高 × 4 + 64 KiB`，不是压缩后实际文件大小。
+- 总配额包含保留任务。删除手机记录不会释放电脑空间；单任务超限也不能靠清理别的任务解决。
+- 无模型专属像素估算拒绝或默认 VRAM 分配上限；实际张量仍可能 OOM/超时，失败不会触发换模型、缩图或独立小图拼接。
+
+<a id="troubleshooting"></a>
+## 常见问题
+
+| 现象 | 检查与处理 |
+|---|---|
+| `py -3.11` 不存在/显示非 64 位 | 安装 CPython 3.11 x64，重新打开终端，不使用其他 Python 的旧虚拟环境 |
+| 下载 wheel 失败/版本不匹配 | 核对 Windows x64 / Python 3.11、网络、磁盘、可信源；不要借用 macOS 锁文件或不明 wheel |
+| `CUDA unavailable` / wheel 缺少 `sm_...` | 核对 NVIDIA 驱动、固定 CUDA wheel、实际 GPU；不默认回退 CPU |
+| BF16 不支持 | 核对 capabilities 与错误；选择设备明确支持的 FP32，或使用支持 BF16 的设备，不能把软件模拟当原生支持 |
+| `Missing local checkpoint` / hash mismatch | 核对 `--weights-dir`、文件名、下载器输出。不要修改 hash 或关闭校验来“修好” |
+| 浏览器能打开，但模型 `ready=False` | 看 capabilities 的 `error` 与终端；HTTP 可达不代表加载成功。多模型启动会顺序核验 |
+| 手机无法访问 `/` | 检查实际 IP/端口、PicaX 本地网络权限、Windows 专用网络防火墙、访客/AP 隔离；不要关闭全部防火墙或开放公网 |
+| 手机提示能力不匹配 | 核对 HTTP/精度版本兼容与模型允许列表，见[兼容性](#compatibility) |
+| HTTP 507 | 区分**单任务配额**、**总配额**、**实际磁盘不足**；按错误调整，改参数后重启。只提高配额不能制造可用空间 |
+| 4× 结果超接收上限 | 回传 2× 可降低接收尺寸，但模型仍用原图跑原生 4×；这不是更换模型或缩小输入 |
+| OOM/共享显存增长 | 先核对结果中的 v2/128/eager 和实际精度，确认没有另一个 GPU 任务；看每页阶段数据。仍可能出现短时 shared，不用 allocated+reserved 相加，也不随意改成 `--hat-window-batch 0` |
+| 改源码后仍像旧版 | 运行中的 worker 不会热更新；在安全停止后按同一数据目录重启，再检查新页面元数据 |
+| 手机移除任务后电脑仍占磁盘 | 手机跟踪与电脑保留是两件事；核对保留期、ACK/取消与清理规则，先备份再清理 |
+
+## 验证与进一步开发
+
+- 无模型的本机轻量检查：`py -3.11 -I -B DesktopServer\tests\test_contracts.py`。
+- 文档链接/示例参数检查：`py -3.11 -I -B BuildScripts\test_documentation.py`。
+- HTTP 集成、HAT CPU 数值、Swift/XCTest 和真实模型验证命令统一见[开发指南](Development.md#tests)。真实 GPU 测试必须显式选择、避开其他 GPU 工作，并使用新的隔离输出目录；本教程不会自动启动第二个模型。
+- [HAT 优化说明](HATOptimization.md)记录截至 2026-11-11 的真实 CUDA/BF16 结果及限制。历史 FP32/HTTPS 证据与当前 HTTP/BF16 路径不是同一次测量，不混用。
+- [架构与 v1 协议](Architecture.md#protocol)解释清单、页 ID、状态机、结果校验和 ACK；这不是任意图片/任意模型上传服务。

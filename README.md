@@ -1,213 +1,108 @@
 # PicaX
 
-[![License](https://img.shields.io/github/license/youshen2/PicaX)](https://github.com/youshen2/PicaX/blob/master/LICENSE)
-[![Download](https://img.shields.io/github/v/release/youshen2/PicaX)](https://github.com/youshen2/PicaX/releases)
-[![stars](https://img.shields.io/github/stars/youshen2/PicaX)](https://github.com/youshen2/PicaX/stargazers)
+[![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue)](LICENSE)
+[![LAN tests](https://github.com/FBKmai/PicaX-private/actions/workflows/test-lan-super-resolution.yml/badge.svg?branch=iphone-duo-ios27)](https://github.com/FBKmai/PicaX-private/actions/workflows/test-lan-super-resolution.yml)
+[![Documentation](https://github.com/FBKmai/PicaX-private/actions/workflows/test-documentation.yml/badge.svg?branch=iphone-duo-ios27)](https://github.com/FBKmai/PicaX-private/actions/workflows/test-documentation.yml)
 
-PicaX 是一个使用 SwiftUI 构建的多漫画源阅读客户端，面向 iOS、watchOS、macOS 和 visionOS。项目以原生 Apple 平台体验为目标，把漫画源登录、浏览、搜索、收藏、阅读、下载、阅读统计、备份迁移和本地数据管理集中在一个应用里。
-
-[![Android Version](https://img.shields.io/badge/Android-安卓版本-26Aaa1?style=for-the-badge&logo=android&logoColor=white)](https://github.com/youshen2/PicaX-Android)
-[![Telegram Group](https://img.shields.io/badge/Telegram-加入群组-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/pica_x)
+PicaX 是使用 SwiftUI 构建的多漫画源阅读客户端，包含浏览、搜索、下载、离线阅读、备份，以及可选的 AI 超分功能。
 
-## 下载
+**这里是 [FBKmai/PicaX-private](https://github.com/FBKmai/PicaX-private)，基于 [youshen2/PicaX](https://github.com/youshen2/PicaX) 维护的衍生版本，不是上游官方发行入口。** 本仓库增加了 iPhone Duo 适配、手机 Core ML 超分实验和局域网电脑超分；电脑端包含保留整页上下文的 HAT-L 显存优化及 FP32/BF16 选择。仓库名称中的 `private` 是历史命名，不代表访问权限或保密承诺。
 
-<a href="https://github.com/youshen2/PicaX/releases">
-<img src="https://user-images.githubusercontent.com/69304392/148696068-0cfea65d-b18f-4685-82b5-329a330b1c0d.png"
-alt="Get it on GitHub" align="center" height="80" /></a>
+## 从哪里开始
 
-## 系统兼容性
+| 你的目标 | 入口 |
+|---|---|
+| 了解 App、手机与电脑分别做什么 | 下方“功能与运行方式”和[架构说明](Docs/Architecture.md) |
+| 在 Windows/NVIDIA 电脑部署优化版超分 | [电脑超分安装与排障](Docs/LanSuperResolution.md) |
+| 获取可连接电脑的手机包 | 下方“获取手机 App” |
+| 修改代码、构建、运行测试 | [开发指南](Docs/Development.md)与[贡献说明](CONTRIBUTING.md) |
+| 理解 HAT 优化与实测边界 | [HAT-L 优化说明](Docs/HATOptimization.md) |
+| 研究手机内置 Core ML 模型 | [Core ML 来源、转换与历史验证](Docs/SuperResolution.md) |
+| 安全使用、报告问题 | [安全说明](SECURITY.md) |
 
-| 平台 / 系统 | 支持情况 |
-| --- | --- |
-| iOS 15.2 | 支持主应用核心功能 |
-| iOS 16.0 | 使用兼容导航实现，支持主应用核心功能 |
-| iOS 16.1+ | 支持下载进度 Live Activity |
-| iOS 17+ | 启用 SwiftUI `NavigationStack` 导航能力 |
-| iOS 26+ | 在上述功能基础上启用 Liquid Glass 视觉效果 |
-| watchOS 9+ | 支持配套 Apple Watch 应用。 |
-
-主应用最低部署版本为 iOS 15.2。Live Activity 扩展最低需要 iOS 16.1，但不会阻止主应用安装或运行在 iOS 15.2 至 iOS 16.0。
-
-## 支持的漫画源
-
-- PicACG
-- JMComic
-- NHentai
-- E-Hentai / ExHentai
-- Hitomi
-- 绅士漫画
+## 当前推荐版本
 
-## 已有功能
+- **默认分支：`iphone-duo-ios27`**。本分支包含 HAT 优化提交 `60e5c37` 及其前置 BF16/HTTP 改动；新部署不需要再切换到历史修复分支。
+- `fix/lan-http-direct` 是这些改动的历史开发分支；`main` 不是本仓库当前推荐的部署入口。
+- 优化默认使用 `--hat-window-batch 128 --hat-attention-backend eager`。`sdpa` 为实验选项，不是默认，也不代表已经完成真实 CUDA 验证。
+- 电脑端通用 CLI 默认 FP32；部署教程显式为 HAT-L 设置 BF16。手机提交时选择的精度优先，并固定在该任务内。
+- [当前更新说明](RELEASE_NOTES.md)。验证状态和限制见各功能文档，不把“CI 通过”当作所有设备都已通过。
 
-### 账号与来源
+```sh
+git clone --branch iphone-duo-ios27 https://github.com/FBKmai/PicaX-private.git
+cd PicaX-private
+```
 
-- 多平台账号管理，支持 API 登录、网页登录、Cookie / User-Agent 保存与复用。
-- 每个漫画源都有独立的前端地址配置，便于随时进行修改。
+## 功能与运行方式
 
-### 浏览、搜索与发现
+### 漫画阅读
 
-- 支持按来源进入随机、最新和排行榜等入口。
-- 分类页支持按来源加载分类，并跳转到对应搜索结果。
-- 搜索页支持单平台搜索和多平台聚合搜索。
-- 搜索关键词支持 `/` 合并、`&` 组合和中英文括号嵌套；括号优先，`&` 优先于 `/`。例如 `(A/B)&C` 等价于 `A&C/B&C`，标签本身包含括号或运算符时可使用双引号包住。
-- 支持 PicACG、NHentai、JMComic 等来源的高级排序选项，NHentai 支持语言过滤。
-- 搜索历史可记录关键词、来源、高级选项和断点；搜索工具菜单可保存、命名、置顶常用搜索。
-- 搜索工具菜单提供表达式组合预览和逐平台请求进度，结果分批显示，失败请求可按平台单独重试。
-- 搜索工具菜单可查看多源版本，展示各来源的语言和页数；长按条目可保持独立或指定共同分组，详情页提供其他来源入口。
-- 支持剪贴板漫画链接和JM车牌号检测、打开分享链接、JM 车牌号直达详情。
+- 支持 PicACG、JMComic、NHentai、E-Hentai / ExHentai、Hitomi、绅士漫画等来源；来源可用性受对应平台影响。
+- 多来源账号管理、浏览与分类、高级搜索、搜索表达式、搜索历史及常用搜索。
+- 详情、评论、本地/云端收藏、屏蔽词、阅读历史、页级书签与阅读时长统计。
+- 连续滚动、分页、左右阅读方向、整本阅读、缩放、预加载和批量阅读。
+- 分章节下载、离线阅读、完整性检查、ZIP/CBZ/PDF 导入与 ZIP/PDF 导出。
+- `.picax` 备份、PicaComic 数据导入、App 锁、网络代理及可选 Watch 配套应用。
 
-### 详情、收藏与评论
+### 三种图像处理路径，不要混淆
 
-- 漫画详情页展示封面、标题、作者 / 上传者、分类、标签、页数、热度、章节等信息。
-- 支持本地收藏和各来源云端收藏夹。
-- 支持评论区加载；支持的来源可发送评论或加载章节评论。
-- 支持按标签继续浏览同类漫画。
-- 列表可显示阅读进度、收藏状态、标签和热度，并可隐藏已读内容。
-- 支持通用屏蔽词和 JMComic 专用屏蔽词，可逐条编辑和启停；应用通用屏蔽的列表显示屏蔽数量、命中规则，并可临时查看本页内容。
+| 路径 | 在哪里计算 | 需要什么 | 主要边界 |
+|---|---|---|---|
+| 传统画质增强 | 手机/App | 不需要模型或电脑 | 是滤镜，不冒充 AI |
+| 本机 AI 超分、下载后自动超分 | 手机 Core ML | 经批准并打包的手机模型 | 默认源码构建不带权重；GPU 曾有真机异常，保留仅 CPU 路径与警告；后台时间由 iOS 决定 |
+| **电脑 AI 超分** | **自己的 Windows/NVIDIA 电脑，PyTorch/CUDA** | **电脑服务、核验后的权重、支持 HTTP/BF16 的手机版本** | **逐页整图处理；手机上传与收取需要前台，完整提交后电脑可独立运行** |
 
-### 阅读器
+**使用电脑超分不要求 IPA 内置 Core ML 权重。** 构建审计显示 `engineering-build-no-models` 只表示没打包手机本机模型，不表示电脑超分不可用。下载后自动超分仍在手机运行，不会自动转发到电脑。
 
-- 支持竖向连续滚动、竖向分页、左到右分页、右到左分页。
-- 支持章节切换、章节列表 Sheet、阅读列表 Sheet、阅读进度和阅读历史保存。
-- 阅读器工具栏提供页级书签，可保存多个章节位置、页面缩略图和备注；在线与离线阅读共用书签，整本连续阅读支持跨章节跳转。
-- 支持批量阅读，把已下载漫画或收藏夹内漫画组成临时阅读列表，阅读器内可上一本 / 下一本切换，也可从阅读列表删除条目。
-- 支持点按翻页、自动翻页、两指缩放、双击缩放、长按临时缩放。
-- 支持图片预加载、加载重试、深色模式降低图片亮度、图片间距、首图顶部留白和末图底部留白等。
-- 支持章节末尾显示评论，已下载漫画会优先使用本地保存的章节评论。
-- 支持页码、进度浮层、时间电量浮层、状态栏隐藏和 UI 显隐设置；iOS 26+ 使用液态玻璃背景，旧系统自动回退为常规材质。
+电脑模型包括 HAT-L、FDAT-XL、FDAT-M，以及未在本机验证的 DAT2 候选。HAT 优化不换 checkpoint、不缩小原图、不把漫画切成独立小图超分；只是调度模型原有的注意力窗口并降低输出临时缓冲峰值。RTX 5090 D v2 上的一组 34 页 BF16/4× 历史对照，从约 30 分 30 秒降至 6 分 37 秒；这不是其他显卡或任意尺寸的速度保证，方法与限制见[完整说明](Docs/HATOptimization.md)。
 
-### 下载与本地阅读
+> **电脑服务是无加密、无密码的 HTTP。只能运行在可信局域网，不能开放公网、端口转发或公共隧道。** 客户端分组 ID 不是认证。详见[安全说明](SECURITY.md)。
 
-- 支持按章节下载漫画，可选择下载全部或部分章节。
-- 支持下载详情评论和章节评论。
-- 下载页支持平台筛选、完成状态筛选、排序和删除。
-- 已下载漫画可离线阅读，阅读列表只包含已下载章节。
-- 长按下载条目可检查完整性，按章节列出缺失或损坏页，并仅下载有问题的页面；本地导入文件可通过原文件重新导入恢复。
-- 下载页可从系统文件选择器导入 ZIP、CBZ 和 PDF，图片按文件名自然排序，PDF 转为阅读页面且可设置分辨率。导入漫画使用独立本地来源，接入离线书库、进度、书签和阅读统计。ZIP / CBZ 图片解压总大小上限为 2 GB。
-- 已下载漫画支持阅读全部。
-- 已下载漫画支持长按以 ZIP 导出。
-- 首页可显示最近下载记录。
+## 获取手机 App
 
-### 统计、历史与首页
+本衍生版本的构建入口是 [Build iPhone Duo unsigned IPA](https://github.com/FBKmai/PicaX-private/actions/workflows/build-iphone-duo.yml)，**不是上游仓库的 Releases**。截至 2026-11-11，本仓库没有长期维护的 GitHub Release 下载包。
 
-- 阅读历史记录章节、页码和进度，支持清空历史或只清空阅读进度。
-- 阅读时长统计支持今日、累计、单本详情和趋势图。
+1. 打开上述 Actions 页面，选择成功的 `iphone-duo-ios27` 构建，核对该次提交。历史 HTTP/BF16 兼容参考为[运行 42802024696](https://github.com/FBKmai/PicaX-private/actions/runs/42802024696)（`52aa2a3`）；历史产物可能过期，不把它作为永久下载地址。
+2. 下载 `PicaX-iPhoneDuo-unsigned-<运行编号>` artifact，解压取得 IPA、`SHA256SUMS.txt` 和构建信息。下载 Actions 产物通常需要登录 GitHub；产物保留 **14 天**。
+3. IPA **未签名，不能直接安装**。用自己的证书/描述文件签名后安装；重签后的 SHA-256 会变化。免费 Apple ID 签名通常有较短有效期，需要定期重签。
+4. 若产物已过期，有本仓库写入权限的维护者可点击 **Run workflow**，分支选 `iphone-duo-ios27`，保持 `bundle_color_model=false`，即可重新构建适用于电脑超分的无内置模型 IPA。普通读者可以 fork 后启用 Actions；工作流需要能调度 `xcode-27` runner 且安装 Xcode 27.1 / iOS 27.1 模拟器。自己的仓库没有该 runner 时，按[开发指南](Docs/Development.md)在自己的 macOS/Xcode 环境构建，不能把一直 queued 当成构建成功。
+5. 个人非商业 Core ML 彩色模型打包是另一条可选流程，涉及独立许可、hash 和验证门槛；见[Core ML 文档](Docs/SuperResolution.md)。电脑超分不需要开启它。
 
-### 应用保护
+旧 HTTPS/配对版不能连接当前 HTTP 服务；没有精度选择的旧手机包可能拒绝 BF16 默认能力响应。请按[兼容性说明](Docs/LanSuperResolution.md#compatibility)更新，而不是通过更换电脑模型解决。
 
-- iOS 的「设置 → App 行为 → 应用锁」支持 Face ID、Touch ID 或设备密码验证；启动需解锁，后台锁定时间可选立即、1 分钟、5 分钟或 15 分钟。
-- 离开应用立即遮挡内容，锁定界面覆盖已打开的弹窗，解锁后保留导航位置。
-- 漫画详情平滑过渡支持在快速右滑返回后恢复底部标签栏。
+应用内“检查更新”目前仍查询上游 `youshen2/PicaX` 的 Release，**不能用它判断或升级本衍生版本**。本版本以此仓库的提交和 Actions 构建信息为准。
 
-### 网络与内置代理
+## 平台与构建要求
 
-- 「设置 → 网络与代理」提供直连、代理服务器、内置代理三种线路，原有 HTTP 代理地址和端口会自动迁移。
-- 内置代理沿用 PicaV 的进程内实现，使用 Yams 6.2.2 解析 Clash YAML，支持从文件、粘贴文本和 HTTPS 订阅链接导入，并提供节点选择、删除、连通性检查和导入结果说明。
-- 支持 HTTP、SOCKS5、Shadowsocks（AES-GCM / ChaCha20-Poly1305）、VMess（alterId=0、AEAD TCP）和 Trojan（TCP + TLS）；导入结果会列出不支持的传输配置。
-- 平台接口、登录接口、漫画图片、漫画下载、标签翻译更新和应用更新请求使用所选线路。可开启读取请求返回 HTTP 403 时按列表切换节点并重试。
-- iOS 17+、macOS 和 visionOS 的网页登录通过本地代理桥接使用所选线路；iOS 15.2 / 16 的内置代理可用于接口、图片和漫画下载，网页登录会提示系统版本要求。
-- 节点密钥及代理服务器凭据使用系统钥匙串保存，代理配置保留在本机；代理配置或连接失败时会中断请求。订阅地址只用于当次获取，YAML 大小限制为 5 MB，可选择订阅获取线路。
+| 部分 | 要求与已知状态 |
+|---|---|
+| iOS 主应用 | 最低部署 iOS 15.2；本机候选 Core ML 推理需 iOS 16+ |
+| Live Activity | iOS 16.1+；不提高主应用最低版本 |
+| Watch 配套 | watchOS 9+；iPhone Duo 专用 IPA 不包含 Watch App |
+| macOS / visionOS | 工程部署目标均为 26.0；不等于每个新功能都在这些平台做过真机验收 |
+| Apple 开发 | 本分支推荐与 CI 一致的 **Xcode 27.1**；Duo 打包脚本要求 iOS SDK ≥27.1 和相应模拟器 |
+| 电脑超分 | **Windows x64、CPython 3.11、兼容 CUDA 12.8 wheel 的 NVIDIA 驱动/GPU**；部署依赖文件只适用于这个组合 |
 
-### 数据、备份与迁移
+Windows 电脑服务不需要 Xcode；构建 iOS App 则需要 macOS/Xcode 或 GitHub Actions。Linux CI 测了 HTTP 与 CPU 小模型数值，不代表已验证 Linux/macOS/AMD 电脑 GPU 部署。已测显卡、尺寸和内存口径见[HAT 优化说明](Docs/HATOptimization.md)。
 
-- 常用搜索、页级书签和版本分组随设置备份，可合并恢复；本地导入的文件随已下载漫画备份。
-- 支持导出导入 `.picax` 备份，可选择账号、设置、本地收藏、阅读历史、阅读时长、搜索历史、屏蔽词和已下载漫画。
-- 支持从 PicaComic 备份导入，覆盖账号、设置、下载、历史记录、本地收藏、搜索记录和屏蔽词等兼容数据。
+## 开发与贡献
 
-## 相比原 PicaComic 更多的功能
+- [开发指南](Docs/Development.md)：环境、代码地图、构建、测试矩阵和常见修改。
+- [架构说明](Docs/Architecture.md)：手机/电脑边界、队列、持久化、恢复与协议。
+- [贡献说明](CONTRIBUTING.md)：基于默认分支提交 PR、选择验证层级、报告问题时保护隐私。
+- [电脑部署教程](Docs/LanSuperResolution.md)：从全新环境到首张结果，不依赖维护者的本机目录。
 
-相对原项目 `PicaComic` README 中列出的浏览、在线阅读、下载、本地 / 云端收藏、数据同步和阅读历史，PicaX 目前额外补充了：
+## 许可与来源
 
-- 原生 SwiftUI / Apple 平台 UI，以及 iOS 26+ Liquid Glass 适配。
-- 阅读时长统计、单本趋势、首页阅读时长卡片和低于阈值不记录设置。
-- 批量阅读：已下载、云端收藏夹、本地收藏夹等列表可直接阅读全部，并在阅读器内切换上一本 / 下一本。
-- 搜索补全：NHentai 平台的搜索补全。
-- 已下载漫画 ZIP 导出，并支持自定义 ZIP 文件名格式。
-- PicaComic 备份迁移入口，导入前预览并支持覆盖 / 合并。
-- 下载评论区、下载限速、下载高级筛选、离线阅读全部。
-- 本地 `.picax` 精细化备份导出 / 导入，支持选择备份内容。
-- 更详细的设置项。
+- 本项目代码使用 **Mozilla Public License 2.0**，见 [LICENSE](LICENSE)；保留上游项目及各第三方依赖的归属和各自许可。
+- 电脑端允许列表中的 MangaJaNai/IllustrationJaNai 3.0.0 权重来自 the-database，适用 **CC-BY-NC-4.0**，与代码许可证不同；下载和运行需要显式确认非商业用途。权重不提交到 git。
+- MangaJaNai V1 黑白手机模型的历史许可冲突尚未解决，不在个人彩色模型打包入口中启用。不要用代码的 MPL 或转换器的 Apache 许可代替权重许可。
+- 漫画内容和账号来自对应来源，版权及服务条款属于相关权利方。请遵守当地法律、来源规则和模型许可；开源代码许可不授予漫画内容再分发权。
 
-## 构建
+## 致谢
 
-1. 克隆仓库：
-
-   ```bash
-   git clone https://github.com/youshen2/PicaX.git
-   cd PicaX
-   ```
-
-2. 使用 Xcode 打开项目：
-
-   ```bash
-   open PicaX.xcodeproj
-   ```
-
-3. 选择 `PicaX` scheme，并选择 iOS 模拟器、真机、macOS 或 visionOS 目标进行构建运行。
-
-项目当前部署目标为 iOS 15.2 / watchOS 9.0 / macOS 26.0 / visionOS 26.0，Live Activity 扩展的部署目标为 iOS 16.1。由于项目包含 iOS 26、macOS 26 和 visionOS 26 API 的条件适配，构建时需要 Xcode 26 或更新版本；生成的 iOS 主应用仍可运行在 iOS 15.2 及更高版本。
-
-### iPhone Duo / iOS 27.2 未签名构建
-
-`iphone-duo-ios27` 分支新增了独立工作流 `.github/workflows/build-iphone-duo.yml`，推送该分支时自动运行，也支持手动触发。它不发布 Release、不调用 Telegram，也不需要配置签名证书。
-
-- 使用 GitHub Actions 的 `xcode-27` runner，默认选择稳定版 Xcode 27.1；手动运行可选 runner 当前提供的 Xcode 27.2 RC。
-- iPhone Duo 的完整屏幕体验需要链接 iOS 27.1 或更新 SDK；不需要把应用最低系统版本提高到 iOS 27.2。默认构建可以在 iOS 27.2 上运行。
-- 在 iPhone Duo / iOS 27.1 模拟器运行单元测试，再生成不含 Watch App 的 `PicaX-iPhoneDuo-unsigned.ipa`。模拟器测试不等于 iOS 27.2 真机验证，也不覆盖自动折叠姿态测试。
-- 构建产物名为 `PicaX-iPhoneDuo-unsigned-<运行编号>`，其中包含未签名 IPA、SHA-256 校验值和构建信息；安装前需自行签名。
-- 分页阅读器在有效窗口尺寸变化时恢复当前页，忽略旧窗口的页码回调；宽屏标签导航采用系统自适应侧边栏。不按设备型号或固定屏幕分辨率判断布局。
-
-参考：[苹果 iPhone Duo 适配指南](https://developer.apple.com/videos/play/tech-talks/111461/)；[Actions Xcode 27 runner 环境](https://github.com/actions/runner-images/blob/main/images/macos/xcode-27-arm64-Readme.md)。
-
-### Telegram CI 发布
-
-每次 CI 成功生成产物后，GitHub Actions 会将上一次成功编译到本次编译之间的 Commit 汇总作为 Caption，并通过 Telegram Bot 将以下 4 个未签名产物合并为同一个媒体组消息发送到频道：
-
-- `PicaX-unsigned.ipa`
-- `PicaX-with-watch-unsigned.ipa`
-- `PicaX-WatchApp-unsigned.zip`
-- `PicaX.dmg`
-
-Caption 超过 Telegram 长度限制时会保留可容纳的 Commit，并注明省略数量及 Actions 链接，不会拆分成第二条消息。外部 Fork 发起的 Pull Request 不会读取仓库 Secrets，因此只构建和保存产物，不会发送到频道。
-
-版本标签会在 GitHub Release 上传完成后以非静默方式发送版本更新消息和全部产物，并自动置顶。机器人还需要频道的置顶消息权限；标签构建不会重复发送普通 CI 消息。Telegram 不会因频道置顶额外通知所有成员，最终通知仍受订阅者的频道通知设置影响。
-
-配置方式：
-
-1. 通过 Telegram 的 `@BotFather` 创建机器人并取得 Bot Token。
-2. 将机器人添加为目标频道管理员，并授予发布消息权限。
-3. 在 GitHub 仓库的 `Settings > Secrets and variables > Actions` 中添加以下 Repository secrets：
-   - `TELEGRAM_BOT_TOKEN`：机器人 Token。
-   - `TELEGRAM_CHAT_ID`：频道标识；公开频道可填写 `@频道用户名`，私有频道可填写 `-100` 开头的数字 ID。
-
-如果任一 Secret 缺失、机器人没有频道发布权限或 Telegram 上传失败，`Send artifacts to Telegram channel` 任务会失败并显示原因。
-
-## 特别鸣谢
-
-[![Readme Card](https://github-readme-stats.vercel.app/api/pin/?username=ccbkv&repo=PicaComic)](https://github.com/ccbkv/PicaComic)
-
-本项目参考的原始多源漫画客户端之一。
-
-[![Readme Card](https://github-readme-stats.vercel.app/api/pin/?username=Pacalini&repo=PicaComic)](https://github.com/Pacalini/PicaComic)
-
-原项目的原 fork，提供了可参考的跨平台功能与 README 信息。
-
-[![Readme Card](https://github-readme-stats.vercel.app/api/pin/?username=tonquer&repo=JMComic-qt)](https://github.com/tonquer/JMComic-qt)
-
-JMComic 图片重组相关实现的重要参考。
-
-[![Readme Card](https://github-readme-stats.vercel.app/api/pin/?username=EhTagTranslation&repo=Database)](https://github.com/EhTagTranslation/Database)
-
-E-Hentai 标签中文翻译数据来源。
-
-各漫画源网站及其社区维护者。
-
-## 免责声明
-
-本项目仅用于学习与个人使用，请在下载后 24 小时内删除。
-
-应用中展示的漫画内容、账号系统和平台数据均来自对应漫画源，版权与服务条款归各平台及其权利方所有。请遵守当地法律法规和对应平台规则。
-
-## 协议
-
-本项目使用 Mozilla Public License 2.0 开源，详见 [LICENSE](LICENSE)。
+- [youshen2/PicaX](https://github.com/youshen2/PicaX)：本仓库的上游项目。
+- [ccbkv/PicaComic](https://github.com/ccbkv/PicaComic)、[Pacalini/PicaComic](https://github.com/Pacalini/PicaComic)：多源客户端与功能设计参考。
+- [tonquer/JMComic-qt](https://github.com/tonquer/JMComic-qt)：JMComic 图片重组实现参考。
+- [EhTagTranslation/Database](https://github.com/EhTagTranslation/Database)：标签中文翻译数据。
+- [the-database/MangaJaNai](https://github.com/the-database/MangaJaNai)、[Spandrel](https://github.com/chaiNNer-org/spandrel)：模型与架构支持，以及对应作者和贡献者。

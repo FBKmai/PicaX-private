@@ -4,6 +4,39 @@ on:
   push:
     branches:
       - iphone-duo-ios27
+    paths:
+      - PicaX/**
+      - PicaXShared/**
+      - PicaXTests/**
+      - PicaXWatch/**
+      - PicaXDownloadActivityWidgets/**
+      - PicaX.xcodeproj/**
+      - BuildSupport/**
+      - BuildScripts/**
+      - '!BuildScripts/test_documentation.py'
+      - DesktopServer/picax_lan/**
+      - DesktopServer/tests/test_contracts.py
+      - RELEASE_NOTES.md
+      - .github/scripts/**
+      - .github/workflows/build-iphone-duo.yml
+  pull_request:
+    branches:
+      - iphone-duo-ios27
+    paths:
+      - PicaX/**
+      - PicaXShared/**
+      - PicaXTests/**
+      - PicaXWatch/**
+      - PicaXDownloadActivityWidgets/**
+      - PicaX.xcodeproj/**
+      - BuildSupport/**
+      - BuildScripts/**
+      - '!BuildScripts/test_documentation.py'
+      - DesktopServer/picax_lan/**
+      - DesktopServer/tests/test_contracts.py
+      - RELEASE_NOTES.md
+      - .github/scripts/**
+      - .github/workflows/build-iphone-duo.yml
   workflow_dispatch:
     inputs:
       xcode_version:
@@ -90,7 +123,7 @@ jobs:
           python -I -B DesktopServer/tests/test_contracts.py
 
       - name: Stage validated color full-page model
-        if: inputs.bundle_color_model == true
+        if: github.event_name == 'workflow_dispatch' && inputs.bundle_color_model == true
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

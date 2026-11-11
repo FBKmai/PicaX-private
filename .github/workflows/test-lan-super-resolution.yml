@@ -2,17 +2,25 @@ name: Test LAN super-resolution contracts and HTTP
 
 on:
   push:
-    branches:
-      - iphone-duo-ios27
     paths:
       - DesktopServer/**
+      - BuildScripts/SuperResolution/convert.py
+      - BuildScripts/SuperResolution/full_page.py
       - PicaX/Services/LanSuperResolution/**
+      - PicaX/Views/Downloads/LanSuperResolutionView.swift
+      - PicaX/Views/Downloads/LanSRQRCodeScanner.swift
+      - PicaX/Views/Settings/Content/DownloadSettingsView.swift
       - PicaXTests/LanSuperResolutionTests.swift
       - .github/workflows/test-lan-super-resolution.yml
   pull_request:
     paths:
       - DesktopServer/**
+      - BuildScripts/SuperResolution/convert.py
+      - BuildScripts/SuperResolution/full_page.py
       - PicaX/Services/LanSuperResolution/**
+      - PicaX/Views/Downloads/LanSuperResolutionView.swift
+      - PicaX/Views/Downloads/LanSRQRCodeScanner.swift
+      - PicaX/Views/Settings/Content/DownloadSettingsView.swift
       - PicaXTests/LanSuperResolutionTests.swift
       - .github/workflows/test-lan-super-resolution.yml
   workflow_dispatch:

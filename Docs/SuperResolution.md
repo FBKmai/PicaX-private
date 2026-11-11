@@ -1,12 +1,18 @@
 # 实验性 Core ML 超分：来源、转换与验证
 
-## 当前状态和边界
+[首页](../README.md) · [电脑 CUDA 部署](LanSuperResolution.md) · [HAT 显存优化](HATOptimization.md) · [开发与测试](Development.md#tests)
 
-首轮只支持用户**显式前台**启动：可试处理当前页，也可在当前章或整本范围内做逐页串行批量；不做后台任务、断点续跑或自动预缓存，原图必须保留。2026-11-08 用户真机自测反馈：本页试处理 `仅 CPU` 正常，`CPU+GPU` 画面异常。因此单页默认已改为仅 CPU，批量固定仅 CPU；GPU 根因尚未定位，不能声称已修复。本仓库**不提交这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**，因此默认的 push 构建没有模型，AI 功能会显示缺少模型/不可用，而不是偷偷用旧锐化冒充 AI。另有一个手动、仅限个人非商业使用的彩色模型打包入口：工作流从已验证的 Actions artifact 下载彩色 `.mlpackage`，核对权重/包 hash 后，仅在该次构建的独立副本中把 `validated` 置为 true；黑白模型仍不打包（许可冲突未解决）。
+> **文档范围：手机 Core ML 的历史研究与个人打包入口，主要证据截至 2026-11-08。不是电脑 HAT-L 的安装教程，也不是当前 App 全部超分功能的状态清单。** 电脑 CUDA 的权重、依赖、精度和显存优化请读上方独立文档。下面保留失败的 FP16/128 分块候选，供复核，不表示推荐使用。
+>
+> 2026-11-11 的当前源码另有下载后自动本机超分队列与 `AutoSuperResolutionBackgroundCoordinator.swift`；iOS 允许的后台时段不是持续后台运行保证，也不自动使用电脑。下面“仅前台/没有自动队列”描述的是当时的手动入口。当前构建与下载以[首页](../README.md#获取手机-app)为准，不以本页历史 run 充当最新版。
 
-截至 2026-11-08，最新含彩色模型构建为 [Actions run #42485830181](https://github.com/FBKmai/PicaX-private/actions/runs/42485830181)（commit `19ff8dfa8b03`）：Xcode 27.1 / iOS 27.1 SDK，183 项 iOS 模拟器测试（含新增超分下载命名、记录编解码、P 前缀完整性识别和批量输出辅助测试）及 48 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-25-color` 的 SHA-256 为 `3672f489fd966e3c40def5cb21b03b4c912c5fb1c9e9110eb53ca94a73af1763`（31,320,617 字节），资源审计为 `validated-models-declared`；IPA 内仅包含彩色 `IllustrationJaNai_V3detail_FDAT_M_2x_float32.mlmodelc` 和 `SuperResolutionAttribution.txt`，不包含黑白模型。该构建包含前台“当前章节/整本”串行批量入口和下载页多选批量超分入口，固定仅 CPU；但仍未在 iPhone Duo 真机验证，安装后 AI 功能是否可用及整本批量的耗时/内存/存储表现取决于真机运行。此前的无模型工程构建 #15（SHA `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`，审计 `engineering-build-no-models`）保留为对照；默认 push 构建仍不打包模型。
+## 2026-11-08 状态和边界
 
-本机为 Windows / Python 3.9，无 Xcode/macOS。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格）**。用户已在 iPhone Duo 上自测单页：仅 CPU 输出可用，CPU+GPU 出现画面异常；但这只是主观反馈，没有真机耗时、峰值内存或系统性画质对比记录，**整本批量的长时间稳定性仍未验证**。手动 `Validate real Core ML super-resolution candidates` 工作流负责在隔离的 macOS runner 上执行真实转换；其产物始终为未批准状态，不会自动进入 IPA 或修改原 artifact 的 `validated`。个人打包入口只在目标构建目录的副本上批准彩色模型，见“个人非商业彩色模型的打包入口”。任何对外分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
+首轮只支持用户**显式前台**启动：可试处理当前页，也可在当前章或整本范围内做逐页串行批量；当时不做后台任务、断点续跑或自动预缓存，原图必须保留。2026-11-08 真机自测反馈：本页试处理 `仅 CPU` 正常，`CPU+GPU` 画面异常。因此单页默认已改为仅 CPU，批量固定仅 CPU；GPU 根因尚未定位，不能声称已修复。本仓库**不提交这两个模型的权重、`.mlpackage`、`.mlmodelc` 或现成有效 descriptor**，默认构建没有手机模型，本机 AI 会显示缺少模型/不可用，而不是用旧锐化冒充 AI；这不影响独立的电脑超分。另有一个手动、仅限个人非商业使用的彩色模型打包入口：工作流从已验证的 Actions artifact 下载彩色 `.mlpackage`，核对权重/包 hash 后，仅在该次构建的独立副本中把 `validated` 置为 true；黑白模型仍不打包（许可冲突未解决）。
+
+2026-11-08 的历史含彩色模型构建 [Actions run #42485830181](https://github.com/FBKmai/PicaX-private/actions/runs/42485830181)（commit `19ff8dfa8b03`）：Xcode 27.1 / iOS 27.1 SDK，183 项 iOS 模拟器测试（含新增超分下载命名、记录编解码、P 前缀完整性识别和批量输出辅助测试）及 48 项 Python 工具测试通过。未签名 IPA `PicaX-iPhoneDuo-unsigned-25-color` 的 SHA-256 为 `3672f489fd966e3c40def5cb21b03b4c912c5fb1c9e9110eb53ca94a73af1763`（31,320,617 字节），资源审计为 `validated-models-declared`；IPA 内仅包含彩色 `IllustrationJaNai_V3detail_FDAT_M_2x_float32.mlmodelc` 和 `SuperResolutionAttribution.txt`，不包含黑白模型。该构建包含前台“当前章节/整本”串行批量入口和下载页多选批量超分入口，固定仅 CPU；当时仍未完成 iPhone Duo 真机批量验收。此前无模型工程构建 #15（SHA `2e3b7aaee9ea171bdb29a46fe5085f495c322f3752fb56e898cef273408d95c7`，审计 `engineering-build-no-models`）仅为对照；这些历史包不是永久下载入口。
+
+当时维护环境为 Windows / Python 3.9，无 Xcode/macOS，转换实际在隔离的 macOS Actions 上完成；**不是当前电脑部署所要求的 Python 3.11 CUDA 环境**。已下载官方原始归档、安全提取所选黑白和彩色 checkpoint 并独立核对下表的文件 hash；已完成真实权重加载、Core ML 整页转换和 macOS CPU 预测；**run 42461503524 的五个尺寸与三种 compute unit 隔离验证全部通过（见下文表格）**。真机单页仅 CPU 输出可用、CPU+GPU 画面异常是主观反馈，没有真机耗时、峰值内存或系统性画质对比记录，不能推导整本批量稳定。手动 `Validate real Core ML super-resolution candidates` 工作流在隔离 macOS runner 执行真实转换，产物保持未批准，不会自动进入 IPA 或修改原 artifact 的 `validated`。个人打包入口只在目标构建目录副本批准彩色模型，见下文。任何对外分发必须先核实具体权重许可；V1 尤其存在下面的许可冲突。
 
 ## 锁定来源和候选
 
@@ -49,7 +55,7 @@
 
 首次数值运行 [42447624740](https://github.com/FBKmai/PicaX-private/actions/runs/42447624740) 已完成真实权重加载、转换及 macOS CPU 预测：Manga 1200p FP32 的三样本最大绝对误差最高为 `0.0003440976`；彩色 FDAT FP32 为 `0.00000292063`，均通过预设转换阈值。彩色 FDAT FP16 的噪声样本平均绝对误差为 `0.0023595911`，超过 `0.5/255 ≈ 0.0019607843`，因此该候选失败（整个工作流也如实失败），不修改阈值强行通过。候选包仍为 `validated: false`；首次运行未验证接缝。
 
-更新后的 `.github/workflows/validate-super-resolution.yml` 只对通过的 Manga 1200p FP32 和彩色 FDAT FP32 继续分块检查，不重新启用已拒绝的 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的私有 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
+更新后的 `.github/workflows/validate-super-resolution.yml` 只对通过的 Manga 1200p FP32 和彩色 FDAT FP32 继续分块检查，不重新启用已拒绝的 FP16。固定 macOS arm64 / CPython 3.11.9 及 hash-locked wheel；每个候选使用独立输出目录，归档、权重、解释器和仓库互不混用。工作流只产生保留 7 天的 Actions 候选包/数值报告，不提交模型、不发布 Release、不自动批准资源。**本仓库当前为 public，Actions 产物不是私密存储**；仅放可公开的合成校准图，不上传真实漫画、凭据或私人日志。Manga 暂存范围仅为原始高度恰好 1200，不推定其他高度已验证。
 
 第二轮真实分块运行 [42448585608](https://github.com/FBKmai/PicaX-private/actions/runs/42448585608) **失败**；小页、1×1、单行和单列均通过，但 216×344 多块合成页的结果如下（归一化 RGB 绝对误差）：
 
@@ -218,7 +224,7 @@ IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输
 
 **前置条件**
 
-- 彩色模型：IllustrationJaNai V3detail FDAT M 2×，权重 SHA-256 `8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0`，package SHA-256 `94f6697f579a45e18fd9247b59e0fe236a52506b3e20807799747438a0b75b13`，来自 run [42461503524](https://github.com/FBKmai/PicaX-private/actions/runs/42461503524) 的 artifact `PicaX-full-page-color-unapproved-5`（保留 14 天；过期后需重新运行验证或改填新的 run/artifact）。
+- 彩色模型：IllustrationJaNai V3detail FDAT M 2×，权重 SHA-256 `8ff2ba0b970e6939f3711077f5260fcded16b8388a939a27f153c687ff5da3e0`，package SHA-256 `94f6697f579a45e18fd9247b59e0fe236a52506b3e20807799747438a0b75b13`，来自 run [42461503524](https://github.com/FBKmai/PicaX-private/actions/runs/42461503524) 的 artifact `PicaX-full-page-color-unapproved-5`（保留 14 天）。过期后可以重新运行隔离转换验证，但新包可能有不同 hash；**不能只填新 run/artifact 就绕过固定允许值**。维护者必须审核新的完整报告、许可与包身份，同步更新 `stage_bundle_model.py`、工作流中的预期 package hash、对应测试和本说明，再使用新产物；不关闭检查、不手改未通过的 descriptor。仅重新上传字节相同的已核验包时 hash 才可保持。
 - 许可：上游 the-database / [MangaJaNai 3.0.0](https://github.com/the-database/MangaJaNai/releases/tag/3.0.0)，[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)。只允许个人非商业使用；不得公开分发、出售或用于商业目的，不得暗示原作者背书。Core ML 转换属于修改/转换，打包的 `SuperResolutionAttribution.txt` 会记录原作者、来源、许可链接及转换/图优化改动。
 - 黑白模型不在此入口内：MangaJaNai V1 1.0.0 的 CC BY-NC-SA 4.0 与后续 CC BY-NC 4.0 冲突尚未解决。
 
@@ -227,7 +233,7 @@ IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输
 在 GitHub Actions 手动运行 `Build iPhone Duo unsigned IPA`，分支选 `iphone-duo-ios27`，设置：
 
 - `bundle_color_model` = true
-- `model_run_id` = `42461503524`（或包含同一 artifact 的新 run）
+- `model_run_id` = `42461503524`（历史已核验包所在 run；新 run 必须满足上述同 hash/重新审核条件）
 - `model_artifact` = `PicaX-full-page-color-unapproved-5`
 - `xcode_version` 默认 `27.1`
 
@@ -241,7 +247,7 @@ IllustrationJaNai V3detail FDAT M（导出的内部 4× / 有效 2×，要求输
 
 2026-11-08 已实际产出 [run #42469448640](https://github.com/FBKmai/PicaX-private/actions/runs/42469448640)：artifact `PicaX-iPhoneDuo-unsigned-17-color`，IPA SHA-256 `5b1f4c037ee031bfdfbc6beb4c94e5f1703b0f9492db451141c8faa85d26eb60`，30,901,756 字节；编译后的 `.mlmodelc` 为 `MLModelType_mlProgram`、specification 7、iOS 16.0 availability、输入 `1×3×64..2048×64..2048`、输出动态、存储精度 Float32；模型文件合计 16,545,893 字节。资源审计通过，但这只是 macOS 构建/打包证据。
 
-命令行等价触发（需要本机 `gh` 已登录且有 `actions: read`）：
+命令行等价触发（需要本机 `gh` 已登录且有工作流运行权限；读取产物还需 `actions: read`）：
 
 ```sh
 gh workflow run build-iphone-duo.yml --ref iphone-duo-ios27 \
@@ -268,7 +274,7 @@ Payload/PicaX.app/SuperResolutionAttribution.txt
 
 请先独立确认权重来源及许可；只获取实际需要的 checkpoint，不要将整个模型仓库、无关模型或读者漫画加入项目。将每个下载文件放独立空目录，安全检查归档及其中许可后只取所需文件；避免路径穿越/链接，不在下载或解压目录执行代码。使用受信任的 Python 环境，从另一个安全工作目录运行，所有输入使用绝对路径。脚本不提供不安全 pickle 回退：先将同一文件字节读入内存、核对调用者给出的 SHA 与上表锁定值及实测 SHA，再对 `.pth` 调用 `torch.load(..., weights_only=True, map_location="cpu")`；彩色使用 safetensors。PyTorch 2.6.0 修复了已知的 CVE-2025-32434，但 `weights_only` 和 safetensors 也不是运行不可信内容的完整沙箱；绝不能接受任意 hash 或关闭核验。已知 hash 来自第三方、不是作者签名，也不能替代信任及隔离。
 
-以下为待 macOS 验证的示例流程。`REPO`、`WEIGHT`、数值阈值和黑白的整页范围必须由操作者实际填写；阈值应在查看结果之前根据验收计划确定，示例故意不预设允许误差。请在可信的空工作目录内执行，不要从下载目录或项目 bundle 工作目录运行解释器。
+以下保留固定 128 分块候选的**研究示例，不是推荐可用配置**：彩色 FP16 已按预设阈值失败，两个 FP32 的 128/20 分块也未通过多块页门槛。要复核曾通过的整页工程路径，应使用上方 FP32 `--full-page` 与五尺寸隔离验证，不能批准此处失败候选。`REPO`、`WEIGHT` 和输出目录必须由操作者实际填写；数值阈值应在查看结果之前根据验收计划确定，示例故意不预设允许误差。请在可信工作目录内执行，不从下载目录或项目 bundle 工作目录运行解释器。
 
 ```sh
 # 仅示意；这些目录各不相同，WEIGHT 指向已经取得并核验来源的单个文件。
@@ -317,7 +323,7 @@ MAX_HEIGHT=  # 操作者选择，不能为空
 4. 只有完成上述许可与工程核验并经人工审核、保留证据后，才能人工更新 descriptor 的确切许可和 `validated`，将模型和对应 `*.superresolution.json` 作为应用资源加入 Xcode，用于后续真机试处理。`validated` 仅声明工程和许可门槛已通过，**不等于用户已确认实际阅读画质提升**。当前描述文件仅接受确切的 `CC-BY-NC-4.0` 或 `CC-BY-NC-SA-4.0`；这只是声明检查，不独立证明实际权重授权。资源基名只使用 ASCII 字母、数字、下划线或连字符，特征名固定 `input`/`output`，来源必须是含有效主机名的 HTTPS URL。iPhone 包内的 descriptor 和对应 `.mlmodelc` 必须作为主应用顶层资源，不能仅放在嵌套文件夹或其他 bundle 内。每个模型 ID、资源名唯一，黑白闭区间不得重叠，彩色只启用一个候选；彩色通常不填高度范围，若填写也必须是完整、为正且有序的上下界。必须在 macOS 核实项目最低部署 iOS 15.2 与模型最低 iOS 16 的资源编译兼容性；必要时将经相应工具链编译的 `.mlmodelc` 作为资源集成，不能为通过构建擅自提高整个 App 的最低系统版本。个人非商业彩色入口采用构建后 `xcrun coremlc` 编译并复制顶层资源的路径：`stage_bundle_model.py` 只修改该次构建的副本，不改原 artifact 或 Xcode 工程。任何步骤未通过则继续显示不可用/原图，原图不可覆盖。
 5. `BuildScripts/verify-super-resolution-bundle.py` 会在 iPhone 打包前审计已编译资源和描述契约，并将 `SuperResolutionModels.json` 随构建产物提供。没有模型时明确标记 `engineering-build-no-models`，这类 IPA 只是工程验证版，**不是已完成 AI 画质验证的交付物**。存在未验证、许可未解决、缺少编译资源或选择有歧义的描述时阻止打包。资源审计不能替代数值、真机、签名或独立许可验证。
 
-6. 有模型的试验 IPA 安装后，才进行用户真机门槛：在目标 iPhone、目标 compute unit 和代表性的黑白文字、网点、彩色纹理页面进行画质、耗时、实际峰值内存和存储验收。对比页显示的内存是图像工作预算估算，不是实测峰值，也不包括无法在此约束的全部 Core ML/系统分配；实际峰值需用 Xcode Instruments 等工具测量。本次已增加前台整本/当前章批量，但后台续跑、重启恢复和自动队列仍未实现；用户确认单页收益后再用短篇验证整本批量，不能把“能启动批次”当作整本验收通过。
+6. 有模型的试验 IPA 安装后，才进行用户真机门槛：在目标 iPhone、目标 compute unit 和代表性的黑白文字、网点、彩色纹理页面进行画质、耗时、实际峰值内存和存储验收。对比页显示的内存是图像工作预算估算，不是实测峰值，也不包括无法在此约束的全部 Core ML/系统分配；实际峰值需用 Xcode Instruments 等工具测量。本次已增加前台整本/当前章批量；此处为 2026-11-08 的手动入口验收清单，后续自动队列不等于已经完成真机量化验收。用户确认单页收益后再用短篇验证整本批量，不能把“能启动批次”当作整本验收通过。
 
 ## 工程验证与操作入口
 
