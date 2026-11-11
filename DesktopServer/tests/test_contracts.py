@@ -489,11 +489,74 @@ class InferenceContractTests(unittest.TestCase):
                 self.assertIs(entry.args[0], entry.kwargs["out"])
         image.fromarray.return_value.resize.assert_called_once_with((126, 130), image.Resampling.LANCZOS)
         image.fromarray.return_value.resize.return_value.save.assert_called_once_with(destination, format="PNG")
+        # Force the measured-pressure branch independently of CUDA internals.
+        # Maintenance is after encoding, is optional, and does not erase peaks.
+        after = {"allocatedBytes": 123, "reservedBytes": 128,
+                 "peakAllocatedBytes": 789, "peakReservedBytes": 1024}
+        maintenance = {"seconds": 0.01, "before": value["memoryStages"]["outputReleased"],
+                       "after": after, "releasedBytes": 328, "deviceTotalBytes": 512}
+        def release(memory):
+            self.assertEqual(image.fromarray.return_value.resize.return_value.save.call_count, 2)
+            self.assertEqual(memory, maintenance["before"])
+            return maintenance
+        with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}), \
+             patch("picax_lan.inference.validate_png"), \
+             patch("picax_lan.inference.png_dimensions", return_value=(126, 130)), \
+             patch("picax_lan.inference.digest_file", side_effect=[page["sha256"], predictor.metadata["sha256"]]), \
+             patch.object(predictor, "release_idle_cache", side_effect=release) as trim:
+            pressured = predictor.predict(Path("mock-input.png"), destination, page, body)
+        trim.assert_called_once_with(maintenance["before"])
+        self.assertEqual(pressured["cacheMaintenance"], maintenance)
+        self.assertEqual(pressured["memoryStages"]["cacheReleased"], after)
+        self.assertEqual((pressured["peakAllocatedBytes"], pressured["peakReservedBytes"]), (789, 1024))
         body["precision"] = "float32"
         with patch.dict(sys.modules, {"PIL": SimpleNamespace(Image=image)}):
             with self.assertRaisesRegex(RuntimeError, "Job precision differs"):
                 predictor.predict(Path("mock-input.png"), destination, page, body)
-        predictor.model.assert_called_once()
+        self.assertEqual(predictor.model.call_count, 2)
+
+    def test_idle_cache_trim_only_for_optimized_cuda_hat_under_pressure(self):
+        from picax_lan.inference import Predictor
+        gib = 1024**3
+        # No model changes, live allocation cap, free-memory estimate or reload.
+        for device, model, adapter, reserved, allocated, expected in (
+            ("cpu", MODELS[0], True, 30*gib, gib, False),
+            ("cuda", MODELS[-1], False, 30*gib, gib, False),
+            ("cuda", MODELS[0], False, 30*gib, gib, False),
+            ("cuda", MODELS[0], True, 20*gib, 20*gib - gib + 1, False),
+            ("cuda", MODELS[0], True, 16*gib, gib, False),  # Exactly 80% of 20 GiB.
+            ("cuda", MODELS[0], True, 16*gib + 1, gib, True),
+            ("cuda", MODELS[0], True, 20*gib, 19*gib, True),  # Exactly 1 GiB idle.
+            ("cuda", MODELS[0], True, 40*gib, 30*gib, True),  # Even live > capacity is not rejected.
+        ):
+            with self.subTest(device=device, model=model.id, adapter=adapter, reserved=reserved, allocated=allocated):
+                predictor = Predictor.__new__(Predictor)
+                predictor.settings = {"device": device}
+                predictor.descriptor, predictor.hat_memory = model, object() if adapter else None
+                predictor.torch = MagicMock()
+                predictor.torch.cuda.get_device_properties.return_value.total_memory = 20*gib
+                after = {"allocatedBytes": allocated, "reservedBytes": allocated,
+                         "peakAllocatedBytes": 40*gib, "peakReservedBytes": 40*gib}
+                predictor.memory_snapshot = Mock(return_value=after)
+                before = {"allocatedBytes": allocated, "reservedBytes": reserved,
+                          "peakAllocatedBytes": 40*gib, "peakReservedBytes": 40*gib}
+                untouched = dict(before)
+                value = predictor.release_idle_cache(before)
+                self.assertEqual(before, untouched)
+                if expected:
+                    predictor.torch.cuda.empty_cache.assert_called_once_with()
+                    predictor.memory_snapshot.assert_called_once_with()
+                    self.assertEqual(value["releasedBytes"], reserved - allocated)
+                    self.assertEqual(value["before"], before)
+                    self.assertEqual(value["after"], after)
+                    self.assertGreaterEqual(value["seconds"], 0)
+                else:
+                    self.assertIsNone(value)
+                    predictor.torch.cuda.empty_cache.assert_not_called()
+                    predictor.memory_snapshot.assert_not_called()
+                predictor.torch.cuda.mem_get_info.assert_not_called()
+                predictor.torch.cuda.set_per_process_memory_fraction.assert_not_called()
+                predictor.torch.cuda.synchronize.assert_not_called()
 
     def test_supervisor_reloads_precision_and_keeps_legacy_jobs_fp32(self):
         from picax_lan.worker import Worker

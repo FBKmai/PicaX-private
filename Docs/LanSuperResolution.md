@@ -75,7 +75,7 @@ DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pi
 
 结果新增可选字段：`attentionImplementation`、`attentionWindowBatch`、`attentionBackend`、`sdpaBackends`、`workerPID`、`modelSeconds`（CUDA 事件计时，CPU 为墙钟）、`modelWallSeconds`（模型调用及结果有限值检查的墙钟）、`postprocessSeconds`（输出传输/量化/编码），以及 `memoryStages.pageStart/modelEnd/outputReleased` 的 current/peak allocated/reserved。注意力窗口/KV 最大批次记录的是该 worker 观察到的高水位。`--diagnostics` 同时打印简短阶段内存日志，不记录漫画标题或图片内容；错误时尽力记录内存，不掩盖原错误。
 
-allocated 包含在 reserved 内，两者不能相加，也不等于 WDDM 的物理专用/共享驻留量。输出释放后的 reserved 不回零可以是正常缓存；不默认逐页 `empty_cache()` 或重载模型。窗口循环内没有主机日志、`.item()` 或 CUDA 同步，计时只在页级边界同步。
+allocated 包含在 reserved 内，两者不能相加，也不等于 WDDM 的物理专用/共享驻留量。输出释放后的 reserved 不回零可以是正常缓存；不无条件逐页 `empty_cache()` 或重载模型。真实混合尺寸 CUDA 对照发现，闲置池也可能累计并长期占用 WDDM shared，因此优化 HAT 在页尾编码结束后只在 **reserved 超过设备物理显存的 80%，且至少 1 GiB 为闲置缓存**时释放空闲块；普通缓存继续复用，模型仍驻留。这个条件只维护缓存，**不是 80% 显存分配上限，也不拦截输入或更改模型/精度**；仍可能出现单页期间的共享内存峰值。触发时记录 `cacheMaintenance`（耗时、释放字节、前后快照）和 `memoryStages.cacheReleased`，总页耗时包含清理成本；不触发时这两个可选字段省略。窗口循环内没有主机日志、`.item()` 或 CUDA 同步，计时只在页级边界同步。
 
 **部署与兼容性**：这部分不改手机协议、数据库或 Swift，已经支持 HTTP/精度选择的现有 IPA 可继续使用，**不需要为显存优化重新打 IPA**。更新源码不会替换已经运行的 worker；应在任务完成并确认可以中断服务后手动重启电脑服务。尚未通过另行授权的真实 GPU 验证前，不承诺大页一定能装入专用显存或具体加速倍数。
 

@@ -125,6 +125,28 @@ class Predictor:
         return {"allocatedBytes": cuda.memory_allocated(), "reservedBytes": cuda.memory_reserved(),
                 "peakAllocatedBytes": cuda.max_memory_allocated(), "peakReservedBytes": cuda.max_memory_reserved()}
 
+    def release_idle_cache(self, memory):
+        """Release idle HAT cache only under observed pressure, never limit inputs.
+
+        Mixed page sizes can retain several disjoint allocator pools on WDDM.
+        This runs after output release/encoding, never inside model attention.
+        Keep ordinary reusable cache; trim only if >=1 GiB is idle and reserved
+        exceeds 80% of physical device memory. No live allocation is capped.
+        """
+        if self.settings["device"] != "cuda" or self.descriptor.architecture != "HAT" or self.hat_memory is None:
+            return None
+        reserved, allocated = memory["reservedBytes"], memory["allocatedBytes"]
+        if reserved - allocated < 1024**3:
+            return None
+        total = self.torch.cuda.get_device_properties().total_memory
+        if reserved * 5 <= total * 4:
+            return None
+        began = time.monotonic()
+        self.torch.cuda.empty_cache()  # Only idle allocator blocks; model stays resident.
+        after = self.memory_snapshot()
+        return {"seconds": time.monotonic() - began, "before": dict(memory), "after": after,
+                "deviceTotalBytes": total, "releasedBytes": max(0, reserved - after["reservedBytes"])}
+
     def diagnostic(self, phase, page, memory=None):
         if self.settings.get("diagnostics"):
             entry = {"phase": phase, "pid": os.getpid(), "width": page["width"], "height": page["height"],
@@ -199,7 +221,13 @@ class Predictor:
         if png_dimensions(destination, MAX_OUTPUT_BYTES, MAX_OUTPUT_PIXELS) != (width * scale, height * scale):
             raise RuntimeError("Encoded result dimensions mismatch")
         postprocess_seconds = time.monotonic() - postprocess_started
+        cache_maintenance = self.release_idle_cache(memory["outputReleased"])
+        if cache_maintenance is not None:
+            memory["cacheReleased"] = cache_maintenance["after"]
+            self.diagnostic("cacheReleased", page, memory["cacheReleased"])
         metadata = dict(self.metadata)
+        if cache_maintenance is not None:
+            metadata["cacheMaintenance"] = cache_maintenance
         if self.hat_memory is not None:
             metadata.update(self.hat_memory.metadata())
         if cuda:
