@@ -66,7 +66,7 @@ DesktopServer\start-server.cmd --host 192.168.5.8 --data-dir "D:\折腾\picax\pi
 目标是继续运行**同一 HAT-L、同一权重、同一精度和原生 4×**，降低中间张量峰值，而不是换模型、缩图或设置一个更早拒绝任务的显存上限。
 
 - 默认 `--hat-window-batch 128 --hat-attention-backend eager`。只对固定的 Spandrel 0.4.2 HAT 实例安装适配器，不修改第三方包或全局类；结构/版本不匹配明确报错。`--hat-window-batch 0` 显式选择原版，仅供**小图对照诊断**，不是失败时自动退回的路径。
-- 普通/移位注意力按原窗口顺序分批执行 QKV、原始缩放、relative-position bias、有限值 `0 / -100` mask、softmax 和投影；全页稠密 shift mask 改为同一分区规则的紧凑标签，每批再展开。多图 batch 仍按各图窗口数正确对应 mask。
+- 普通/移位注意力按原窗口顺序分批执行原始缩放、QK、relative-position bias、有限值 `0 / -100` mask、softmax 和 V 聚合；全页稠密 shift mask 改为同一分区规则的紧凑标签，每批再展开。**QKV 与输出投影保留原版完整 GEMM 形状**，避免 BF16 CUDA 在行数分批后选择不同矩阵内核而改变舍入；只将二次规模的注意力分批。多图 batch 仍按各图窗口数正确对应 mask。
 - OCAB 保留整页 norm/QKV，只在当前批次提取原来的重叠 K/V。使用 `Tensor.unfold` 的网格**视图**，先取有限窗口再物化，不生成整页 `nn.Unfold` 展开结果；边缘仍是原 OCAB 的**零填充**。
 - 整页卷积、全局通道平均池化、移位/反移位、残差、MLP 和上采样不变；外侧反射填充、64 对齐和输出裁切不变。**不是把漫画切块后各自超分再拼接**，没有删去原来任何 query 可见的 K/V。
 - 以 16×16 query、24×24 K/V、6 heads、BF16 为例，128 个窗口的一个 OCAB score 约 216 MiB；这只是单个临时张量，不是总显存预测。全页特征和上采样依然随页面增大。64/128/256/512 哪个更快须实测，不能认定越小越快。

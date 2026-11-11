@@ -29,7 +29,7 @@ class WindowScheduler:
         self.sdpa_backends = set()
 
     def metadata(self):
-        return {"attentionImplementation": "hat-window-batched-v1",
+        return {"attentionImplementation": "hat-window-batched-v2",
                 "attentionWindowBatch": self.window_batch,
                 "attentionBackend": self.backend,
                 "attentionMaxWindows": self.max_attention_windows,
@@ -125,17 +125,21 @@ class WindowScheduler:
             raise RuntimeError("Unexpected HAT window features")
         bias = module.relative_position_bias_table[rpi.reshape(-1)].view(tokens, tokens, heads)
         bias = bias.permute(2, 0, 1).contiguous()
+        # Preserve the original full linear GEMM shapes. BF16 CUDA kernels can
+        # round differently when QKV/projection rows are split, even though the
+        # FP32 formulas agree. Only the quadratic attention is window-batched.
+        qkv = module.qkv(x).reshape(count, tokens, 3, heads, channels // heads)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
         output = x.new_empty(x.shape)
         for start in range(0, count, self.window_batch):
             end = min(start + self.window_batch, count)
-            qkv = module.qkv(x[start:end]).reshape(end - start, tokens, 3, heads, channels // heads)
-            q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
             chunk_mask = self.mask_chunk(mask, start, end, x)
-            attended = self.attend(q, k, v, bias, chunk_mask, module.scale, module.attn_drop)
-            attended = attended.transpose(1, 2).reshape(end - start, tokens, channels)
-            output[start:end] = module.proj_drop(module.proj(attended))
-            del qkv, q, k, v, attended, chunk_mask
-        return output
+            attended = self.attend(q[start:end], k[start:end], v[start:end], bias,
+                                   chunk_mask, module.scale, module.attn_drop)
+            output[start:end] = attended.transpose(1, 2).reshape(end - start, tokens, channels)
+            del attended, chunk_mask
+        del qkv, q, k, v
+        return module.proj_drop(module.proj(output))
 
     def overlap_forward(self, module, x, x_size, rpi):
         self.guard(module)

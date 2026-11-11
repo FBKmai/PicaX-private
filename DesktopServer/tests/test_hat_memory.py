@@ -89,11 +89,15 @@ class HATMemoryTests(unittest.TestCase):
                             mask = optimized.calculate_mask((8, 12), features.dtype)
                         attention = optimized.layers[0].residual_group.blocks[index].attn
                         with AttentionBounds(self, chunk, 2, 16, 16) as bounds, \
-                             patch.object(attention.qkv, "forward", wraps=attention.qkv.forward) as qkv:
+                             patch.object(attention.qkv, "forward", wraps=attention.qkv.forward) as qkv, \
+                             patch.object(attention.proj, "forward", wraps=attention.proj.forward) as proj:
                             actual = attention(features, optimized.relative_position_index_SA, mask)
                         self.close(expected, actual)
                         expected_batches = [min(chunk, 12 - start) for start in range(0, 12, chunk)]
-                        self.assertEqual([entry.args[0].shape[0] for entry in qkv.call_args_list], expected_batches)
+                        # Linear GEMM shapes must stay original for BF16 rounding;
+                        # the quadratic attention must still obey the bound.
+                        self.assertEqual([tuple(entry.args[0].shape) for entry in qkv.call_args_list], [(12, 16, 60)])
+                        self.assertEqual([tuple(entry.args[0].shape) for entry in proj.call_args_list], [(12, 16, 60)])
                         self.assertEqual(bounds.scores, expected_batches)
                         self.assertEqual(scheduler.max_attention_windows, min(chunk, 12))
 
